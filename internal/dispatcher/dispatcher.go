@@ -46,9 +46,92 @@ func dispatchGitHub(ctx context.Context, cfg config.Config, queue store.QueueSto
 }
 
 func dispatchConcurrent(ctx context.Context, cfg config.Config, queue store.QueueStore, gh issuegithub.Client) (Result, error) {
-	runnerIdentity := newRunnerIdentity(cfg)
-	runnerInfo := model.RunnerInfo{ID: runnerIdentity.RunnerID, Name: cfg.Runner.Name}
-	limits := perRouteLimits(cfg)
+	supervisor := NewSupervisor(cfg, queue, gh)
+	now := time.Now().UTC()
+	if err := supervisor.Heartbeat(ctx); err != nil {
+		return Result{}, err
+	}
+	staleBefore := now.Add(-supervisor.LeaseDuration())
+	if _, err := queue.ReleaseExpiredLeases(ctx, now, staleBefore, supervisor.Identity().InstanceID, nil); err != nil {
+		return Result{}, err
+	}
+	frontier, err := queue.ListEligibleJobIDs(ctx, now)
+	if err != nil {
+		return Result{}, err
+	}
+
+	frontierRemaining := stringSet(frontier)
+	for len(frontierRemaining) > 0 || supervisor.ActiveCount() > 0 {
+		if err := supervisor.Heartbeat(ctx); err != nil {
+			if supervisor.ActiveCount() == 0 {
+				return supervisor.Result(), err
+			}
+		} else {
+			if err := supervisor.refill(ctx, frontierRemaining); err != nil {
+				supervisor.CancelActive(err)
+				_ = supervisor.Wait(ctx)
+				return supervisor.Result(), err
+			}
+		}
+		if supervisor.ActiveCount() == 0 {
+			if len(frontierRemaining) > 0 {
+				return supervisor.Result(), nil
+			}
+			continue
+		}
+		waitCh := supervisor.firstDone()
+		heartbeatTimer := time.NewTimer(HeartbeatInterval(supervisor.LeaseDuration()))
+		select {
+		case <-ctx.Done():
+			stopTimer(heartbeatTimer)
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), CleanupTimeout(supervisor.LeaseDuration()))
+			supervisor.CancelActive(context.Cause(ctx))
+			_ = supervisor.Wait(cleanupCtx)
+			cancel()
+			return supervisor.Result(), ctx.Err()
+		case <-waitCh:
+			stopTimer(heartbeatTimer)
+		case <-heartbeatTimer.C:
+			if err := supervisor.Renew(ctx); err != nil {
+				if supervisor.ActiveCount() == 0 {
+					return supervisor.Result(), nil
+				}
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					cleanupCtx, cancel := context.WithTimeout(context.Background(), CleanupTimeout(supervisor.LeaseDuration()))
+					supervisor.CancelActive(err)
+					_ = supervisor.Wait(cleanupCtx)
+					cancel()
+					return supervisor.Result(), err
+				}
+			}
+			continue
+		}
+		if err := supervisor.ReapReady(ctx); err != nil {
+			supervisor.CancelActive(err)
+			_ = supervisor.Wait(ctx)
+			return supervisor.Result(), err
+		}
+	}
+	return supervisor.Result(), nil
+}
+
+type Supervisor struct {
+	mu         sync.Mutex
+	cfg        config.Config
+	queue      store.QueueStore
+	gh         issuegithub.Client
+	identity   model.RunnerIdentity
+	runnerInfo model.RunnerInfo
+	limits     map[string]int
+	maxGlobal  int
+	lease      time.Duration
+	active     map[string]*localActiveJob
+	result     Result
+	processID  int
+}
+
+func NewSupervisor(cfg config.Config, queue store.QueueStore, gh issuegithub.Client) *Supervisor {
+	identity := newRunnerIdentity(cfg)
 	maxGlobal := cfg.Queue.MaxGlobalConcurrency
 	if maxGlobal <= 0 {
 		maxGlobal = 1
@@ -57,127 +140,245 @@ func dispatchConcurrent(ctx context.Context, cfg config.Config, queue store.Queu
 	if lease <= 0 {
 		lease = config.DefaultLeaseDuration
 	}
-	now := time.Now().UTC()
-	if err := queue.HeartbeatRunner(ctx, runnerIdentity, os.Getpid(), now); err != nil {
-		return Result{}, err
+	return &Supervisor{
+		cfg:        cfg,
+		queue:      queue,
+		gh:         gh,
+		identity:   identity,
+		runnerInfo: model.RunnerInfo{ID: identity.RunnerID, Name: cfg.Runner.Name},
+		limits:     perRouteLimits(cfg),
+		maxGlobal:  maxGlobal,
+		lease:      lease,
+		active:     map[string]*localActiveJob{},
+		processID:  os.Getpid(),
 	}
-	staleBefore := now.Add(-lease)
-	if _, err := queue.ReleaseExpiredLeases(ctx, now, staleBefore, runnerIdentity.InstanceID, nil); err != nil {
-		return Result{}, err
-	}
-	frontier, err := queue.ListEligibleJobIDs(ctx, now)
-	if err != nil {
-		return Result{}, err
-	}
+}
 
-	active := map[string]*localActiveJob{}
-	frontierRemaining := stringSet(frontier)
-	var result Result
-	for len(frontierRemaining) > 0 || len(active) > 0 {
-		if err := queue.HeartbeatRunner(ctx, runnerIdentity, os.Getpid(), time.Now().UTC()); err != nil {
-			if len(active) == 0 {
-				return result, err
-			}
-		} else {
-			for len(active) < maxGlobal && len(frontierRemaining) > 0 {
-				job, err := queue.ClaimNextJobInFrontier(ctx, runnerIdentity, cfg.Runner.Capabilities, maxGlobal, limits, lease, keys(frontierRemaining))
-				if err != nil {
-					cancelActive(active, err)
-					_ = waitActive(ctx, cfg, queue, gh, runnerIdentity, active, lease, &result)
-					return result, err
-				}
-				if job == nil {
-					break
-				}
-				delete(frontierRemaining, job.ID)
-				result.Claimed++
-				route, ok := findRoute(cfg, job.RouteName)
-				if !ok {
-					dropped, err := dropOnOwnershipLoss(queue.FinalizeJobOwned(ctx, job.ID, runnerIdentity.InstanceID, model.JobFinalize{Status: model.JobStatusFailed, LastError: "route not found"}))
-					if err != nil {
-						return result, err
-					}
-					if dropped {
-						continue
-					}
-					result.Failed++
-					continue
-				}
-				issue, outcome, err := prepareClaimedJob(ctx, cfg, queue, gh, runnerIdentity, job, route, lease, &result)
-				if err != nil {
-					return result, err
-				}
-				if outcome != claimStart {
-					continue
-				}
-				handle, err := runner.Start(ctx, cfg, route, *job, issue, runnerInfo)
-				if err != nil {
-					var startErr runner.StartError
-					if !errors.As(err, &startErr) {
-						return result, err
-					}
-					dropped, err := updateArtifactsOwnedOrDrop(ctx, queue, job.ID, runnerIdentity.InstanceID, startErr.Result)
-					if err != nil {
-						return result, err
-					}
-					if dropped {
-						continue
-					}
-					if err := finalizeRunResult(ctx, cfg, queue, gh, &localActiveJob{job: job, issue: issue, route: route}, runnerIdentity, lease, startErr.Result, &result); err != nil {
-						return result, err
-					}
-					continue
-				}
-				if err := queue.UpdateJobArtifactsOwned(ctx, job.ID, runnerIdentity.InstanceID, handle.Paths.ContextPath, handle.Paths.ResultPath, handle.Paths.StdoutPath, handle.Paths.StderrPath, handle.PID); err != nil {
-					handle.Cancel(err)
-					_ = runner.Wait(handle)
-					dropped, err := dropOnOwnershipLoss(err)
-					if err != nil {
-						return result, err
-					}
-					if dropped {
-						continue
-					}
-				}
-				active[job.ID] = &localActiveJob{job: job, issue: issue, route: route, handle: handle}
-			}
+func (s *Supervisor) lock(ctx context.Context) error {
+	for {
+		if s.mu.TryLock() {
+			return nil
 		}
-		if len(active) == 0 {
-			if len(frontierRemaining) > 0 {
-				return result, nil
-			}
-			continue
-		}
-		waitCh := firstDone(active)
-		heartbeatTimer := time.NewTimer(heartbeatInterval(lease))
 		select {
 		case <-ctx.Done():
-			stopTimer(heartbeatTimer)
-			cancelActive(active, context.Cause(ctx))
-			_ = waitActive(ctx, cfg, queue, gh, runnerIdentity, active, lease, &result)
-			return result, ctx.Err()
-		case <-waitCh:
-			stopTimer(heartbeatTimer)
-		case <-heartbeatTimer.C:
-			if err := renewActive(ctx, queue, runnerIdentity, active, lease); err != nil {
-				if len(active) == 0 {
-					return result, nil
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func (s *Supervisor) Identity() model.RunnerIdentity {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.identity
+}
+func (s *Supervisor) LeaseDuration() time.Duration { return s.lease }
+func (s *Supervisor) ActiveCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.active)
+}
+func (s *Supervisor) Result() Result {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.result
+}
+
+func (s *Supervisor) ActiveJobIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.activeJobIDsLocked()
+}
+
+func (s *Supervisor) activeJobIDsLocked() []string {
+	ids := make([]string, 0, len(s.active))
+	for id := range s.active {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (s *Supervisor) Heartbeat(ctx context.Context) error {
+	return s.queue.HeartbeatRunner(ctx, s.identity, s.processID, time.Now().UTC())
+}
+
+func (s *Supervisor) ReleaseExpiredLeases(ctx context.Context) (int, error) {
+	s.mu.Lock()
+	activeJobIDs := s.activeJobIDsLocked()
+	instanceID := s.identity.InstanceID
+	s.mu.Unlock()
+	now := time.Now().UTC()
+	return s.queue.ReleaseExpiredLeases(ctx, now, now.Add(-s.lease), instanceID, activeJobIDs)
+}
+
+func (s *Supervisor) PruneStaleHeartbeats(ctx context.Context) (int, error) {
+	return s.queue.PruneStaleRunnerHeartbeats(ctx, time.Now().UTC().Add(-s.lease))
+}
+
+func (s *Supervisor) DeleteHeartbeat(ctx context.Context) error {
+	return s.queue.DeleteRunnerHeartbeat(ctx, s.identity.InstanceID)
+}
+
+func (s *Supervisor) Refill(ctx context.Context) error {
+	if err := s.lock(ctx); err != nil {
+		return err
+	}
+	defer s.mu.Unlock()
+	return s.refill(ctx, nil)
+}
+
+func (s *Supervisor) refill(ctx context.Context, frontierRemaining map[string]struct{}) error {
+	for len(s.active) < s.maxGlobal {
+		var job *model.Job
+		var err error
+		if frontierRemaining != nil {
+			if len(frontierRemaining) == 0 {
+				return nil
+			}
+			job, err = s.queue.ClaimNextJobInFrontier(ctx, s.identity, s.cfg.Runner.Capabilities, s.maxGlobal, s.limits, s.lease, keys(frontierRemaining))
+		} else {
+			job, err = s.queue.ClaimNextJob(ctx, s.identity, s.cfg.Runner.Capabilities, s.maxGlobal, s.limits, s.lease)
+		}
+		if err != nil {
+			return err
+		}
+		if job == nil {
+			return nil
+		}
+		if frontierRemaining != nil {
+			delete(frontierRemaining, job.ID)
+		}
+		s.result.Claimed++
+		route, ok := findRoute(s.cfg, job.RouteName)
+		if !ok {
+			dropped, err := dropOnOwnershipLoss(s.queue.FinalizeJobOwned(ctx, job.ID, s.identity.InstanceID, model.JobFinalize{Status: model.JobStatusFailed, LastError: "route not found"}))
+			if err != nil {
+				return err
+			}
+			if dropped {
+				continue
+			}
+			s.result.Failed++
+			continue
+		}
+		activeJob := &localActiveJob{job: job, route: route}
+		s.active[job.ID] = activeJob
+		issue, outcome, err := prepareClaimedJob(ctx, s.cfg, s.queue, s.gh, s.identity, job, route, s.lease, &s.result)
+		if err != nil {
+			if ctx.Err() == nil {
+				activeJob.preStartError = err.Error()
+			}
+			return err
+		}
+		if outcome != claimStart {
+			delete(s.active, job.ID)
+			continue
+		}
+		activeJob.issue = issue
+		handle, err := runner.Start(ctx, s.cfg, route, *job, issue, s.runnerInfo)
+		activeJob.handle = handle
+		if err != nil {
+			var startErr runner.StartError
+			if !errors.As(err, &startErr) {
+				if ctx.Err() == nil {
+					activeJob.preStartError = err.Error()
 				}
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					cancelActive(active, err)
-					_ = waitActive(ctx, cfg, queue, gh, runnerIdentity, active, lease, &result)
-					return result, err
+				return err
+			}
+			dropped, err := updateArtifactsOwnedOrDrop(ctx, s.queue, job.ID, s.identity.InstanceID, startErr.Result)
+			if err != nil {
+				if ctx.Err() == nil {
+					activeJob.preStartError = err.Error()
 				}
+				return err
+			}
+			if dropped {
+				delete(s.active, job.ID)
+				continue
+			}
+			if err := finalizeRunResult(ctx, s.cfg, s.queue, s.gh, activeJob, s.identity, s.lease, startErr.Result, &s.result); err != nil {
+				if ctx.Err() == nil {
+					activeJob.preStartError = err.Error()
+				}
+				return err
+			}
+			delete(s.active, job.ID)
+			continue
+		}
+		if err := s.queue.UpdateJobArtifactsOwned(ctx, job.ID, s.identity.InstanceID, handle.Paths.ContextPath, handle.Paths.ResultPath, handle.Paths.StdoutPath, handle.Paths.StderrPath, handle.PID); err != nil {
+			handle.Cancel(err)
+			runResult := runner.Wait(handle)
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				cleanupCtx, cancel := context.WithTimeout(context.Background(), CleanupTimeout(s.lease))
+				dropped, cleanupErr := updateArtifactsOwnedOrDrop(cleanupCtx, s.queue, job.ID, s.identity.InstanceID, runResult)
+				if cleanupErr == nil && !dropped {
+					cleanupErr = finalizeRunResult(cleanupCtx, s.cfg, s.queue, s.gh, activeJob, s.identity, s.lease, runResult, &s.result)
+				}
+				cancel()
+				if cleanupErr != nil {
+					return cleanupErr
+				}
+				delete(s.active, job.ID)
+				return err
+			}
+			dropped, err := dropOnOwnershipLoss(err)
+			if err != nil {
+				return err
+			}
+			delete(s.active, job.ID)
+			if dropped {
+				continue
 			}
 			continue
 		}
-		if err := reapReady(ctx, cfg, queue, gh, runnerIdentity, active, lease, &result); err != nil {
-			cancelActive(active, err)
-			_ = waitActive(ctx, cfg, queue, gh, runnerIdentity, active, lease, &result)
-			return result, err
-		}
 	}
-	return result, nil
+	return nil
+}
+
+func (s *Supervisor) Renew(ctx context.Context) error {
+	if err := s.lock(ctx); err != nil {
+		return err
+	}
+	defer s.mu.Unlock()
+	return renewActive(ctx, s.queue, s.identity, s.active, s.lease)
+}
+
+func (s *Supervisor) ReapReady(ctx context.Context) error {
+	if err := s.lock(ctx); err != nil {
+		return err
+	}
+	defer s.mu.Unlock()
+	return reapReady(ctx, s.cfg, s.queue, s.gh, s.identity, s.active, s.lease, &s.result)
+}
+
+func (s *Supervisor) CancelActive(cause error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cancelActive(s.active, cause)
+}
+
+func (s *Supervisor) Wait(ctx context.Context) error {
+	if err := s.lock(ctx); err != nil {
+		return err
+	}
+	defer s.mu.Unlock()
+	return waitActive(ctx, s.cfg, s.queue, s.gh, s.identity, s.active, s.lease, &s.result)
+}
+
+func (s *Supervisor) Shutdown(ctx context.Context, cause error) error {
+	if err := s.lock(ctx); err != nil {
+		return err
+	}
+	defer s.mu.Unlock()
+	if cause == nil {
+		cause = context.Canceled
+	}
+	cancelActive(s.active, cause)
+	return waitActive(ctx, s.cfg, s.queue, s.gh, s.identity, s.active, s.lease, &s.result)
+}
+
+func (s *Supervisor) firstDone() <-chan struct{} {
+	return firstDone(s.active)
 }
 
 type localActiveJob struct {
@@ -186,6 +387,7 @@ type localActiveJob struct {
 	route         config.RouteConfig
 	handle        *runner.Handle
 	lostOwnership bool
+	preStartError string
 }
 
 type claimOutcome int
@@ -356,6 +558,9 @@ func renewActive(ctx context.Context, queue store.QueueStore, identity model.Run
 		transientErr = err
 	}
 	for id, activeJob := range active {
+		if activeJob.handle == nil {
+			continue
+		}
 		if err := queue.RenewJobLease(ctx, activeJob.job.ID, identity.InstanceID, lease); err != nil {
 			if isOwnershipLoss(err) {
 				activeJob.lostOwnership = true
@@ -401,13 +606,27 @@ func stopTimer(timer *time.Timer) {
 
 func cancelActive(active map[string]*localActiveJob, cause error) {
 	for _, activeJob := range active {
+		if activeJob.handle == nil {
+			continue
+		}
 		activeJob.handle.Cancel(cause)
 	}
 }
 
 func waitActive(ctx context.Context, cfg config.Config, queue store.QueueStore, gh issuegithub.Client, identity model.RunnerIdentity, active map[string]*localActiveJob, lease time.Duration, result *Result) error {
 	for len(active) > 0 {
-		<-firstDone(active)
+		progress, err := finalizePreStartCancelled(ctx, queue, identity, active, result)
+		if err != nil {
+			return err
+		}
+		if progress {
+			continue
+		}
+		waitCh := firstDone(active)
+		if waitCh == nil {
+			return errors.New("active pre-start job could not be finalized")
+		}
+		<-waitCh
 		if err := reapReady(ctx, cfg, queue, gh, identity, active, lease, result); err != nil {
 			return err
 		}
@@ -415,8 +634,41 @@ func waitActive(ctx context.Context, cfg config.Config, queue store.QueueStore, 
 	return nil
 }
 
+func finalizePreStartCancelled(ctx context.Context, queue store.QueueStore, identity model.RunnerIdentity, active map[string]*localActiveJob, result *Result) (bool, error) {
+	for id, activeJob := range active {
+		if activeJob.handle != nil {
+			continue
+		}
+		dropped, err := dropOnOwnershipLoss(queue.FinalizeJobOwned(ctx, activeJob.job.ID, identity.InstanceID, model.JobFinalize{Status: model.JobStatusCancelled, LastError: "runner shutting down"}))
+		if err != nil {
+			return false, err
+		}
+		if !dropped {
+			_, _ = queue.InsertJobEvent(ctx, model.JobEvent{JobID: activeJob.job.ID, IssueKey: activeJob.job.IssueKey, EventType: "job_" + model.JobStatusCancelled, Message: "runner shutting down"})
+		}
+		delete(active, id)
+		_ = result
+		return true, nil
+	}
+	return false, nil
+}
+
 func reapReady(ctx context.Context, cfg config.Config, queue store.QueueStore, gh issuegithub.Client, identity model.RunnerIdentity, active map[string]*localActiveJob, lease time.Duration, result *Result) error {
 	for id, activeJob := range active {
+		if activeJob.handle == nil {
+			if activeJob.preStartError != "" {
+				dropped, err := dropOnOwnershipLoss(queue.FinalizeJobOwned(ctx, activeJob.job.ID, identity.InstanceID, model.JobFinalize{Status: model.JobStatusFailed, LastError: activeJob.preStartError}))
+				if err != nil {
+					return err
+				}
+				delete(active, id)
+				if !dropped {
+					_, _ = queue.InsertJobEvent(ctx, model.JobEvent{JobID: activeJob.job.ID, IssueKey: activeJob.job.IssueKey, EventType: "job_" + model.JobStatusFailed, Message: activeJob.preStartError})
+					result.Failed++
+				}
+			}
+			continue
+		}
 		select {
 		case <-activeJob.handle.Done:
 		case <-activeJob.handle.ContextDone:
@@ -429,6 +681,15 @@ func reapReady(ctx context.Context, cfg config.Config, queue store.QueueStore, g
 			continue
 		}
 		dropped, err := updateArtifactsOwnedOrDrop(ctx, queue, activeJob.job.ID, identity.InstanceID, runResult)
+		if err != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), CleanupTimeout(lease))
+			dropped, err = updateArtifactsOwnedOrDrop(cleanupCtx, queue, activeJob.job.ID, identity.InstanceID, runResult)
+			if err == nil && !dropped {
+				err = finalizeRunResult(cleanupCtx, cfg, queue, gh, activeJob, identity, lease, runResult, result)
+			}
+			cancel()
+			return err
+		}
 		if err != nil {
 			return err
 		}
@@ -446,13 +707,17 @@ func finalizeRunResult(ctx context.Context, cfg config.Config, queue store.Queue
 	status := model.JobStatusSucceeded
 	lastErr := ""
 	baseAction := activeJob.route.Job.OnSuccess
-	if runResult.Error != nil || runResult.ExitCode != 0 {
+	if runResult.Cancelled {
+		status = model.JobStatusCancelled
+		lastErr = runResult.ErrorString()
+		baseAction = config.ActionConfig{}
+	} else if runResult.Error != nil || runResult.ExitCode != 0 {
 		status = model.JobStatusFailed
 		lastErr = runResult.ErrorString()
 		baseAction = activeJob.route.Job.OnFailure
 	}
 	finalAction := baseAction
-	if runResult.Paths.ResultPath != "" {
+	if !runResult.Cancelled && runResult.Paths.ResultPath != "" {
 		resultAction, found, parseErr := actions.ParseResultFile(runResult.Paths.ResultPath)
 		if parseErr != nil {
 			status = model.JobStatusFailed
@@ -462,7 +727,7 @@ func finalizeRunResult(ctx context.Context, cfg config.Config, queue store.Queue
 			finalAction = actions.Merge(baseAction, resultAction)
 		}
 	}
-	if gh != nil {
+	if gh != nil && !runResult.Cancelled {
 		if err := queue.RenewJobLease(ctx, activeJob.job.ID, identity.InstanceID, lease); err != nil {
 			dropped, err := dropOnOwnershipLoss(err)
 			if dropped || err == nil {
@@ -507,6 +772,8 @@ func finalizeRunResult(ctx context.Context, cfg config.Config, queue store.Queue
 		result.Succeeded++
 	case model.JobStatusDead:
 		result.Dead++
+	case model.JobStatusCancelled:
+		// Cancellation is tracked by job status but is not a command failure.
 	default:
 		result.Failed++
 	}
@@ -524,9 +791,15 @@ func failClaimedJobAfterRunOwned(ctx context.Context, queue store.QueueStore, jo
 }
 
 func firstDone(active map[string]*localActiveJob) <-chan struct{} {
+	if len(active) == 0 {
+		return nil
+	}
 	out := make(chan struct{})
 	var once sync.Once
 	for _, activeJob := range active {
+		if activeJob.handle == nil {
+			continue
+		}
 		go func(done <-chan struct{}, contextDone <-chan struct{}) {
 			select {
 			case <-done:
@@ -538,7 +811,21 @@ func firstDone(active map[string]*localActiveJob) <-chan struct{} {
 	return out
 }
 
-func heartbeatInterval(lease time.Duration) time.Duration {
+func CleanupTimeout(lease time.Duration) time.Duration {
+	if lease <= 0 {
+		lease = config.DefaultLeaseDuration
+	}
+	timeout := lease
+	if timeout < time.Second {
+		timeout = time.Second
+	}
+	if timeout > 10*time.Second {
+		timeout = 10 * time.Second
+	}
+	return timeout
+}
+
+func HeartbeatInterval(lease time.Duration) time.Duration {
 	interval := lease / 4
 	if interval <= 0 || interval > time.Second {
 		interval = time.Second
