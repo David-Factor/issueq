@@ -19,6 +19,7 @@ type Result struct {
 	Succeeded int
 	Failed    int
 	Skipped   int
+	Dead      int
 }
 
 func Dispatch(ctx context.Context, cfg config.Config, queue store.QueueStore) (Result, error) {
@@ -79,11 +80,43 @@ func DispatchWithGitHub(ctx context.Context, cfg config.Config, queue store.Queu
 				continue
 			}
 			issue = latest
+			generation, _, err := queue.GetIssueState(ctx, issue.IssueKey)
+			if err != nil {
+				return result, err
+			}
+			attempts, err := queue.IncrementAttempts(ctx, issue.IssueKey, generation, route.Name)
+			if err != nil {
+				return result, err
+			}
+			job.Attempts = attempts
+			if attempts > route.Job.MaxAttempts {
+				_, _ = actions.Apply(ctx, cfg, gh, queue, issue, route.Job.OnAttemptsExceeded)
+				if err := queue.FinalizeJob(ctx, job.ID, model.JobFinalize{Status: model.JobStatusDead, LastError: "max attempts exceeded"}); err != nil {
+					return result, err
+				}
+				_, _ = queue.InsertJobEvent(ctx, model.JobEvent{JobID: job.ID, IssueKey: job.IssueKey, EventType: "job_dead", Message: "max attempts exceeded"})
+				result.Dead++
+				continue
+			}
 			applied, err := actions.Apply(ctx, cfg, gh, queue, issue, route.Job.OnStart)
 			if err != nil {
 				return result, err
 			}
 			issue = applied.UpdatedIssue
+			if applied.Changed {
+				dead, err := checkTransitionLimit(ctx, cfg, queue, gh, job.ID, issue, route)
+				if err != nil {
+					return result, err
+				}
+				if dead {
+					if err := queue.FinalizeJob(ctx, job.ID, model.JobFinalize{Status: model.JobStatusDead, LastError: "max transitions exceeded"}); err != nil {
+						return result, err
+					}
+					_, _ = queue.InsertJobEvent(ctx, model.JobEvent{JobID: job.ID, IssueKey: job.IssueKey, EventType: "job_dead", Message: "max transitions exceeded"})
+					result.Dead++
+					continue
+				}
+			}
 			_, _ = queue.InsertJobEvent(ctx, model.JobEvent{JobID: job.ID, IssueKey: job.IssueKey, EventType: "action_on_start"})
 		}
 
@@ -117,6 +150,16 @@ func DispatchWithGitHub(ctx context.Context, cfg config.Config, queue store.Queu
 				lastErr = err.Error()
 			} else {
 				issue = applied.UpdatedIssue
+				if applied.Changed {
+					dead, err := checkTransitionLimit(ctx, cfg, queue, gh, job.ID, issue, route)
+					if err != nil {
+						return result, err
+					}
+					if dead {
+						status = model.JobStatusDead
+						lastErr = "max transitions exceeded"
+					}
+				}
 			}
 			_ = issue
 		}
@@ -134,6 +177,8 @@ func DispatchWithGitHub(ctx context.Context, cfg config.Config, queue store.Queu
 		_, _ = queue.InsertJobEvent(ctx, model.JobEvent{JobID: job.ID, IssueKey: job.IssueKey, EventType: "job_" + status, Message: lastErr})
 		if status == model.JobStatusSucceeded {
 			result.Succeeded++
+		} else if status == model.JobStatusDead {
+			result.Dead++
 		} else {
 			result.Failed++
 		}
@@ -162,4 +207,22 @@ func runnerID(cfg config.Config) string {
 		return cfg.Runner.Name
 	}
 	return "issueq-local"
+}
+
+func checkTransitionLimit(ctx context.Context, cfg config.Config, queue store.QueueStore, gh issuegithub.Client, jobID string, issue model.IssueSnapshot, route config.RouteConfig) (bool, error) {
+	count, err := queue.IncrementTransitions(ctx, issue.IssueKey)
+	if err != nil {
+		return false, err
+	}
+	limit := cfg.Workflow.MaxTransitionsPerIssue
+	if limit == 0 {
+		limit = 10
+	}
+	if limit >= 0 && count <= limit {
+		return false, nil
+	}
+	if gh != nil {
+		_, _ = actions.Apply(ctx, cfg, gh, queue, issue, cfg.Workflow.OnTransitionsExceeded)
+	}
+	return true, nil
 }

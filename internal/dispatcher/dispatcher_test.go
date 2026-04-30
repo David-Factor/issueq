@@ -225,3 +225,96 @@ exit 0
 		t.Fatalf("comments = %#v", gh.comments)
 	}
 }
+
+func TestAttemptsWithinMaxSpawnsSubprocess(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, "#!/bin/sh\necho spawned\n")
+	defer store.Close()
+	cfg.Routes[0].When = config.PredicateConfig{LabelsInclude: []string{"agent-ready"}}
+	cfg.Routes[0].Job.OnStart = config.ActionConfig{LabelsRemove: []string{"agent-ready"}, LabelsAdd: []string{"agent-running"}}
+	cfg.Routes[0].Job.MaxAttempts = 1
+	gh := &fakeGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
+	result, err := DispatchWithGitHub(ctx, cfg, store, gh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Succeeded != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	jobs, _ := store.ListJobs(ctx)
+	assertContains(t, jobs[0].StdoutPath, "spawned")
+}
+
+func TestAttemptsExceededDoesNotSpawnAndMarksDead(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, "#!/bin/sh\necho should-not-run\n")
+	defer store.Close()
+	cfg.Routes[0].When = config.PredicateConfig{LabelsInclude: []string{"agent-ready"}}
+	cfg.Routes[0].Job.MaxAttempts = 1
+	cfg.Routes[0].Job.OnAttemptsExceeded = config.ActionConfig{LabelsAdd: []string{"agent-failed", "agent-needs-human"}, Comment: "too many"}
+	_, err := store.IncrementAttempts(ctx, "github.com/example-org/example-repo#1", 0, "code")
+	if err != nil {
+		t.Fatal(err)
+	}
+	gh := &fakeGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
+	result, err := DispatchWithGitHub(ctx, cfg, store, gh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Dead != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	jobs, _ := store.ListJobs(ctx)
+	if jobs[0].Status != model.JobStatusDead || jobs[0].StdoutPath != "" {
+		t.Fatalf("job = %#v", jobs[0])
+	}
+	if len(gh.comments) != 1 || gh.comments[0] != "too many" {
+		t.Fatalf("comments = %#v", gh.comments)
+	}
+}
+
+func TestTransitionLimitExceededAppliesTerminalAction(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, "#!/bin/sh\nexit 0\n")
+	defer store.Close()
+	cfg.Routes[0].When = config.PredicateConfig{LabelsInclude: []string{"agent-ready"}}
+	cfg.Routes[0].Job.OnStart = config.ActionConfig{LabelsRemove: []string{"agent-ready"}, LabelsAdd: []string{"agent-running"}}
+	cfg.Workflow.MaxTransitionsPerIssue = -1
+	cfg.Workflow.OnTransitionsExceeded = config.ActionConfig{LabelsAdd: []string{"agent-failed", "agent-needs-human"}, Comment: "terminal"}
+	gh := &fakeGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
+	result, err := DispatchWithGitHub(ctx, cfg, store, gh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Dead != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	if len(gh.comments) == 0 || gh.comments[len(gh.comments)-1] != "terminal" {
+		t.Fatalf("comments = %#v", gh.comments)
+	}
+}
+
+func TestReviewLoopStopsAfterConfiguredAttempts(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, "#!/bin/sh\necho should-not-run\n")
+	defer store.Close()
+	cfg.Routes[0].Name = "review"
+	cfg.Routes[0].Job.Kind = "code"
+	cfg.Routes[0].When = config.PredicateConfig{LabelsInclude: []string{"agent-review"}}
+	cfg.Routes[0].Job.MaxAttempts = 2
+	jobs, _ := store.ListJobs(ctx)
+	_ = store.FinalizeJob(ctx, jobs[0].ID, model.JobFinalize{Status: model.JobStatusCancelled})
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "review", Kind: "code", DedupeKey: "review"}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = store.IncrementAttempts(ctx, "github.com/example-org/example-repo#1", 0, "review")
+	_, _ = store.IncrementAttempts(ctx, "github.com/example-org/example-repo#1", 0, "review")
+	gh := &fakeGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-review"}, State: "open"}}
+	result, err := DispatchWithGitHub(ctx, cfg, store, gh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Dead != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+}

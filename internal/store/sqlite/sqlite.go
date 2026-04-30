@@ -254,6 +254,54 @@ WHERE id = ?`, result.Status, result.ResultPath, result.StdoutPath, result.Stder
 	return nil
 }
 
+func (s *Store) IncrementAttempts(ctx context.Context, issueKey string, generation int, routeName string) (int, error) {
+	now := formatTime(time.Now().UTC())
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin increment attempts: %w", err)
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO route_attempts (issue_key, generation, route_name, attempts, updated_at)
+VALUES (?, ?, ?, 0, ?)
+ON CONFLICT(issue_key, generation, route_name) DO NOTHING`, issueKey, generation, routeName, now)
+	if err != nil {
+		return 0, fmt.Errorf("insert route attempts: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `
+UPDATE route_attempts SET attempts = attempts + 1, updated_at = ?
+WHERE issue_key = ? AND generation = ? AND route_name = ?`, now, issueKey, generation, routeName)
+	if err != nil {
+		return 0, fmt.Errorf("update route attempts: %w", err)
+	}
+	var attempts int
+	if err := tx.QueryRowContext(ctx, `SELECT attempts FROM route_attempts WHERE issue_key = ? AND generation = ? AND route_name = ?`, issueKey, generation, routeName).Scan(&attempts); err != nil {
+		return 0, fmt.Errorf("select route attempts: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit increment attempts: %w", err)
+	}
+	return attempts, nil
+}
+
+func (s *Store) GetIssueState(ctx context.Context, issueKey string) (generation int, transitions int, err error) {
+	err = s.db.QueryRowContext(ctx, `SELECT generation, transition_count FROM issue_state WHERE issue_key = ?`, issueKey).Scan(&generation, &transitions)
+	if err != nil {
+		return 0, 0, fmt.Errorf("get issue state: %w", err)
+	}
+	return generation, transitions, nil
+}
+
+func (s *Store) IncrementTransitions(ctx context.Context, issueKey string) (int, error) {
+	now := formatTime(time.Now().UTC())
+	_, err := s.db.ExecContext(ctx, `UPDATE issue_state SET transition_count = transition_count + 1, updated_at = ? WHERE issue_key = ?`, now, issueKey)
+	if err != nil {
+		return 0, fmt.Errorf("increment transitions: %w", err)
+	}
+	_, transitions, err := s.GetIssueState(ctx, issueKey)
+	return transitions, err
+}
+
 func (s *Store) jobByID(ctx context.Context, id string) (model.Job, error) {
 	row := s.db.QueryRowContext(ctx, `
 SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, lease_until, pid,

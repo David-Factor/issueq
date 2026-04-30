@@ -17,6 +17,9 @@ type QueueStore interface {
 	ReleaseExpiredLeases(ctx context.Context, now time.Time) (int, error)
 	FinalizeJob(ctx context.Context, jobID string, result model.JobFinalize) error
 	UpdateJobArtifacts(ctx context.Context, jobID, contextPath, resultPath, stdoutPath, stderrPath string, pid int) error
+	IncrementAttempts(ctx context.Context, issueKey string, generation int, routeName string) (int, error)
+	GetIssueState(ctx context.Context, issueKey string) (generation int, transitions int, err error)
+	IncrementTransitions(ctx context.Context, issueKey string) (int, error)
 	ListJobs(ctx context.Context) ([]model.Job, error)
 	ListIssues(ctx context.Context) ([]model.IssueSnapshot, error)
 	InsertJobEvent(ctx context.Context, event model.JobEvent) (model.JobEvent, error)

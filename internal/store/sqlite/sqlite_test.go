@@ -332,3 +332,43 @@ func TestClaimRespectsGlobalAndRouteConcurrency(t *testing.T) {
 		t.Fatalf("blockedRoute = %#v, want nil", blockedRoute)
 	}
 }
+
+func TestAttemptsScopedByIssueGenerationRouteAndIncrement(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	first, err := store.IncrementAttempts(ctx, "issue-1", 0, "code")
+	if err != nil || first != 1 {
+		t.Fatalf("first attempts=%d err=%v", first, err)
+	}
+	second, err := store.IncrementAttempts(ctx, "issue-1", 0, "code")
+	if err != nil || second != 2 {
+		t.Fatalf("second attempts=%d err=%v", second, err)
+	}
+	otherGen, err := store.IncrementAttempts(ctx, "issue-1", 1, "code")
+	if err != nil || otherGen != 1 {
+		t.Fatalf("otherGen attempts=%d err=%v", otherGen, err)
+	}
+	otherRoute, err := store.IncrementAttempts(ctx, "issue-1", 0, "review")
+	if err != nil || otherRoute != 1 {
+		t.Fatalf("otherRoute attempts=%d err=%v", otherRoute, err)
+	}
+}
+
+func TestTransitionCountIncrements(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	issue := sampleIssue()
+	if err := store.UpsertIssue(ctx, issue); err != nil {
+		t.Fatal(err)
+	}
+	count, err := store.IncrementTransitions(ctx, issue.IssueKey)
+	if err != nil || count != 1 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+	count, err = store.IncrementTransitions(ctx, issue.IssueKey)
+	if err != nil || count != 2 {
+		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
