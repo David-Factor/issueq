@@ -42,6 +42,7 @@ type Paths struct {
 type Result struct {
 	ExitCode   int
 	TimedOut   bool
+	Cancelled  bool
 	Error      error
 	Paths      Paths
 	StartedAt  time.Time
@@ -127,7 +128,8 @@ func Run(ctx context.Context, cfg config.Config, route config.RouteConfig, job m
 	defer cancel()
 	args := append([]string{}, route.Job.Command[1:]...)
 	args = append(args, paths.ContextPath, paths.ResultPath)
-	cmd := exec.CommandContext(timeoutCtx, route.Job.Command[0], args...)
+	cmd := exec.Command(route.Job.Command[0], args...)
+	prepareCommand(cmd)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Env = BuildEnv(cfg, route, job, issue, paths)
@@ -136,11 +138,31 @@ func Run(ctx context.Context, cfg config.Config, route config.RouteConfig, job m
 		return Result{ExitCode: -1, Error: fmt.Errorf("start subprocess: %w", err), Paths: paths, StartedAt: started, FinishedAt: time.Now().UTC()}
 	}
 	pid := cmd.Process.Pid
-	err = cmd.Wait()
-	finished := time.Now().UTC()
-	if timeoutCtx.Err() == context.DeadlineExceeded {
-		return Result{ExitCode: -1, TimedOut: true, Error: fmt.Errorf("subprocess timed out after %s", route.Job.Timeout.Duration), Paths: paths, StartedAt: started, FinishedAt: finished, PID: pid}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	select {
+	case err = <-done:
+	case <-timeoutCtx.Done():
+		killErr := killProcessTree(cmd.Process)
+		err = <-done
+		finished := time.Now().UTC()
+		if timeoutCtx.Err() == context.DeadlineExceeded {
+			if killErr != nil {
+				return Result{ExitCode: -1, TimedOut: true, Error: fmt.Errorf("subprocess timed out after %s; kill process tree: %w", route.Job.Timeout.Duration, killErr), Paths: paths, StartedAt: started, FinishedAt: finished, PID: pid}
+			}
+			return Result{ExitCode: -1, TimedOut: true, Error: fmt.Errorf("subprocess timed out after %s", route.Job.Timeout.Duration), Paths: paths, StartedAt: started, FinishedAt: finished, PID: pid}
+		}
+		cause := context.Cause(timeoutCtx)
+		if cause == nil {
+			cause = context.Canceled
+		}
+		if killErr != nil {
+			return Result{ExitCode: -1, Cancelled: true, Error: fmt.Errorf("subprocess cancelled: %v; kill process tree: %w", cause, killErr), Paths: paths, StartedAt: started, FinishedAt: finished, PID: pid}
+		}
+		return Result{ExitCode: -1, Cancelled: true, Error: cause, Paths: paths, StartedAt: started, FinishedAt: finished, PID: pid}
 	}
+	finished := time.Now().UTC()
 	if err != nil {
 		exitCode := -1
 		var exitErr *exec.ExitError
@@ -150,6 +172,13 @@ func Run(ctx context.Context, cfg config.Config, route config.RouteConfig, job m
 		return Result{ExitCode: exitCode, Error: err, Paths: paths, StartedAt: started, FinishedAt: finished, PID: pid}
 	}
 	return Result{ExitCode: 0, Paths: paths, StartedAt: started, FinishedAt: finished, PID: pid}
+}
+
+func errorsIsProcessDone(err error) bool {
+	if err == nil {
+		return true
+	}
+	return errors.Is(err, os.ErrProcessDone)
 }
 
 func BuildEnv(cfg config.Config, route config.RouteConfig, job model.Job, issue model.IssueSnapshot, paths Paths) []string {
