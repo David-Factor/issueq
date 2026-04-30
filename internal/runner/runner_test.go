@@ -25,13 +25,24 @@ func TestBuildEnvAllowsOnlyExplicitPassAndMetadata(t *testing.T) {
 	issue := testIssue("malicious; touch /tmp/pwned")
 	paths := PreparePaths(cfg.Workdir.Path, job.ID)
 	env := strings.Join(BuildEnv(cfg, cfg.Routes[0], job, issue, paths), "\n")
-	for _, want := range []string{"PATH=/bin", "HOME=/home/test", "AGENT_TOKEN=agent", "ISSUEQ_JOB_ID=job_1", "GITHUB_ISSUE_NUMBER=1"} {
+	for _, want := range []string{"PATH=/bin", "HOME=/home/test", "AGENT_TOKEN=agent", "ISSUEQ_JOB_ID=job_1", "ISSUEQ_ATTEMPT=1", "GITHUB_ISSUE_NUMBER=1"} {
 		if !strings.Contains(env, want) {
 			t.Fatalf("env missing %q:\n%s", want, env)
 		}
 	}
 	if strings.Contains(env, "GITHUB_TOKEN=secret") || strings.Contains(env, "UNLISTED_SECRET") {
 		t.Fatalf("env leaked secret:\n%s", env)
+	}
+}
+
+func TestBuildEnvClampsZeroAttemptToFirstAttempt(t *testing.T) {
+	cfg := testConfig(t, []string{"/bin/echo"})
+	job := testJob()
+	job.Attempts = 0
+	paths := PreparePaths(cfg.Workdir.Path, job.ID)
+	env := strings.Join(BuildEnv(cfg, cfg.Routes[0], job, testIssue("title"), paths), "\n")
+	if !strings.Contains(env, "ISSUEQ_ATTEMPT=1") {
+		t.Fatalf("env = %s, want ISSUEQ_ATTEMPT=1", env)
 	}
 }
 
@@ -61,7 +72,7 @@ PY
 	if err := json.Unmarshal(data, &ctxData); err != nil {
 		t.Fatal(err)
 	}
-	if ctxData.Issue.Title != "title" || ctxData.Job.ID != "job_1" || ctxData.Runner.ID != "runner-1" {
+	if ctxData.Issue.Title != "title" || ctxData.Job.ID != "job_1" || ctxData.Job.Attempt != 1 || ctxData.Runner.ID != "runner-1" {
 		t.Fatalf("context = %#v", ctxData)
 	}
 }
@@ -118,7 +129,7 @@ func testConfig(t *testing.T, command []string) config.Config {
 }
 
 func testJob() model.Job {
-	return model.Job{ID: "job_1", IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code"}
+	return model.Job{ID: "job_1", IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Attempts: 1}
 }
 
 func testIssue(title string) model.IssueSnapshot {

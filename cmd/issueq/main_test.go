@@ -214,7 +214,30 @@ func TestInspectCommandsJSON(t *testing.T) {
 	}
 }
 
-func TestDispatchCommandRunsSeededJob(t *testing.T) {
+func TestDispatchCommandRequiresGitHubTokenByDefault(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "issueq.yaml")
+	dbPath := filepath.Join(dir, "issueq.db")
+	writeConfig(t, configPath, dbPath)
+	t.Setenv("GITHUB_TOKEN", "")
+	_ = os.Unsetenv("GITHUB_TOKEN")
+
+	cmd := newRootCommand()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--config", configPath, "dispatch"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("Execute() error = nil")
+	}
+	if !strings.Contains(err.Error(), "environment variable GITHUB_TOKEN named by github.token_env is not set") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestDispatchCommandLocalNoGitHubRunsSeededJob(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "issueq.yaml")
 	dbPath := filepath.Join(dir, "issueq.db")
@@ -241,7 +264,7 @@ func TestDispatchCommandRunsSeededJob(t *testing.T) {
 	buf := new(bytes.Buffer)
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
-	cmd.SetArgs([]string{"--config", configPath, "dispatch"})
+	cmd.SetArgs([]string{"--config", configPath, "dispatch", "--local-no-github"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("dispatch error = %v", err)
 	}
@@ -261,12 +284,43 @@ func TestDispatchCommandRunsSeededJob(t *testing.T) {
 	if len(jobs) != 1 || jobs[0].Status != model.JobStatusSucceeded {
 		t.Fatalf("jobs = %#v", jobs)
 	}
+	if jobs[0].Attempts != 0 {
+		t.Fatalf("local fixture dispatch should not persist GitHub attempt count, got %d", jobs[0].Attempts)
+	}
 	data, err := os.ReadFile(jobs[0].StdoutPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(data), "cli-dispatch") {
 		t.Fatalf("stdout = %q", data)
+	}
+	ctxData, err := os.ReadFile(jobs[0].ContextPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ctxData), `"attempt": 1`) {
+		t.Fatalf("context = %q, want first attempt", ctxData)
+	}
+}
+
+func TestOnceNoWaitUnsupported(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "issueq.yaml")
+	dbPath := filepath.Join(dir, "issueq.db")
+	writeConfig(t, configPath, dbPath)
+
+	cmd := newRootCommand()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--config", configPath, "once", "--no-wait"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("Execute() error = nil")
+	}
+	if !strings.Contains(err.Error(), "once --no-wait is not supported") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

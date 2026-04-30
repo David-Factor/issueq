@@ -85,16 +85,14 @@ func daemonCommand(configPath *string) *cobra.Command {
 func onceCommand(configPath *string) *cobra.Command {
 	var noWait bool
 	c := &cobra.Command{Use: "once", Short: "Run one poll-route-dispatch reconciliation cycle", RunE: func(cmd *cobra.Command, args []string) error {
+		if noWait {
+			return fmt.Errorf("once --no-wait is not supported until background child supervision is implemented")
+		}
 		cfg, store, gh, err := openGitHubStore(cmd.Context(), *configPath)
 		if err != nil {
 			return err
 		}
 		defer store.Close()
-		if noWait {
-			go func() { _, _ = daemon.Once(context.Background(), *cfg, store, gh) }()
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "once started")
-			return nil
-		}
 		result, err := daemon.Once(cmd.Context(), *cfg, store, gh)
 		if err != nil {
 			return err
@@ -102,7 +100,7 @@ func onceCommand(configPath *string) *cobra.Command {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "once OK: fetched=%d routed=%d claimed=%d succeeded=%d failed=%d\n", result.Poll.IssuesFetched, result.Route.JobsCreated, result.Dispatch.Claimed, result.Dispatch.Succeeded, result.Dispatch.Failed)
 		return nil
 	}}
-	c.Flags().BoolVar(&noWait, "no-wait", false, "return after starting reconciliation")
+	c.Flags().BoolVar(&noWait, "no-wait", false, "unsupported: background reconciliation is not implemented")
 	return c
 }
 
@@ -139,8 +137,17 @@ func routeCommand(configPath *string) *cobra.Command {
 }
 
 func dispatchCommand(configPath *string) *cobra.Command {
-	return &cobra.Command{Use: "dispatch", Short: "Dispatch eligible queued jobs", RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, store, err := openConfiguredStore(cmd.Context(), *configPath)
+	var localNoGitHub bool
+	c := &cobra.Command{Use: "dispatch", Short: "Dispatch eligible queued jobs", RunE: func(cmd *cobra.Command, args []string) error {
+		var cfg *config.Config
+		var store *sqlitestore.Store
+		var gh issuegithub.Client
+		var err error
+		if localNoGitHub {
+			cfg, store, err = openConfiguredStore(cmd.Context(), *configPath)
+		} else {
+			cfg, store, gh, err = openGitHubStore(cmd.Context(), *configPath)
+		}
 		if err != nil {
 			return err
 		}
@@ -148,13 +155,15 @@ func dispatchCommand(configPath *string) *cobra.Command {
 		if _, err := store.ReleaseExpiredLeases(cmd.Context(), time.Now().UTC()); err != nil {
 			return err
 		}
-		result, err := dispatcher.Dispatch(cmd.Context(), *cfg, store)
+		result, err := dispatcher.DispatchWithGitHub(cmd.Context(), *cfg, store, gh)
 		if err != nil {
 			return err
 		}
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "dispatch OK: claimed=%d succeeded=%d failed=%d dead=%d skipped=%d\n", result.Claimed, result.Succeeded, result.Failed, result.Dead, result.Skipped)
 		return nil
 	}}
+	c.Flags().BoolVar(&localNoGitHub, "local-no-github", false, "dispatch without GitHub refresh/actions/attempt enforcement; intended for local fixtures only")
+	return c
 }
 
 func jobsCommand(configPath *string) *cobra.Command {

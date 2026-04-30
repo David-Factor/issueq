@@ -237,6 +237,17 @@ WHERE id = ?`, contextPath, resultPath, stdoutPath, stderrPath, pid, formatTime(
 	return nil
 }
 
+func (s *Store) UpdateJobAttempts(ctx context.Context, jobID string, attempts int) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE jobs
+SET attempts = ?, updated_at = ?
+WHERE id = ?`, attempts, formatTime(time.Now().UTC()), jobID)
+	if err != nil {
+		return fmt.Errorf("update job attempts: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) FinalizeJob(ctx context.Context, jobID string, result model.JobFinalize) error {
 	finished := result.FinishedAt
 	if finished.IsZero() {

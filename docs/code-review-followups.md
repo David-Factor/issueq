@@ -4,52 +4,45 @@ This document tracks issues found during the post Phase 5-8 code review. Automat
 
 ## Priority 0 — must fix before trusting E2E behavior
 
-### 1. `once --no-wait` is not actually safe/nonblocking
+### 1. `once --no-wait` is not actually safe/nonblocking — fixed
 
 **Where:** `cmd/issueq/main.go`, `onceCommand`
 
-`once --no-wait` starts `daemon.Once` in a goroutine, returns immediately, then deferred cleanup closes the SQLite store. In normal CLI execution the process can also exit before the goroutine completes. Errors are discarded.
+`once --no-wait` used to start `daemon.Once` in a goroutine, return immediately, then deferred cleanup closed the SQLite store. In normal CLI execution the process could also exit before the goroutine completed. Errors were discarded.
 
-**Risk:** work may not start or may race with a closed DB.
+**Fix:** `once --no-wait` is now rejected with a clear unsupported error until real background child supervision exists. No goroutine is started.
 
-**Suggested fix:** either remove/disable `--no-wait` for v1 until the dispatcher has real background child supervision, or refactor dispatch into explicit start/reap phases so `--no-wait` synchronously starts jobs, persists artifacts/PIDs, then returns.
+**Verification:** `cmd/issueq` has a CLI test for the unsupported error; standard gates include `go test ./...`.
 
-### 2. `issueq dispatch` bypasses GitHub staleness, actions, and attempts
+### 2. `issueq dispatch` bypasses GitHub staleness, actions, and attempts — fixed
 
 **Where:** `cmd/issueq/main.go`, `dispatchCommand`; `internal/dispatcher`
 
-The CLI `dispatch` command opens only the local store and calls `dispatcher.Dispatch(..., gh=nil)`. That skips:
+The CLI `dispatch` command used to open only the local store and call `dispatcher.Dispatch(..., gh=nil)`, skipping GitHub refresh, stale predicate checks, lifecycle actions, route attempt enforcement, and transition counting.
 
-- GitHub re-fetch before dispatch
-- route predicate staleness check
-- `on_start`
-- success/failure GitHub label/comment actions
-- route attempt increment/enforcement
-- transition counting
+**Fix:** `issueq dispatch` now requires GitHub credentials by default, opens a GitHub-backed store/client, and calls `DispatchWithGitHub`. Local fixture dispatch remains available only via explicit `--local-no-github`.
 
-**Risk:** CLI behavior differs from daemon/once behavior and violates the v1 dispatch/action/staleness requirements.
+**Verification:** CLI tests assert default dispatch requires `github.token_env`; existing dispatcher tests cover GitHub refresh/stale skip/actions/attempts; local fixture dispatch is covered through `dispatch --local-no-github`.
 
-**Suggested fix:** make `dispatch` a GitHub-contacting command by default using `openGitHubStore` and `DispatchWithGitHub`. If local-only fixture dispatch remains useful, gate it behind an explicit flag such as `--local-no-github`.
-
-### 3. Attempt numbers are off by one and not persisted on jobs
+### 3. Attempt numbers are off by one and not persisted on jobs — fixed
 
 **Where:** `internal/dispatcher/dispatcher.go`; `internal/runner/runner.go`; `internal/store/sqlite/sqlite.go`
 
-`IncrementAttempts` returns the current attempt number and dispatcher assigns it to `job.Attempts`, but runner writes `job.Attempts + 1` to context JSON and env. The first GitHub-aware run therefore reports attempt `2`. The `jobs.attempts` column is also not updated when attempts increment.
+`IncrementAttempts` returns the current attempt number and dispatcher assigns it to `job.Attempts`, but runner used to write `job.Attempts + 1` to context JSON and env. The first GitHub-aware run therefore reported attempt `2`. The `jobs.attempts` column was also not updated when attempts incremented.
 
-**Risk:** confusing context/env, misleading CLI state, incorrect downstream agent behavior.
+**Fix:** `Job.Attempts` is now treated as the current GitHub-backed attempt once dispatcher increments it. Runner context JSON and `ISSUEQ_ATTEMPT` emit that value directly, clamped to `1` for local fixture jobs that have no GitHub-backed attempt counter. The store interface and SQLite implementation now include `UpdateJobAttempts`, and dispatcher persists attempts immediately after route-attempt increment.
 
-**Suggested fix:** treat `Job.Attempts` as the current attempt. Runner should emit it directly. Add a store method or update path to persist `jobs.attempts` when route attempts increment.
+**Verification:** runner tests assert attempt `1` in env/context for a first attempt and for zero-attempt local fixture jobs; dispatcher tests assert the job row persists `attempts=1` and result-driven comment sees `ISSUEQ_ATTEMPT=1`.
 
-### 4. Claimed jobs can remain `running` after post-claim errors
+### 4. Claimed jobs can remain `running` after post-claim errors — fixed
 
 **Where:** `internal/dispatcher/dispatcher.go`
 
-After a job is claimed, several errors return from dispatch without finalizing/releasing the job, including GitHub refresh errors, issue state errors, attempt increment errors, `on_start` errors, and transition-limit errors.
+After a job is claimed, several errors could return from dispatch without finalizing/releasing the job, including GitHub refresh errors, issue state errors, attempt increment errors, `on_start` errors, and transition-limit errors.
 
-**Risk:** jobs remain `running` until lease expiry, causing delayed retries and confusing operator state.
+**Fix:** dispatcher now uses a common `failClaimedJob` path for post-claim GitHub refresh/upsert, issue-state, attempt increment/persist, `on_start`, terminal action, and transition-limit errors. These jobs are finalized as `failed`, get `last_error`, and emit a `job_failed` event. This intentionally treats transient GitHub/API errors as failed jobs for now rather than leaving them leased/running.
 
-**Suggested fix:** once a job is claimed, use a common finalize/release path. For deterministic action/application failures, mark the job `failed` with `last_error`. For transient GitHub fetch failures, choose and document either release-to-pending or failed-with-retry policy.
+**Verification:** dispatcher tests inject GitHub refresh and `on_start` failures and assert jobs end as `failed` with useful `last_error`, not `running`.
 
 ## Priority 1 — important hardening
 
@@ -107,7 +100,7 @@ The current code refreshes before actions, locally edits labels after remove/add
 
 **Where:** `internal/dispatcher/dispatcher.go`
 
-Errors from `actions.Apply` are discarded for `on_attempts_exceeded` and workflow terminalization.
+Errors from `actions.Apply` are still discarded for workflow terminalization (`workflow.on_transitions_exceeded`). `on_attempts_exceeded` action errors are now captured by the Priority 0 post-claim error handling fix.
 
 **Risk:** jobs may be marked `dead` even though GitHub was not updated with terminal labels/comments.
 
@@ -137,11 +130,11 @@ The daemon loop calls `Once`, and `Once` blocks until all dispatch work in the c
 
 ## Suggested work order
 
-1. Fix `dispatch` to use GitHub-backed dispatch by default.
-2. Fix attempt numbering and persist job attempts.
-3. Add common post-claim failure handling so jobs do not remain `running` on errors.
+1. ~~Fix `dispatch` to use GitHub-backed dispatch by default.~~
+2. ~~Fix attempt numbering and persist job attempts.~~
+3. ~~Add common post-claim failure handling so jobs do not remain `running` on errors.~~
 4. Fix action post-refresh and real label-change detection.
-5. Decide whether to remove/disable `once --no-wait` or implement real nonblocking spawn semantics.
+5. ~~Decide whether to remove/disable `once --no-wait` or implement real nonblocking spawn semantics.~~ Disabled for now.
 6. Document or implement lease renewal/process-tree killing/concurrent supervision.
 7. Add HTTP client timeout.
 8. Re-run automated gates, then start Phase 9 manual E2E.

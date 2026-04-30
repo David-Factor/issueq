@@ -84,6 +84,13 @@ func WriteContext(paths Paths, ctxData Context) error {
 	return nil
 }
 
+func currentAttempt(attempts int) int {
+	if attempts < 1 {
+		return 1
+	}
+	return attempts
+}
+
 func Run(ctx context.Context, cfg config.Config, route config.RouteConfig, job model.Job, issue model.IssueSnapshot, runnerInfo model.RunnerInfo) Result {
 	paths := PreparePaths(cfg.Workdir.Path, job.ID)
 	started := time.Now().UTC()
@@ -93,7 +100,7 @@ func Run(ctx context.Context, cfg config.Config, route config.RouteConfig, job m
 			ID:          job.ID,
 			Route:       job.RouteName,
 			Kind:        job.Kind,
-			Attempt:     job.Attempts + 1,
+			Attempt:     currentAttempt(job.Attempts),
 			MaxAttempts: route.Job.MaxAttempts,
 		},
 		Runner: runnerInfo,
@@ -168,7 +175,7 @@ func BuildEnv(cfg config.Config, route config.RouteConfig, job model.Job, issue 
 	env["ISSUEQ_JOB_ID"] = job.ID
 	env["ISSUEQ_ROUTE"] = job.RouteName
 	env["ISSUEQ_KIND"] = job.Kind
-	env["ISSUEQ_ATTEMPT"] = strconv.Itoa(job.Attempts + 1)
+	env["ISSUEQ_ATTEMPT"] = strconv.Itoa(currentAttempt(job.Attempts))
 	env["ISSUEQ_CONTEXT_PATH"] = paths.ContextPath
 	env["ISSUEQ_RESULT_PATH"] = paths.ResultPath
 	env["ISSUEQ_ISSUE_KEY"] = issue.IssueKey

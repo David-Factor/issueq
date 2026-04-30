@@ -242,7 +242,7 @@ func (c Config) Validate(opts ValidateOptions) error {
 	} else if !validEnvName(c.GitHub.TokenEnv) {
 		errs = append(errs, fmt.Sprintf("github.token_env %q is not a valid environment variable name", c.GitHub.TokenEnv))
 	} else if opts.RequireGitHubToken {
-		if _, ok := os.LookupEnv(c.GitHub.TokenEnv); !ok {
+		if strings.TrimSpace(os.Getenv(c.GitHub.TokenEnv)) == "" {
 			errs = append(errs, fmt.Sprintf("environment variable %s named by github.token_env is not set", c.GitHub.TokenEnv))
 		}
 	}

@@ -208,6 +208,12 @@ func TestRequireGitHubToken(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 
+	t.Setenv("ISSUEQ_TEST_TOKEN", "   ")
+	_, err = LoadBytesWithOptions([]byte(cfgText), ValidateOptions{RequireGitHubToken: true})
+	if err == nil {
+		t.Fatal("LoadBytesWithOptions() error = nil for whitespace token")
+	}
+
 	t.Setenv("ISSUEQ_TEST_TOKEN", "secret")
 	if _, err := LoadBytesWithOptions([]byte(cfgText), ValidateOptions{RequireGitHubToken: true}); err != nil {
 		t.Fatalf("LoadBytesWithOptions() error = %v", err)

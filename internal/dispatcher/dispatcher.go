@@ -68,9 +68,17 @@ func DispatchWithGitHub(ctx context.Context, cfg config.Config, queue store.Queu
 		if gh != nil {
 			latest, err := gh.GetIssue(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number)
 			if err != nil {
-				return result, err
+				if ferr := failClaimedJob(ctx, queue, job, &result, fmt.Sprintf("refresh issue: %v", err)); ferr != nil {
+					return result, ferr
+				}
+				continue
 			}
-			_ = queue.UpsertIssue(ctx, latest)
+			if err := queue.UpsertIssue(ctx, latest); err != nil {
+				if ferr := failClaimedJob(ctx, queue, job, &result, fmt.Sprintf("store refreshed issue: %v", err)); ferr != nil {
+					return result, ferr
+				}
+				continue
+			}
 			if !router.Matches(cfg, route, latest) {
 				if err := queue.FinalizeJob(ctx, job.ID, model.JobFinalize{Status: model.JobStatusSkipped, LastError: "stale route predicate"}); err != nil {
 					return result, err
@@ -82,15 +90,32 @@ func DispatchWithGitHub(ctx context.Context, cfg config.Config, queue store.Queu
 			issue = latest
 			generation, _, err := queue.GetIssueState(ctx, issue.IssueKey)
 			if err != nil {
-				return result, err
+				if ferr := failClaimedJob(ctx, queue, job, &result, fmt.Sprintf("load issue state: %v", err)); ferr != nil {
+					return result, ferr
+				}
+				continue
 			}
 			attempts, err := queue.IncrementAttempts(ctx, issue.IssueKey, generation, route.Name)
 			if err != nil {
-				return result, err
+				if ferr := failClaimedJob(ctx, queue, job, &result, fmt.Sprintf("increment attempts: %v", err)); ferr != nil {
+					return result, ferr
+				}
+				continue
 			}
 			job.Attempts = attempts
+			if err := queue.UpdateJobAttempts(ctx, job.ID, attempts); err != nil {
+				if ferr := failClaimedJob(ctx, queue, job, &result, fmt.Sprintf("persist job attempts: %v", err)); ferr != nil {
+					return result, ferr
+				}
+				continue
+			}
 			if attempts > route.Job.MaxAttempts {
-				_, _ = actions.Apply(ctx, cfg, gh, queue, issue, route.Job.OnAttemptsExceeded)
+				if _, err := actions.Apply(ctx, cfg, gh, queue, issue, route.Job.OnAttemptsExceeded); err != nil {
+					if ferr := failClaimedJob(ctx, queue, job, &result, fmt.Sprintf("apply attempts-exceeded actions: %v", err)); ferr != nil {
+						return result, ferr
+					}
+					continue
+				}
 				if err := queue.FinalizeJob(ctx, job.ID, model.JobFinalize{Status: model.JobStatusDead, LastError: "max attempts exceeded"}); err != nil {
 					return result, err
 				}
@@ -100,13 +125,19 @@ func DispatchWithGitHub(ctx context.Context, cfg config.Config, queue store.Queu
 			}
 			applied, err := actions.Apply(ctx, cfg, gh, queue, issue, route.Job.OnStart)
 			if err != nil {
-				return result, err
+				if ferr := failClaimedJob(ctx, queue, job, &result, fmt.Sprintf("apply on_start actions: %v", err)); ferr != nil {
+					return result, ferr
+				}
+				continue
 			}
 			issue = applied.UpdatedIssue
 			if applied.Changed {
 				dead, err := checkTransitionLimit(ctx, cfg, queue, gh, job.ID, issue, route)
 				if err != nil {
-					return result, err
+					if ferr := failClaimedJob(ctx, queue, job, &result, fmt.Sprintf("check transition limit: %v", err)); ferr != nil {
+						return result, ferr
+					}
+					continue
 				}
 				if dead {
 					if err := queue.FinalizeJob(ctx, job.ID, model.JobFinalize{Status: model.JobStatusDead, LastError: "max transitions exceeded"}); err != nil {
@@ -153,7 +184,10 @@ func DispatchWithGitHub(ctx context.Context, cfg config.Config, queue store.Queu
 				if applied.Changed {
 					dead, err := checkTransitionLimit(ctx, cfg, queue, gh, job.ID, issue, route)
 					if err != nil {
-						return result, err
+						if ferr := failClaimedJob(ctx, queue, job, &result, fmt.Sprintf("check transition limit: %v", err)); ferr != nil {
+							return result, ferr
+						}
+						continue
 					}
 					if dead {
 						status = model.JobStatusDead
@@ -207,6 +241,15 @@ func runnerID(cfg config.Config) string {
 		return cfg.Runner.Name
 	}
 	return "issueq-local"
+}
+
+func failClaimedJob(ctx context.Context, queue store.QueueStore, job *model.Job, result *Result, message string) error {
+	if err := queue.FinalizeJob(ctx, job.ID, model.JobFinalize{Status: model.JobStatusFailed, LastError: message}); err != nil {
+		return err
+	}
+	_, _ = queue.InsertJobEvent(ctx, model.JobEvent{JobID: job.ID, IssueKey: job.IssueKey, EventType: "job_failed", Message: message})
+	result.Failed++
+	return nil
 }
 
 func checkTransitionLimit(ctx context.Context, cfg config.Config, queue store.QueueStore, gh issuegithub.Client, jobID string, issue model.IssueSnapshot, route config.RouteConfig) (bool, error) {
