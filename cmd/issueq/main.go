@@ -6,6 +6,8 @@ import (
 	"os"
 
 	"issueq/internal/config"
+	issuegithub "issueq/internal/github"
+	"issueq/internal/poller"
 	"issueq/internal/router"
 	sqlitestore "issueq/internal/store/sqlite"
 
@@ -39,7 +41,7 @@ func newRootCommand() *cobra.Command {
 	cmd.AddCommand(
 		stubCommand("daemon", "Run the long-lived issueq daemon", &configPath),
 		stubCommand("once", "Run one poll-route-dispatch reconciliation cycle", &configPath),
-		stubCommand("poll", "Poll GitHub issues into the local store", &configPath),
+		pollCommand(&configPath),
 		routeCommand(&configPath),
 		stubCommand("dispatch", "Dispatch eligible queued jobs", &configPath),
 		jobsCommand(&configPath),
@@ -71,6 +73,32 @@ func configCheckCommand(use, short string, configPath *string) *cobra.Command {
 				return err
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "config OK: %s\n", *configPath)
+			return nil
+		},
+	}
+}
+
+func pollCommand(configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "poll",
+		Short: "Poll GitHub issues into the local store",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, store, err := openConfiguredStoreWithOptions(cmd.Context(), *configPath, config.ValidateOptions{RequireGitHubToken: true})
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			token := os.Getenv(cfg.GitHub.TokenEnv)
+			client, err := issuegithub.NewRESTClient(cfg.GitHub.Host, token)
+			if err != nil {
+				return err
+			}
+			result, err := poller.Poll(cmd.Context(), *cfg, client, store)
+			if err != nil {
+				return fmt.Errorf("poll failed: %s", issuegithub.RedactSecrets(err.Error(), token))
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "poll OK: fetched=%d upserted=%d\n", result.IssuesFetched, result.IssuesUpserted)
 			return nil
 		},
 	}
@@ -145,7 +173,11 @@ func issuesCommand(configPath *string) *cobra.Command {
 }
 
 func openConfiguredStore(ctx context.Context, configPath string) (*config.Config, *sqlitestore.Store, error) {
-	cfg, err := config.LoadFile(configPath)
+	return openConfiguredStoreWithOptions(ctx, configPath, config.ValidateOptions{})
+}
+
+func openConfiguredStoreWithOptions(ctx context.Context, configPath string, opts config.ValidateOptions) (*config.Config, *sqlitestore.Store, error) {
+	cfg, err := config.LoadFileWithOptions(configPath, opts)
 	if err != nil {
 		return nil, nil, err
 	}

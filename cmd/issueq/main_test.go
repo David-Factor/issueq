@@ -48,13 +48,13 @@ func TestStubCommandsAcceptConfigFlag(t *testing.T) {
 	buf := new(bytes.Buffer)
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
-	cmd.SetArgs([]string{"--config", "custom.yaml", "poll"})
+	cmd.SetArgs([]string{"--config", "custom.yaml", "dispatch"})
 
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	want := "poll is not implemented yet (config: custom.yaml)"
+	want := "dispatch is not implemented yet (config: custom.yaml)"
 	if !strings.Contains(buf.String(), want) {
 		t.Fatalf("output missing %q:\n%s", want, buf.String())
 	}
@@ -107,6 +107,29 @@ routes:
 		t.Fatal("Execute() error = nil")
 	}
 	if !strings.Contains(err.Error(), "github.repo is required") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestPollCommandMissingTokenEnvFails(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "issueq.yaml")
+	dbPath := filepath.Join(dir, "issueq.db")
+	writeConfig(t, configPath, dbPath)
+	t.Setenv("GITHUB_TOKEN", "")
+	_ = os.Unsetenv("GITHUB_TOKEN")
+
+	cmd := newRootCommand()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--config", configPath, "poll"})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("Execute() error = nil")
+	}
+	if !strings.Contains(err.Error(), "environment variable GITHUB_TOKEN named by github.token_env is not set") {
 		t.Fatalf("error = %v", err)
 	}
 }

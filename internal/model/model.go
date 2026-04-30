@@ -1,7 +1,10 @@
 // Package model defines shared domain types for issueq.
 package model
 
-import "time"
+import (
+	"strconv"
+	"time"
+)
 
 const (
 	JobStatusPending   = "pending"
@@ -69,4 +72,8 @@ type JobEvent struct {
 	Message   string
 	DataJSON  string
 	CreatedAt time.Time
+}
+
+func IssueKey(host, owner, repo string, number int) string {
+	return host + "/" + owner + "/" + repo + "#" + strconv.Itoa(number)
 }
