@@ -337,7 +337,7 @@ Startup must fail fast if:
 - token env var is missing for commands that contact GitHub
 - SQLite path is empty
 - `runner.env.pass` or route-level `job.env.pass` contains an invalid environment variable name
-- `github.token_env` is included in subprocess env pass-through without an explicit acknowledgement flag, if that guard is implemented
+- `github.token_env` is included in any subprocess env pass-through list
 - route names are empty or duplicated
 - route kind is empty
 - command is empty for a dispatchable job
@@ -680,8 +680,7 @@ Subprocesses may write:
 {
   "comment": "Implemented in PR #456.",
   "labels_add": ["agent-review"],
-  "labels_remove": ["agent-running"],
-  "enqueue": []
+  "labels_remove": ["agent-running"]
 }
 ```
 
@@ -696,17 +695,11 @@ V1 result policy:
 
 ### 13.5 Direct queue appends
 
-Result JSON may eventually include local follow-up jobs:
+V1 does not support direct queue appends from result JSON.
 
-```json
-{
-  "enqueue": [
-    {"route": "cleanup", "kind": "cleanup", "delay": "5m"}
-  ]
-}
-```
+User-visible workflow follow-ups must be represented by GitHub labels and routed by the router. For example, a successful code job should add `agent-review`; the next poll/route cycle then creates the review job.
 
-V1 may defer `enqueue` support. User-visible workflow follow-ups should normally be represented by GitHub labels and routed by the router.
+Local/internal follow-up jobs such as cleanup may be reconsidered after v1.
 
 ## 14. GitHub interaction
 
@@ -740,7 +733,7 @@ routes:
         pass: [AGENT_GITHUB_TOKEN]
 ```
 
-The `issueq` GitHub token and coding-agent GitHub credentials should be treated as separate credentials. By default, the `issueq` token should not be passed to subprocesses unless the user explicitly opts into that environment pass-through.
+The `issueq` GitHub token and coding-agent GitHub credentials are separate credentials. `github.token_env` must not be passed to subprocesses. If a coding agent needs GitHub access, configure a different env var such as `AGENT_GITHUB_TOKEN`.
 
 ### 14.2 Polling
 
@@ -816,7 +809,22 @@ internal/logging
 migrations
 ```
 
-### 16.1 Interfaces
+### 16.1 Initial Go dependencies
+
+Recommended v1 dependencies:
+
+```text
+CLI:        github.com/spf13/cobra
+Config:     gopkg.in/yaml.v3
+SQLite:     modernc.org/sqlite
+GitHub:     github.com/google/go-github/v66/github
+IDs:        github.com/oklog/ulid/v2
+Logging:    standard library log/slog
+```
+
+Use `modernc.org/sqlite` to avoid CGO for local builds. Keep dependency use modest and hidden behind internal interfaces where practical.
+
+### 16.2 Interfaces
 
 ```go
 type QueueStore interface {
@@ -953,7 +961,7 @@ A v1 implementation is complete when it satisfies these requirements:
 - **R5 Inspect**: list jobs and issues from local state.
 - **R6 Dispatch**: claim jobs, enforce leases/capacity, and spawn argv-array subprocesses.
 - **R7 Context**: write context/result paths and expected environment variables.
-- **R8 Results**: handle exit code, timeout, stdout/stderr capture, and optional result JSON.
+- **R8 Results**: handle exit code, timeout, stdout/stderr capture, and optional result JSON without direct queue append support.
 - **R9 GitHub actions**: apply start/success/failure/terminal labels and comments.
 - **R10 Staleness**: re-fetch and skip stale jobs before execution.
 - **R11 Loop prevention**: enforce route max attempts and max transitions.

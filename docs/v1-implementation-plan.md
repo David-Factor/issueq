@@ -75,7 +75,12 @@ Create fixture task scripts under `testdata/tasks/` or generated temp dirs:
 ### Scope
 
 - Create Go module.
-- Add minimal CLI entrypoint.
+- Add chosen initial dependencies:
+  - `github.com/spf13/cobra`
+  - `gopkg.in/yaml.v3`
+  - `modernc.org/sqlite`
+  - `github.com/google/go-github/v66/github`
+  - `github.com/oklog/ulid/v2`
 - Add package layout from spec.
 - Add initial README usage notes.
 - Add Makefile or just documented commands.
@@ -131,7 +136,7 @@ Unit tests:
 - command string is not accepted as shell string; command must be YAML list.
 - invalid env var names in pass-through config fail.
 - default config does not inherit the full parent environment.
-- including `github.token_env` in subprocess pass-through is rejected or requires the documented explicit acknowledgement if that guard is implemented.
+- `github.token_env` in subprocess pass-through config fails.
 
 CLI smoke:
 
@@ -313,7 +318,7 @@ Runner/component tests:
 - context file contains issue/job/runner data.
 - env vars are present.
 - subprocess receives allowlisted env vars.
-- subprocess does not receive `GITHUB_TOKEN`/the `github.token_env` value by default.
+- subprocess does not receive `GITHUB_TOKEN`/the `github.token_env` value.
 - stdout/stderr files are written.
 - global concurrency limit is respected.
 - per-route concurrency limit is respected.
@@ -344,6 +349,7 @@ CLI smoke:
 - Apply `on_start` before subprocess spawn.
 - Apply `on_success`/`on_failure` after subprocess completion.
 - Parse optional result JSON and merge per spec §13.4.
+- Reject unsupported result JSON fields such as `enqueue` with a controlled failure or validation error.
 - Treat malformed result JSON as failure.
 
 ### Requirements addressed
@@ -360,6 +366,7 @@ Unit tests:
 - action merge concatenates comments.
 - result-file label ops win conflicts.
 - malformed result JSON returns controlled error.
+- result JSON containing unsupported `enqueue` field returns controlled error.
 
 Component tests with fake GitHub:
 
@@ -529,7 +536,7 @@ Do not implement in v1 unless required by real use:
 - Webhooks.
 - Multiple repos per config.
 - Rich predicates.
-- Direct queue append support from result JSON.
+- direct queue append support from result JSON.
 - Structured GitHub state comment.
 - Exit-code outcome mapping beyond success/failure.
 - Web dashboard.
