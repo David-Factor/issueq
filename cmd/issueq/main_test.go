@@ -43,13 +43,13 @@ func TestStubCommandsAcceptConfigFlag(t *testing.T) {
 	buf := new(bytes.Buffer)
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
-	cmd.SetArgs([]string{"--config", "custom.yaml", "jobs"})
+	cmd.SetArgs([]string{"--config", "custom.yaml", "poll"})
 
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	want := "jobs is not implemented yet (config: custom.yaml)"
+	want := "poll is not implemented yet (config: custom.yaml)"
 	if !strings.Contains(buf.String(), want) {
 		t.Fatalf("output missing %q:\n%s", want, buf.String())
 	}
@@ -103,5 +103,51 @@ routes:
 	}
 	if !strings.Contains(err.Error(), "github.repo is required") {
 		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestJobsAndIssuesCommandsWorkOnEmptyDB(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "issueq.yaml")
+	dbPath := filepath.Join(dir, "issueq.db")
+	writeConfig(t, configPath, dbPath)
+
+	for _, name := range []string{"jobs", "issues"} {
+		t.Run(name, func(t *testing.T) {
+			cmd := newRootCommand()
+			buf := new(bytes.Buffer)
+			cmd.SetOut(buf)
+			cmd.SetErr(buf)
+			cmd.SetArgs([]string{"--config", configPath, name})
+
+			if err := cmd.Execute(); err != nil {
+				t.Fatalf("Execute() error = %v", err)
+			}
+			if buf.String() != "" {
+				t.Fatalf("output = %q, want empty", buf.String())
+			}
+		})
+	}
+}
+
+func writeConfig(t *testing.T, path, dbPath string) {
+	t.Helper()
+	content := `github:
+  owner: example-org
+  repo: example-repo
+queue:
+  sqlite:
+    path: ` + dbPath + `
+routes:
+  - name: triage
+    job:
+      kind: triage
+      command: ["./tasks/triage.sh"]
+      timeout: 10m
+      concurrency: 1
+      max_attempts: 2
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
