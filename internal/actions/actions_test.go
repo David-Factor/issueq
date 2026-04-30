@@ -1,12 +1,16 @@
 package actions
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"issueq/internal/config"
+	"issueq/internal/model"
+	sqlitestore "issueq/internal/store/sqlite"
 )
 
 func TestMergeConcatenatesComments(t *testing.T) {
@@ -24,6 +28,104 @@ func TestMergeResultFileLabelOpsWinConflicts(t *testing.T) {
 	if strings.Join(got.LabelsRemove, ",") != "agent-review" {
 		t.Fatalf("labels remove = %#v", got.LabelsRemove)
 	}
+}
+
+func TestApplyRefreshesAfterMutationsAndDetectsRealLabelChange(t *testing.T) {
+	ctx := context.Background()
+	queue, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "issueq.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	issue := testIssue([]string{"agent-ready"})
+	final := testIssue([]string{"agent-running"})
+	final.GitHubUpdatedAt = time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)
+	gh := &fakeClient{issues: []model.IssueSnapshot{issue, final}}
+
+	result, err := Apply(ctx, testConfig(), gh, queue, issue, config.ActionConfig{LabelsRemove: []string{"agent-ready"}, LabelsAdd: []string{"agent-running"}, Comment: "started"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Changed {
+		t.Fatal("Changed = false, want true")
+	}
+	if strings.Join(result.UpdatedIssue.Labels, ",") != "agent-running" || !result.UpdatedIssue.GitHubUpdatedAt.Equal(final.GitHubUpdatedAt) {
+		t.Fatalf("updated issue = %#v", result.UpdatedIssue)
+	}
+	stored, err := queue.GetIssue(ctx, issue.IssueKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(stored.Labels, ",") != "agent-running" || !stored.GitHubUpdatedAt.Equal(final.GitHubUpdatedAt) {
+		t.Fatalf("stored issue = %#v", stored)
+	}
+	if got := strings.Join(gh.calls, "|"); got != "get|remove:agent-ready|add:agent-running|comment|get" {
+		t.Fatalf("calls = %s", got)
+	}
+}
+
+func TestApplyNoOpLabelsAndCommentsDoNotCountAsChanged(t *testing.T) {
+	ctx := context.Background()
+	queue, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "issueq.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	issue := testIssue([]string{"agent-ready"})
+	gh := &fakeClient{issues: []model.IssueSnapshot{issue, issue}}
+
+	result, err := Apply(ctx, testConfig(), gh, queue, issue, config.ActionConfig{LabelsRemove: []string{"missing"}, LabelsAdd: []string{"agent-ready"}, Comment: "note"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Changed {
+		t.Fatal("Changed = true, want false")
+	}
+	if got := strings.Join(gh.calls, "|"); got != "get|remove:missing|add:agent-ready|comment|get" {
+		t.Fatalf("calls = %s", got)
+	}
+}
+
+func testConfig() config.Config {
+	return config.Config{GitHub: config.GitHubConfig{Host: "github.com", Owner: "example-org", Repo: "example-repo"}}
+}
+
+func testIssue(labels []string) model.IssueSnapshot {
+	return model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: labels, State: "open"}
+}
+
+type fakeClient struct {
+	issues []model.IssueSnapshot
+	calls  []string
+}
+
+func (f *fakeClient) ListOpenIssues(ctx context.Context, owner, repo string) ([]model.IssueSnapshot, error) {
+	return nil, nil
+}
+
+func (f *fakeClient) GetIssue(ctx context.Context, owner, repo string, number int) (model.IssueSnapshot, error) {
+	f.calls = append(f.calls, "get")
+	if len(f.issues) == 0 {
+		return model.IssueSnapshot{}, nil
+	}
+	issue := f.issues[0]
+	f.issues = f.issues[1:]
+	return issue, nil
+}
+
+func (f *fakeClient) AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	f.calls = append(f.calls, "add:"+strings.Join(labels, ","))
+	return nil
+}
+
+func (f *fakeClient) RemoveLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	f.calls = append(f.calls, "remove:"+strings.Join(labels, ","))
+	return nil
+}
+
+func (f *fakeClient) CreateComment(ctx context.Context, owner, repo string, number int, body string) error {
+	f.calls = append(f.calls, "comment")
+	return nil
 }
 
 func TestParseResultFileErrors(t *testing.T) {

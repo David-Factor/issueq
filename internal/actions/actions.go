@@ -97,31 +97,54 @@ func Apply(ctx context.Context, cfg config.Config, client issuegithub.Client, qu
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("refresh issue before action: %w", err)
 	}
-	changed := false
+	beforeLabels := append([]string{}, latest.Labels...)
+	mutated := false
 	if len(action.LabelsRemove) > 0 {
 		if err := client.RemoveLabels(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number, action.LabelsRemove); err != nil && !isAbsentLabelError(err) {
 			return ApplyResult{}, fmt.Errorf("remove labels: %w", err)
 		}
-		latest.Labels = removeLabels(latest.Labels, action.LabelsRemove)
-		changed = true
+		mutated = true
 	}
 	if len(action.LabelsAdd) > 0 {
 		if err := client.AddLabels(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number, action.LabelsAdd); err != nil {
 			return ApplyResult{}, fmt.Errorf("add labels: %w", err)
 		}
-		latest.Labels = addLabels(latest.Labels, action.LabelsAdd)
-		changed = true
+		mutated = true
 	}
 	if strings.TrimSpace(action.Comment) != "" {
 		if err := client.CreateComment(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number, action.Comment); err != nil {
 			return ApplyResult{}, fmt.Errorf("create comment: %w", err)
+		}
+		mutated = true
+	}
+	if mutated {
+		latest, err = client.GetIssue(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number)
+		if err != nil {
+			return ApplyResult{}, fmt.Errorf("refresh issue after action: %w", err)
 		}
 	}
 	latest.IssueKey = model.IssueKey(latest.Host, latest.Owner, latest.Repo, latest.Number)
 	if err := queue.UpsertIssue(ctx, latest); err != nil {
 		return ApplyResult{}, fmt.Errorf("update local issue snapshot: %w", err)
 	}
-	return ApplyResult{UpdatedIssue: latest, Changed: changed}, nil
+	return ApplyResult{UpdatedIssue: latest, Changed: !sameLabelSet(beforeLabels, latest.Labels)}, nil
+}
+
+func sameLabelSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := map[string]int{}
+	for _, label := range a {
+		seen[label]++
+	}
+	for _, label := range b {
+		seen[label]--
+		if seen[label] < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func isAbsentLabelError(err error) bool {
@@ -158,26 +181,4 @@ func removeWithout(values []string, value string) []string {
 		}
 	}
 	return out
-}
-
-func removeLabels(labels, remove []string) []string {
-	blocked := map[string]struct{}{}
-	for _, label := range remove {
-		blocked[label] = struct{}{}
-	}
-	out := make([]string, 0, len(labels))
-	for _, label := range labels {
-		if _, ok := blocked[label]; !ok {
-			out = append(out, label)
-		}
-	}
-	return out
-}
-
-func addLabels(labels, add []string) []string {
-	set := orderedSet(labels)
-	for _, label := range add {
-		set.add(label)
-	}
-	return set.values
 }

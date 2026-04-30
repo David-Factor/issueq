@@ -76,47 +76,47 @@ There is no lease renewal while subprocesses run. `ReleaseExpiredLeases` blindly
 
 **Suggested fix:** start jobs in their own process group/session and kill the process group on timeout/cancel. Implement platform-specific handling for Unix first.
 
-### 8. Action application does not refresh after mutations
+### 8. Action application does not refresh after mutations — fixed
 
 **Where:** `internal/actions/actions.go`, `Apply`
 
-The current code refreshes before actions, locally edits labels after remove/add, and upserts that synthetic snapshot. The spec calls for refreshing/updating local state after actions.
+The code used to refresh before actions, locally edit labels after remove/add, and upsert that synthetic snapshot. The spec calls for refreshing/updating local state after actions.
 
-**Risk:** local snapshots may miss GitHub-normalized labels, `updated_at`, concurrent edits, or other server-side changes.
+**Fix:** `Apply` now refreshes before actions, applies remove/add/comment, refreshes once after any mutation, and upserts the final GitHub snapshot.
 
-**Suggested fix:** after remove/add/comment, call `GetIssue` again and upsert that final snapshot.
+**Verification:** action tests assert post-action refresh call order and that the stored issue comes from the final GitHub snapshot.
 
-### 9. Transition count increments even when labels did not change
+### 9. Transition count increments even when labels did not change — fixed
 
 **Where:** `internal/actions/actions.go`; `internal/dispatcher/dispatcher.go`
 
-`ApplyResult.Changed` is true whenever action label add/remove lists are non-empty, even if removing an absent label or adding an already-present label produces no actual state change.
+`ApplyResult.Changed` used to be true whenever action label add/remove lists were non-empty, even if removing an absent label or adding an already-present label produced no actual state change.
 
-**Risk:** workflows can hit `max_transitions_per_issue` prematurely.
+**Fix:** `ApplyResult.Changed` now compares the pre-action label set to the final refreshed label set. Comments do not count as workflow transitions.
 
-**Suggested fix:** compare pre/post label sets and set `Changed` only if labels actually differ.
+**Verification:** action tests assert no-op add/remove plus comment returns `Changed=false`.
 
-### 10. Terminal action errors are ignored
+### 10. Terminal action errors are ignored — fixed
 
 **Where:** `internal/dispatcher/dispatcher.go`
 
-Errors from `actions.Apply` are still discarded for workflow terminalization (`workflow.on_transitions_exceeded`). `on_attempts_exceeded` action errors are now captured by the Priority 0 post-claim error handling fix.
+Errors from `actions.Apply` were still discarded for workflow terminalization (`workflow.on_transitions_exceeded`). `on_attempts_exceeded` action errors had already been captured by the Priority 0 post-claim error handling fix.
 
-**Risk:** jobs may be marked `dead` even though GitHub was not updated with terminal labels/comments.
+**Fix:** workflow terminalization action failures now produce a `terminal_action_failed` event, propagate through the post-claim failure path, and finalize the job as `failed` rather than `dead`.
 
-**Suggested fix:** capture terminal action errors and persist them in `last_error`/events. Decide whether terminalization failure should leave the job `failed`, `dead`, or retryable.
+**Verification:** dispatcher tests inject workflow terminal action failure and assert `failed` status, useful `last_error`, and `terminal_action_failed` event.
 
 ## Priority 2 — polish and robustness
 
-### 11. GitHub HTTP client has no default timeout
+### 11. GitHub HTTP client has no default timeout — fixed
 
 **Where:** `internal/github/github.go`
 
-The REST client uses `http.DefaultClient` when no client is provided. That client has no timeout.
+The REST client used to use `http.DefaultClient` when no client was provided. That client has no timeout.
 
-**Risk:** GitHub calls can hang indefinitely unless the caller context is canceled.
+**Fix:** default REST clients now use `http.Client{Timeout: 30 * time.Second}`. Injected clients remain unchanged.
 
-**Suggested fix:** use a default `http.Client{Timeout: ...}` or ensure all CLI/daemon GitHub calls run under bounded contexts.
+**Verification:** GitHub tests assert `NewRESTClient` installs the default timeout.
 
 ### 12. `daemon` currently blocks inside full synchronous dispatch cycles
 
@@ -133,10 +133,10 @@ The daemon loop calls `Once`, and `Once` blocks until all dispatch work in the c
 1. ~~Fix `dispatch` to use GitHub-backed dispatch by default.~~
 2. ~~Fix attempt numbering and persist job attempts.~~
 3. ~~Add common post-claim failure handling so jobs do not remain `running` on errors.~~
-4. Fix action post-refresh and real label-change detection.
+4. ~~Fix action post-refresh and real label-change detection.~~
 5. ~~Decide whether to remove/disable `once --no-wait` or implement real nonblocking spawn semantics.~~ Disabled for now.
 6. Document or implement lease renewal/process-tree killing/concurrent supervision.
-7. Add HTTP client timeout.
+7. ~~Add HTTP client timeout.~~
 8. Re-run automated gates, then start Phase 9 manual E2E.
 
 ## Gates for follow-up fixes

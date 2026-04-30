@@ -106,6 +106,16 @@ func TestRESTClientRedactsTokenFromErrors(t *testing.T) {
 	}
 }
 
+func TestNewRESTClientUsesDefaultHTTPTimeout(t *testing.T) {
+	client, err := NewRESTClient("github.com", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.http == nil || client.http.Timeout != defaultHTTPClientTimeout {
+		t.Fatalf("timeout = %v, want %v", client.http.Timeout, defaultHTTPClientTimeout)
+	}
+}
+
 func TestIssueURLPath(t *testing.T) {
 	if got := IssueURLPath("o/r", "repo name", 12); got != "/repos/o%2Fr/repo%20name/issues/12" {
 		t.Fatalf("IssueURLPath() = %q", got)

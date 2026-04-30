@@ -265,7 +265,10 @@ func checkTransitionLimit(ctx context.Context, cfg config.Config, queue store.Qu
 		return false, nil
 	}
 	if gh != nil {
-		_, _ = actions.Apply(ctx, cfg, gh, queue, issue, cfg.Workflow.OnTransitionsExceeded)
+		if _, err := actions.Apply(ctx, cfg, gh, queue, issue, cfg.Workflow.OnTransitionsExceeded); err != nil {
+			_, _ = queue.InsertJobEvent(ctx, model.JobEvent{JobID: jobID, IssueKey: issue.IssueKey, EventType: "terminal_action_failed", Message: err.Error()})
+			return false, fmt.Errorf("apply transitions-exceeded actions: %w", err)
+		}
 	}
 	return true, nil
 }

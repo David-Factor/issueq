@@ -17,7 +17,10 @@ import (
 	"issueq/internal/model"
 )
 
-const defaultAPIBaseURL = "https://api.github.com"
+const (
+	defaultAPIBaseURL        = "https://api.github.com"
+	defaultHTTPClientTimeout = 30 * time.Second
+)
 
 type Client interface {
 	ListOpenIssues(ctx context.Context, owner, repo string) ([]model.IssueSnapshot, error)
@@ -51,7 +54,7 @@ func NewRESTClientWithBaseURL(host, baseURL, token string, httpClient *http.Clie
 		return nil, fmt.Errorf("parse GitHub API base URL: %w", err)
 	}
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		httpClient = &http.Client{Timeout: defaultHTTPClientTimeout}
 	}
 	return &RESTClient{host: host, baseURL: parsed, token: token, http: httpClient}, nil
 }

@@ -112,10 +112,11 @@ func assertContains(t *testing.T, path, want string) {
 }
 
 type fakeGitHub struct {
-	issue    model.IssueSnapshot
-	calls    []string
-	comments []string
-	errOn    map[string]error
+	issue     model.IssueSnapshot
+	calls     []string
+	comments  []string
+	errOn     map[string]error
+	errOnCall map[string]int
 }
 
 func (f *fakeGitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]model.IssueSnapshot, error) {
@@ -123,14 +124,14 @@ func (f *fakeGitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]
 }
 func (f *fakeGitHub) GetIssue(ctx context.Context, owner, repo string, number int) (model.IssueSnapshot, error) {
 	f.calls = append(f.calls, "get")
-	if err := f.errOn["get"]; err != nil {
+	if err := f.callError("get"); err != nil {
 		return model.IssueSnapshot{}, err
 	}
 	return f.issue, nil
 }
 func (f *fakeGitHub) AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
 	f.calls = append(f.calls, "add:"+strings.Join(labels, ","))
-	if err := f.errOn["add"]; err != nil {
+	if err := f.callError("add"); err != nil {
 		return err
 	}
 	f.issue.Labels = append(f.issue.Labels, labels...)
@@ -138,7 +139,7 @@ func (f *fakeGitHub) AddLabels(ctx context.Context, owner, repo string, number i
 }
 func (f *fakeGitHub) RemoveLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
 	f.calls = append(f.calls, "remove:"+strings.Join(labels, ","))
-	if err := f.errOn["remove"]; err != nil {
+	if err := f.callError("remove"); err != nil {
 		return err
 	}
 	blocked := map[string]bool{}
@@ -156,11 +157,22 @@ func (f *fakeGitHub) RemoveLabels(ctx context.Context, owner, repo string, numbe
 }
 func (f *fakeGitHub) CreateComment(ctx context.Context, owner, repo string, number int, body string) error {
 	f.calls = append(f.calls, "comment")
-	if err := f.errOn["comment"]; err != nil {
+	if err := f.callError("comment"); err != nil {
 		return err
 	}
 	f.comments = append(f.comments, body)
 	return nil
+}
+
+func (f *fakeGitHub) callError(name string) error {
+	if f.errOnCall != nil {
+		f.errOnCall[name]--
+		if f.errOnCall[name] == 0 {
+			return f.errOn[name]
+		}
+		return nil
+	}
+	return f.errOn[name]
 }
 
 func TestDispatchWithGitHubStaleJobSkipped(t *testing.T) {
@@ -360,6 +372,48 @@ func TestTransitionLimitExceededAppliesTerminalAction(t *testing.T) {
 	if len(gh.comments) == 0 || gh.comments[len(gh.comments)-1] != "terminal" {
 		t.Fatalf("comments = %#v", gh.comments)
 	}
+}
+
+func TestTransitionLimitTerminalActionErrorFailsJob(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, "#!/bin/sh\nexit 0\n")
+	defer store.Close()
+	cfg.Routes[0].When = config.PredicateConfig{LabelsInclude: []string{"agent-ready"}}
+	cfg.Routes[0].Job.OnStart = config.ActionConfig{LabelsRemove: []string{"agent-ready"}, LabelsAdd: []string{"agent-running"}}
+	cfg.Workflow.MaxTransitionsPerIssue = -1
+	cfg.Workflow.OnTransitionsExceeded = config.ActionConfig{LabelsAdd: []string{"agent-failed"}, Comment: "terminal"}
+	gh := &fakeGitHub{
+		issue:     model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"},
+		errOn:     map[string]error{"add": errors.New("terminal add failed")},
+		errOnCall: map[string]int{"add": 2},
+	}
+	result, err := DispatchWithGitHub(ctx, cfg, store, gh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Failed != 1 || result.Dead != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	jobs, _ := store.ListJobs(ctx)
+	if jobs[0].Status != model.JobStatusFailed || !strings.Contains(jobs[0].LastError, "apply transitions-exceeded actions") {
+		t.Fatalf("job = %#v", jobs[0])
+	}
+	events, err := store.ListJobEvents(ctx, jobs[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasEvent(events, "terminal_action_failed") {
+		t.Fatalf("events = %#v", events)
+	}
+}
+
+func hasEvent(events []model.JobEvent, typ string) bool {
+	for _, event := range events {
+		if event.EventType == typ {
+			return true
+		}
+	}
+	return false
 }
 
 func TestReviewLoopStopsAfterConfiguredAttempts(t *testing.T) {
