@@ -108,13 +108,15 @@ Create fixture task scripts under `testdata/tasks/` or generated temp dirs:
   - queue backend `sqlite`
   - lease duration `30m`
   - workdir `./.issueq`
+  - runner env inheritance disabled unless explicitly enabled
+  - minimal subprocess env pass-through such as `PATH` and `HOME`
 - Implement validation rules from spec §8.1.
 - Add `issueq config-check --config issueq.yaml` if useful, or make `doctor` later.
 
 ### Requirements addressed
 
 - R1 Config
-- R12 Safety, partially: argv command shape and timeout validation
+- R12 Safety/Auth, partially: argv command shape, timeout validation, and env pass-through validation
 
 ### Tests
 
@@ -127,6 +129,9 @@ Unit tests:
 - non-positive timeout/concurrency/max attempts fail.
 - action add/remove conflict fails.
 - command string is not accepted as shell string; command must be YAML list.
+- invalid env var names in pass-through config fail.
+- default config does not inherit the full parent environment.
+- including `github.token_env` in subprocess pass-through is rejected or requires the documented explicit acknowledgement if that guard is implemented.
 
 CLI smoke:
 
@@ -228,7 +233,10 @@ CLI smoke:
 ### Scope
 
 - Define `GitHubClient` interface.
+- Read token from `github.token_env` for GitHub-contacting commands.
 - Implement REST-backed client for list/get issue and basic label/comment methods as stubs or full methods depending on sequencing.
+- Use the token only in the GitHub client authorization header.
+- Redact token values from errors/logs.
 - Implement poller that lists open issues for configured repo and upserts snapshots.
 - Add `issueq poll` command.
 - Keep automated tests on fake client/HTTP test server; no real network tests.
@@ -236,6 +244,7 @@ CLI smoke:
 ### Requirements addressed
 
 - R3 Poll
+- R12 Safety/Auth, partially: GitHub token handling
 
 ### Tests
 
@@ -246,11 +255,13 @@ Unit/component tests:
 - issue key format is correct.
 - poll handles empty issue list.
 - poll reports GitHub/API errors clearly.
+- missing token env var fails for GitHub-contacting commands.
+- token value is not present in logged/error strings.
 
 Optional HTTP tests:
 
 - REST client parses GitHub-like JSON from `httptest.Server`.
-- token env var is used.
+- HTTP client sends `Authorization` header to test server.
 
 CLI smoke:
 
@@ -259,6 +270,7 @@ CLI smoke:
 ### Gate
 
 - Polling logic is isolated behind `GitHubClient`.
+- GitHub client auth is usable without leaking credentials into local state or logs.
 - No automated test requires real GitHub credentials.
 
 ## 8. Phase 5 — Basic dispatcher and subprocess runner
@@ -269,6 +281,7 @@ CLI smoke:
 - Implement running-count capacity checks.
 - Implement subprocess invocation as argv, not shell.
 - Write context JSON and expected env vars.
+- Implement subprocess env construction from explicit allowlist plus job metadata.
 - Capture stdout/stderr to files.
 - Enforce timeout.
 - Mark jobs succeeded/failed.
@@ -281,7 +294,7 @@ At this phase, GitHub actions may be no-op or fake-only. Full action application
 - R6 Dispatch
 - R7 Context
 - R8 Results, partially
-- R12 Safety
+- R12 Safety/Auth
 - R13 Observability, partially
 
 ### Tests
@@ -299,6 +312,8 @@ Runner/component tests:
 - timeout script is killed -> job `failed` with timeout error.
 - context file contains issue/job/runner data.
 - env vars are present.
+- subprocess receives allowlisted env vars.
+- subprocess does not receive `GITHUB_TOKEN`/the `github.token_env` value by default.
 - stdout/stderr files are written.
 - global concurrency limit is respected.
 - per-route concurrency limit is respected.
@@ -313,6 +328,7 @@ CLI smoke:
 - Dispatcher can run local fixture jobs end-to-end without GitHub.
 - Timeout behavior is reliable.
 - No shell-string execution path exists.
+- Parent environment secrets are not leaked to subprocesses unless explicitly allowlisted.
 
 ## 9. Phase 6 — GitHub actions, staleness, and result JSON
 
@@ -501,7 +517,7 @@ CLI smoke:
 | R9 GitHub actions | Phase 6 | Start/success/failure labels/comments |
 | R10 Staleness | Phase 6 | Re-fetch before spawn |
 | R11 Loop prevention | Phase 7 | Attempts/transitions |
-| R12 Safety | Phases 1, 5 | Argv arrays, timeouts, no shell interpolation |
+| R12 Safety/Auth | Phases 1, 4, 5 | Argv arrays, timeouts, token handling, env allowlist, no shell interpolation |
 | R13 Observability | Phases 5, 8 | Logs/events/CLI output |
 | R14 Future compatibility | Phases 2, 3, 5 | Interfaces, IDs, leases |
 

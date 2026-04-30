@@ -210,6 +210,9 @@ V1 uses YAML.
 runner:
   name: david-exedev
   capabilities: [triage, code, review]
+  env:
+    inherit: false
+    pass: [PATH, HOME]
 
 queue:
   backend: sqlite
@@ -281,6 +284,8 @@ routes:
       concurrency: 1
       max_attempts: 3
       priority: 20
+      env:
+        pass: [AGENT_GITHUB_TOKEN, ANTHROPIC_API_KEY]
       on_start:
         labels_remove: [agent-ready]
         labels_add: [agent-running]
@@ -331,6 +336,8 @@ Startup must fail fast if:
 - no GitHub owner/repo is configured
 - token env var is missing for commands that contact GitHub
 - SQLite path is empty
+- `runner.env.pass` or route-level `job.env.pass` contains an invalid environment variable name
+- `github.token_env` is included in subprocess env pass-through without an explicit acknowledgement flag, if that guard is implemented
 - route names are empty or duplicated
 - route kind is empty
 - command is empty for a dispatchable job
@@ -590,7 +597,35 @@ Commands are argv arrays, not shell strings.
 
 ### 13.2 Environment
 
-Set at least:
+`issueq` always sets job metadata environment variables for subprocesses. User environment pass-through is controlled by config.
+
+Recommended default:
+
+```yaml
+runner:
+  env:
+    inherit: false
+    pass: [PATH, HOME]
+```
+
+Route-level additions are allowed:
+
+```yaml
+routes:
+  - name: code
+    job:
+      env:
+        pass: [AGENT_GITHUB_TOKEN, ANTHROPIC_API_KEY]
+```
+
+If `runner.env.inherit` is `false`, subprocesses receive only:
+
+- the explicitly passed env vars
+- the `ISSUEQ_*`/`GITHUB_*` metadata variables listed below
+
+If `runner.env.inherit` is `true`, subprocesses inherit the parent process environment. This is convenient for local experimentation but riskier because it may expose tokens to coding agents or scripts.
+
+Set at least these metadata variables:
 
 ```text
 ISSUEQ_JOB_ID
@@ -677,15 +712,35 @@ V1 may defer `enqueue` support. User-visible workflow follow-ups should normally
 
 ### 14.1 Authentication
 
-Token comes from `github.token_env`, usually `GITHUB_TOKEN`.
+`issueq` authenticates to GitHub with a token read from `github.token_env`, usually `GITHUB_TOKEN`.
 
-Required permissions:
+Recommended token type:
 
-- read issues
-- write labels on issues
-- write issue comments
+- GitHub fine-grained personal access token
+- selected repository only
+- minimum permissions:
+  - Metadata: read
+  - Issues: read/write
 
-Subprocesses that create branches/PRs manage their own GitHub/git credentials.
+`issueq` uses this token only for issue automation:
+
+- list/fetch issues
+- add/remove issue labels
+- create issue comments
+
+`issueq` must not write the token to SQLite, context JSON, result JSON, stdout/stderr logs, or job events. Logs must not print request authorization headers.
+
+Subprocesses that create branches, push code, or open PRs manage their own credentials. Recommended pattern:
+
+```yaml
+routes:
+  - name: code
+    job:
+      env:
+        pass: [AGENT_GITHUB_TOKEN]
+```
+
+The `issueq` GitHub token and coding-agent GitHub credentials should be treated as separate credentials. By default, the `issueq` token should not be passed to subprocesses unless the user explicitly opts into that environment pass-through.
 
 ### 14.2 Polling
 
@@ -732,6 +787,10 @@ Because v1 is not a distributed queue, this is best-effort coordination only. Di
 - Commands must be argv arrays.
 - Issue/job data is passed via JSON files and environment variables.
 - Each job must have a timeout.
+- `issueq`'s GitHub token must not be persisted or logged.
+- Subprocess env pass-through should default to a minimal allowlist rather than full environment inheritance.
+- Local DB and workdir should be treated as private because context, logs, and result files may contain sensitive issue or agent output.
+- Recommended file permissions: SQLite DB `0600`; workdir `0700` where practical.
 - Stdout/stderr are captured to files under `workdir.path`.
 - Context/result files are written under `workdir.path/jobs/<job-id>/`.
 - Coding-agent task scripts should create per-issue or per-job worktrees/clones if they edit repositories.
@@ -898,6 +957,6 @@ A v1 implementation is complete when it satisfies these requirements:
 - **R9 GitHub actions**: apply start/success/failure/terminal labels and comments.
 - **R10 Staleness**: re-fetch and skip stale jobs before execution.
 - **R11 Loop prevention**: enforce route max attempts and max transitions.
-- **R12 Safety**: avoid shell interpolation and require timeouts.
+- **R12 Safety/Auth**: avoid shell interpolation, require timeouts, do not persist/log tokens, and use explicit subprocess env pass-through.
 - **R13 Observability**: log events and provide useful `jobs`/`issues` output.
 - **R14 Future compatibility**: keep queue behind an interface and use portable IDs/leases.
