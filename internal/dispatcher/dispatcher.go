@@ -275,22 +275,24 @@ func dispatchLocal(ctx context.Context, cfg config.Config, queue store.QueueStor
 				result.Claimed++
 				route, ok := findRoute(cfg, job.RouteName)
 				if !ok {
-					if err := queue.FinalizeJobOwned(ctx, job.ID, runnerIdentity.InstanceID, model.JobFinalize{Status: model.JobStatusFailed, LastError: "route not found"}); err != nil {
-						if isOwnershipLoss(err) {
-							continue
-						}
+					dropped, err := dropOnOwnershipLoss(queue.FinalizeJobOwned(ctx, job.ID, runnerIdentity.InstanceID, model.JobFinalize{Status: model.JobStatusFailed, LastError: "route not found"}))
+					if err != nil {
 						return result, err
+					}
+					if dropped {
+						continue
 					}
 					result.Failed++
 					continue
 				}
 				issue, err := queue.GetIssue(ctx, job.IssueKey)
 				if err != nil {
-					if err := queue.FinalizeJobOwned(ctx, job.ID, runnerIdentity.InstanceID, model.JobFinalize{Status: model.JobStatusFailed, LastError: fmt.Sprintf("load issue: %v", err)}); err != nil {
-						if isOwnershipLoss(err) {
-							continue
-						}
+					dropped, err := dropOnOwnershipLoss(queue.FinalizeJobOwned(ctx, job.ID, runnerIdentity.InstanceID, model.JobFinalize{Status: model.JobStatusFailed, LastError: fmt.Sprintf("load issue: %v", err)}))
+					if err != nil {
 						return result, err
+					}
+					if dropped {
+						continue
 					}
 					result.Failed++
 					continue
@@ -301,17 +303,19 @@ func dispatchLocal(ctx context.Context, cfg config.Config, queue store.QueueStor
 					if !errors.As(err, &startErr) {
 						return result, err
 					}
-					if err := queue.UpdateJobArtifactsOwned(ctx, job.ID, runnerIdentity.InstanceID, startErr.Result.Paths.ContextPath, startErr.Result.Paths.ResultPath, startErr.Result.Paths.StdoutPath, startErr.Result.Paths.StderrPath, startErr.Result.PID); err != nil {
-						if isOwnershipLoss(err) {
-							continue
-						}
+					dropped, err := updateArtifactsOwnedOrDrop(ctx, queue, job.ID, runnerIdentity.InstanceID, startErr.Result)
+					if err != nil {
 						return result, err
 					}
-					if err := queue.FinalizeJobOwned(ctx, job.ID, runnerIdentity.InstanceID, model.JobFinalize{Status: model.JobStatusFailed, LastError: startErr.Result.ErrorString(), FinishedAt: startErr.Result.FinishedAt}); err != nil {
-						if isOwnershipLoss(err) {
-							continue
-						}
+					if dropped {
+						continue
+					}
+					dropped, err = dropOnOwnershipLoss(queue.FinalizeJobOwned(ctx, job.ID, runnerIdentity.InstanceID, model.JobFinalize{Status: model.JobStatusFailed, LastError: startErr.Result.ErrorString(), FinishedAt: startErr.Result.FinishedAt}))
+					if err != nil {
 						return result, err
+					}
+					if dropped {
+						continue
 					}
 					result.Failed++
 					continue
@@ -319,10 +323,13 @@ func dispatchLocal(ctx context.Context, cfg config.Config, queue store.QueueStor
 				if err := queue.UpdateJobArtifactsOwned(ctx, job.ID, runnerIdentity.InstanceID, handle.Paths.ContextPath, handle.Paths.ResultPath, handle.Paths.StdoutPath, handle.Paths.StderrPath, handle.PID); err != nil {
 					handle.Cancel(err)
 					_ = runner.Wait(handle)
-					if isOwnershipLoss(err) {
+					dropped, err := dropOnOwnershipLoss(err)
+					if err != nil {
+						return result, err
+					}
+					if dropped {
 						continue
 					}
-					return result, err
 				}
 				active[job.ID] = &localActiveJob{job: job, handle: handle}
 			}
@@ -397,6 +404,20 @@ func isOwnershipLoss(err error) bool {
 	return errors.Is(err, store.ErrLostLease) || errors.Is(err, store.ErrNotOwner)
 }
 
+func dropOnOwnershipLoss(err error) (bool, error) {
+	if err == nil {
+		return false, nil
+	}
+	if isOwnershipLoss(err) {
+		return true, nil
+	}
+	return false, err
+}
+
+func updateArtifactsOwnedOrDrop(ctx context.Context, queue store.QueueStore, jobID, runnerInstanceID string, runResult runner.Result) (bool, error) {
+	return dropOnOwnershipLoss(queue.UpdateJobArtifactsOwned(ctx, jobID, runnerInstanceID, runResult.Paths.ContextPath, runResult.Paths.ResultPath, runResult.Paths.StdoutPath, runResult.Paths.StderrPath, runResult.PID))
+}
+
 func stopTimer(timer *time.Timer) {
 	if !timer.Stop() {
 		select {
@@ -435,11 +456,12 @@ func reapReady(ctx context.Context, queue store.QueueStore, identity model.Runne
 		if activeJob.lostOwnership {
 			continue
 		}
-		if err := queue.UpdateJobArtifactsOwned(ctx, activeJob.job.ID, identity.InstanceID, runResult.Paths.ContextPath, runResult.Paths.ResultPath, runResult.Paths.StdoutPath, runResult.Paths.StderrPath, runResult.PID); err != nil {
-			if isOwnershipLoss(err) {
-				continue
-			}
+		dropped, err := updateArtifactsOwnedOrDrop(ctx, queue, activeJob.job.ID, identity.InstanceID, runResult)
+		if err != nil {
 			return err
+		}
+		if dropped {
+			continue
 		}
 		status := model.JobStatusSucceeded
 		lastErr := ""
@@ -454,11 +476,12 @@ func reapReady(ctx context.Context, queue store.QueueStore, identity model.Runne
 				lastErr = parseErr.Error()
 			}
 		}
-		if err := queue.FinalizeJobOwned(ctx, activeJob.job.ID, identity.InstanceID, model.JobFinalize{Status: status, LastError: lastErr, ResultPath: runResult.Paths.ResultPath, StdoutPath: runResult.Paths.StdoutPath, StderrPath: runResult.Paths.StderrPath, FinishedAt: runResult.FinishedAt}); err != nil {
-			if isOwnershipLoss(err) {
-				continue
-			}
+		dropped, err = dropOnOwnershipLoss(queue.FinalizeJobOwned(ctx, activeJob.job.ID, identity.InstanceID, model.JobFinalize{Status: status, LastError: lastErr, ResultPath: runResult.Paths.ResultPath, StdoutPath: runResult.Paths.StdoutPath, StderrPath: runResult.Paths.StderrPath, FinishedAt: runResult.FinishedAt}))
+		if err != nil {
 			return err
+		}
+		if dropped {
+			continue
 		}
 		_, _ = queue.InsertJobEvent(ctx, model.JobEvent{JobID: activeJob.job.ID, IssueKey: activeJob.job.IssueKey, EventType: "job_" + status, Message: lastErr})
 		if status == model.JobStatusSucceeded {
