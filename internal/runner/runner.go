@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"issueq/internal/config"
@@ -92,7 +93,118 @@ func currentAttempt(attempts int) int {
 	return attempts
 }
 
-func Run(ctx context.Context, cfg config.Config, route config.RouteConfig, job model.Job, issue model.IssueSnapshot, runnerInfo model.RunnerInfo) Result {
+type ProcessSpec struct {
+	Command string
+	Args    []string
+	Env     []string
+	Stdout  *os.File
+	Stderr  *os.File
+}
+
+type Process interface {
+	PID() int
+	Wait() error
+	KillTree() error
+}
+
+type ProcessStarter interface {
+	StartProcess(spec ProcessSpec) (Process, error)
+}
+
+type realProcessStarter struct{}
+
+type realProcess struct {
+	cmd *exec.Cmd
+}
+
+func (realProcessStarter) StartProcess(spec ProcessSpec) (Process, error) {
+	cmd := exec.Command(spec.Command, spec.Args...)
+	prepareCommand(cmd)
+	cmd.Stdout = spec.Stdout
+	cmd.Stderr = spec.Stderr
+	cmd.Env = spec.Env
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	return &realProcess{cmd: cmd}, nil
+}
+
+func (p *realProcess) PID() int        { return p.cmd.Process.Pid }
+func (p *realProcess) Wait() error     { return p.cmd.Wait() }
+func (p *realProcess) KillTree() error { return killProcessTree(p.cmd.Process) }
+
+var (
+	processStarterMu sync.Mutex
+	processStarter   ProcessStarter = realProcessStarter{}
+)
+
+func SetProcessStarterForTest(starter ProcessStarter) func() {
+	processStarterMu.Lock()
+	previous := processStarter
+	processStarter = starter
+	processStarterMu.Unlock()
+	return func() {
+		processStarterMu.Lock()
+		processStarter = previous
+		processStarterMu.Unlock()
+	}
+}
+
+func currentProcessStarter() ProcessStarter {
+	processStarterMu.Lock()
+	defer processStarterMu.Unlock()
+	return processStarter
+}
+
+type Handle struct {
+	Job       model.Job
+	Issue     model.IssueSnapshot
+	Route     config.RouteConfig
+	Runner    model.RunnerInfo
+	Paths     Paths
+	PID       int
+	StartedAt time.Time
+	Timeout   time.Duration
+	Done      <-chan struct{}
+
+	ctx        context.Context
+	cancel     context.CancelCauseFunc
+	timer      *time.Timer
+	process    Process
+	stdout     *os.File
+	stderr     *os.File
+	done       chan struct{}
+	waitErr    error
+	waitErrMu  sync.Mutex
+	closeOnce  sync.Once
+	cancelOnce sync.Once
+}
+
+func (h *Handle) Cancel(cause error) {
+	if cause == nil {
+		cause = context.Canceled
+	}
+	h.cancelOnce.Do(func() { h.cancel(cause) })
+}
+
+func (h *Handle) closeLogs() {
+	h.closeOnce.Do(func() {
+		if h.stdout != nil {
+			_ = h.stdout.Close()
+		}
+		if h.stderr != nil {
+			_ = h.stderr.Close()
+		}
+	})
+}
+
+type StartError struct {
+	Result Result
+}
+
+func (e StartError) Error() string { return e.Result.ErrorString() }
+
+func Start(ctx context.Context, cfg config.Config, route config.RouteConfig, job model.Job, issue model.IssueSnapshot, runnerInfo model.RunnerInfo) (*Handle, error) {
 	paths := PreparePaths(cfg.Workdir.Path, job.ID)
 	started := time.Now().UTC()
 	ctxData := Context{
@@ -107,71 +219,128 @@ func Run(ctx context.Context, cfg config.Config, route config.RouteConfig, job m
 		Runner: runnerInfo,
 	}
 	if err := WriteContext(paths, ctxData); err != nil {
-		return Result{ExitCode: -1, Error: err, Paths: paths, StartedAt: started, FinishedAt: time.Now().UTC()}
+		return nil, StartError{Result: Result{ExitCode: -1, Error: err, Paths: paths, StartedAt: started, FinishedAt: time.Now().UTC()}}
 	}
 
 	stdout, err := os.OpenFile(paths.StdoutPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return Result{ExitCode: -1, Error: fmt.Errorf("open stdout log: %w", err), Paths: paths, StartedAt: started, FinishedAt: time.Now().UTC()}
+		return nil, StartError{Result: Result{ExitCode: -1, Error: fmt.Errorf("open stdout log: %w", err), Paths: paths, StartedAt: started, FinishedAt: time.Now().UTC()}}
 	}
-	defer stdout.Close()
 	stderr, err := os.OpenFile(paths.StderrPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return Result{ExitCode: -1, Error: fmt.Errorf("open stderr log: %w", err), Paths: paths, StartedAt: started, FinishedAt: time.Now().UTC()}
+		_ = stdout.Close()
+		return nil, StartError{Result: Result{ExitCode: -1, Error: fmt.Errorf("open stderr log: %w", err), Paths: paths, StartedAt: started, FinishedAt: time.Now().UTC()}}
 	}
-	defer stderr.Close()
 
 	if len(route.Job.Command) == 0 {
-		return Result{ExitCode: -1, Error: errors.New("job command is empty"), Paths: paths, StartedAt: started, FinishedAt: time.Now().UTC()}
+		_ = stdout.Close()
+		_ = stderr.Close()
+		return nil, StartError{Result: Result{ExitCode: -1, Error: errors.New("job command is empty"), Paths: paths, StartedAt: started, FinishedAt: time.Now().UTC()}}
 	}
-	timeoutCtx, cancel := context.WithTimeout(ctx, route.Job.Timeout.Duration)
-	defer cancel()
+	procCtx, cancel := context.WithCancelCause(ctx)
+	timeout := route.Job.Timeout.Duration
+	if timeout <= 0 {
+		timeout = config.DefaultLeaseDuration
+	}
+	var timeoutTimer *time.Timer
+	timeoutTimer = time.AfterFunc(timeout, func() { cancel(context.DeadlineExceeded) })
+
 	args := append([]string{}, route.Job.Command[1:]...)
 	args = append(args, paths.ContextPath, paths.ResultPath)
-	cmd := exec.Command(route.Job.Command[0], args...)
-	prepareCommand(cmd)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	cmd.Env = BuildEnv(cfg, route, job, issue, paths)
-
-	if err := cmd.Start(); err != nil {
-		return Result{ExitCode: -1, Error: fmt.Errorf("start subprocess: %w", err), Paths: paths, StartedAt: started, FinishedAt: time.Now().UTC()}
+	proc, err := currentProcessStarter().StartProcess(ProcessSpec{
+		Command: route.Job.Command[0],
+		Args:    args,
+		Env:     BuildEnv(cfg, route, job, issue, paths),
+		Stdout:  stdout,
+		Stderr:  stderr,
+	})
+	if err != nil {
+		timeoutTimer.Stop()
+		cancel(context.Canceled)
+		_ = stdout.Close()
+		_ = stderr.Close()
+		return nil, StartError{Result: Result{ExitCode: -1, Error: fmt.Errorf("start subprocess: %w", err), Paths: paths, StartedAt: started, FinishedAt: time.Now().UTC()}}
 	}
-	pid := cmd.Process.Pid
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
+	done := make(chan struct{})
+	handle := &Handle{
+		Job:       job,
+		Issue:     issue,
+		Route:     route,
+		Runner:    runnerInfo,
+		Paths:     paths,
+		PID:       proc.PID(),
+		StartedAt: started,
+		Timeout:   timeout,
+		ctx:       procCtx,
+		cancel:    cancel,
+		timer:     timeoutTimer,
+		process:   proc,
+		stdout:    stdout,
+		stderr:    stderr,
+		done:      done,
+		Done:      done,
+	}
+	go func() {
+		err := proc.Wait()
+		handle.waitErrMu.Lock()
+		handle.waitErr = err
+		handle.waitErrMu.Unlock()
+		close(done)
+	}()
+	return handle, nil
+}
 
+func Wait(handle *Handle) Result {
 	select {
-	case err = <-done:
-	case <-timeoutCtx.Done():
-		killErr := killProcessTree(cmd.Process)
-		err = <-done
+	case <-handle.Done:
+	case <-handle.ctx.Done():
+		killErr := handle.process.KillTree()
+		<-handle.Done
 		finished := time.Now().UTC()
-		if timeoutCtx.Err() == context.DeadlineExceeded {
-			if killErr != nil {
-				return Result{ExitCode: -1, TimedOut: true, Error: fmt.Errorf("subprocess timed out after %s; kill process tree: %w", route.Job.Timeout.Duration, killErr), Paths: paths, StartedAt: started, FinishedAt: finished, PID: pid}
-			}
-			return Result{ExitCode: -1, TimedOut: true, Error: fmt.Errorf("subprocess timed out after %s", route.Job.Timeout.Duration), Paths: paths, StartedAt: started, FinishedAt: finished, PID: pid}
-		}
-		cause := context.Cause(timeoutCtx)
+		handle.timer.Stop()
+		handle.closeLogs()
+		cause := context.Cause(handle.ctx)
 		if cause == nil {
 			cause = context.Canceled
 		}
-		if killErr != nil {
-			return Result{ExitCode: -1, Cancelled: true, Error: fmt.Errorf("subprocess cancelled: %v; kill process tree: %w", cause, killErr), Paths: paths, StartedAt: started, FinishedAt: finished, PID: pid}
+		if errors.Is(cause, context.DeadlineExceeded) {
+			if killErr != nil {
+				return Result{ExitCode: -1, TimedOut: true, Error: fmt.Errorf("subprocess timed out after %s; kill process tree: %w", handle.Timeout, killErr), Paths: handle.Paths, StartedAt: handle.StartedAt, FinishedAt: finished, PID: handle.PID}
+			}
+			return Result{ExitCode: -1, TimedOut: true, Error: fmt.Errorf("subprocess timed out after %s", handle.Timeout), Paths: handle.Paths, StartedAt: handle.StartedAt, FinishedAt: finished, PID: handle.PID}
 		}
-		return Result{ExitCode: -1, Cancelled: true, Error: cause, Paths: paths, StartedAt: started, FinishedAt: finished, PID: pid}
+		if killErr != nil {
+			return Result{ExitCode: -1, Cancelled: true, Error: fmt.Errorf("subprocess cancelled: %v; kill process tree: %w", cause, killErr), Paths: handle.Paths, StartedAt: handle.StartedAt, FinishedAt: finished, PID: handle.PID}
+		}
+		return Result{ExitCode: -1, Cancelled: true, Error: cause, Paths: handle.Paths, StartedAt: handle.StartedAt, FinishedAt: finished, PID: handle.PID}
 	}
 	finished := time.Now().UTC()
+	handle.timer.Stop()
+	handle.closeLogs()
+	handle.waitErrMu.Lock()
+	err := handle.waitErr
+	handle.waitErrMu.Unlock()
 	if err != nil {
 		exitCode := -1
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			exitCode = exitErr.ExitCode()
 		}
-		return Result{ExitCode: exitCode, Error: err, Paths: paths, StartedAt: started, FinishedAt: finished, PID: pid}
+		return Result{ExitCode: exitCode, Error: err, Paths: handle.Paths, StartedAt: handle.StartedAt, FinishedAt: finished, PID: handle.PID}
 	}
-	return Result{ExitCode: 0, Paths: paths, StartedAt: started, FinishedAt: finished, PID: pid}
+	return Result{ExitCode: 0, Paths: handle.Paths, StartedAt: handle.StartedAt, FinishedAt: finished, PID: handle.PID}
+}
+
+func Run(ctx context.Context, cfg config.Config, route config.RouteConfig, job model.Job, issue model.IssueSnapshot, runnerInfo model.RunnerInfo) Result {
+	handle, err := Start(ctx, cfg, route, job, issue, runnerInfo)
+	if err != nil {
+		var startErr StartError
+		if errors.As(err, &startErr) {
+			return startErr.Result
+		}
+		return Result{ExitCode: -1, Error: err, StartedAt: time.Now().UTC(), FinishedAt: time.Now().UTC()}
+	}
+	return Wait(handle)
 }
 
 func errorsIsProcessDone(err error) bool {
