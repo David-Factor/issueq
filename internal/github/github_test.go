@@ -106,6 +106,29 @@ func TestRESTClientRedactsTokenFromErrors(t *testing.T) {
 	}
 }
 
+func TestRESTClientEscapesPathSegmentsOnce(t *testing.T) {
+	var got []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.EscapedPath())
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	client, err := NewRESTClientWithBaseURL("github.com", server.URL, "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.RemoveLabels(context.Background(), "o/r", "repo name", 12, []string{"needs info", "area/foo"}); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"/repos/o%2Fr/repo%20name/issues/12/labels/needs%20info",
+		"/repos/o%2Fr/repo%20name/issues/12/labels/area%2Ffoo",
+	}
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("paths = %#v, want %#v", got, want)
+	}
+}
+
 func TestNewRESTClientUsesDefaultHTTPTimeout(t *testing.T) {
 	client, err := NewRESTClient("github.com", "")
 	if err != nil {
