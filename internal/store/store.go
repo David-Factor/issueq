@@ -3,9 +3,15 @@ package store
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"issueq/internal/model"
+)
+
+var (
+	ErrNotOwner  = errors.New("job is not owned by runner instance")
+	ErrLostLease = errors.New("job lease is no longer valid")
 )
 
 type QueueStore interface {
@@ -13,14 +19,25 @@ type QueueStore interface {
 	GetIssue(ctx context.Context, issueKey string) (model.IssueSnapshot, error)
 	ListRoutableIssues(ctx context.Context) ([]model.IssueSnapshot, error)
 	EnqueueJob(ctx context.Context, job model.JobCreate) (model.Job, bool, error)
-	ClaimNextJob(ctx context.Context, runnerID string, allowedKinds []string, maxGlobal int, perRouteLimit map[string]int, leaseDuration time.Duration) (*model.Job, error)
-	ReleaseExpiredLeases(ctx context.Context, now time.Time) (int, error)
+	ClaimNextJob(ctx context.Context, identity model.RunnerIdentity, allowedKinds []string, maxGlobal int, perRouteLimit map[string]int, leaseDuration time.Duration) (*model.Job, error)
+	ClaimNextJobInFrontier(ctx context.Context, identity model.RunnerIdentity, allowedKinds []string, maxGlobal int, perRouteLimit map[string]int, leaseDuration time.Duration, frontierJobIDs []string) (*model.Job, error)
+	ReleaseExpiredLeases(ctx context.Context, now time.Time, staleHeartbeatBefore time.Time, currentRunnerInstanceID string, activeJobIDs []string) (int, error)
 	FinalizeJob(ctx context.Context, jobID string, result model.JobFinalize) error
+	FinalizeJobOwned(ctx context.Context, jobID string, runnerInstanceID string, result model.JobFinalize) error
 	UpdateJobArtifacts(ctx context.Context, jobID, contextPath, resultPath, stdoutPath, stderrPath string, pid int) error
+	UpdateJobArtifactsOwned(ctx context.Context, jobID, runnerInstanceID, contextPath, resultPath, stdoutPath, stderrPath string, pid int) error
 	UpdateJobAttempts(ctx context.Context, jobID string, attempts int) error
+	UpdateJobAttemptsOwned(ctx context.Context, jobID, runnerInstanceID string, attempts int) error
 	IncrementAttempts(ctx context.Context, issueKey string, generation int, routeName string) (int, error)
+	IncrementAttemptsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string, generation int, routeName string) (int, error)
 	GetIssueState(ctx context.Context, issueKey string) (generation int, transitions int, err error)
 	IncrementTransitions(ctx context.Context, issueKey string) (int, error)
+	HeartbeatRunner(ctx context.Context, identity model.RunnerIdentity, pid int, now time.Time) error
+	DeleteRunnerHeartbeat(ctx context.Context, runnerInstanceID string) error
+	PruneStaleRunnerHeartbeats(ctx context.Context, before time.Time) (int, error)
+	AssertJobOwned(ctx context.Context, jobID, runnerInstanceID string) error
+	RenewJobLease(ctx context.Context, jobID, runnerInstanceID string, leaseDuration time.Duration) error
+	ListEligibleJobIDs(ctx context.Context, now time.Time) ([]string, error)
 	ListJobs(ctx context.Context) ([]model.Job, error)
 	ListIssues(ctx context.Context) ([]model.IssueSnapshot, error)
 	InsertJobEvent(ctx context.Context, event model.JobEvent) (model.JobEvent, error)

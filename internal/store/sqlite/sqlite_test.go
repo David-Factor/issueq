@@ -3,11 +3,13 @@ package sqlite
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"issueq/internal/model"
+	storepkg "issueq/internal/store"
 
 	_ "modernc.org/sqlite"
 )
@@ -20,7 +22,7 @@ func TestMigrationsCreateTablesAndAreIdempotent(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("second Migrate() error = %v", err)
 	}
-	for _, table := range []string{"issues", "jobs", "issue_state", "route_attempts", "job_events"} {
+	for _, table := range []string{"issues", "jobs", "issue_state", "route_attempts", "runner_heartbeats", "job_events"} {
 		var name string
 		err := store.db.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&name)
 		if err != nil {
@@ -211,6 +213,10 @@ func openTempStore(t *testing.T, ctx context.Context) *Store {
 	return store
 }
 
+func identity(id string) model.RunnerIdentity {
+	return model.RunnerIdentity{RunnerID: id, InstanceID: id + "-instance"}
+}
+
 func sampleIssue() model.IssueSnapshot {
 	return model.IssueSnapshot{
 		IssueKey:        "github.com/example-org/example-repo#1",
@@ -236,14 +242,14 @@ func TestClaimPendingJobSetsLeaseFields(t *testing.T) {
 	if err != nil || !inserted {
 		t.Fatalf("enqueue inserted=%v err=%v", inserted, err)
 	}
-	job, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 1, map[string]int{"code": 1}, 30*time.Minute)
+	job, err := store.ClaimNextJob(ctx, identity("runner-1"), []string{"code"}, 1, map[string]int{"code": 1}, 30*time.Minute)
 	if err != nil {
 		t.Fatalf("ClaimNextJob error = %v", err)
 	}
 	if job == nil {
 		t.Fatal("job = nil")
 	}
-	if job.Status != model.JobStatusRunning || job.LockedBy != "runner-1" || job.LeaseUntil == nil || job.StartedAt == nil {
+	if job.Status != model.JobStatusRunning || job.LockedBy != "runner-1" || job.RunnerInstanceID != "runner-1-instance" || job.LeaseUntil == nil || job.StartedAt == nil {
 		t.Fatalf("claimed job = %#v", job)
 	}
 }
@@ -256,11 +262,11 @@ func TestNonExpiredRunningJobNotClaimedTwice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	first, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 2, map[string]int{"code": 2}, 30*time.Minute)
+	first, err := store.ClaimNextJob(ctx, identity("runner-1"), []string{"code"}, 2, map[string]int{"code": 2}, 30*time.Minute)
 	if err != nil || first == nil {
 		t.Fatalf("first claim job=%#v err=%v", first, err)
 	}
-	second, err := store.ClaimNextJob(ctx, "runner-2", []string{"code"}, 2, map[string]int{"code": 2}, 30*time.Minute)
+	second, err := store.ClaimNextJob(ctx, identity("runner-2"), []string{"code"}, 2, map[string]int{"code": 2}, 30*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -277,12 +283,12 @@ func TestExpiredLeaseCanBeReleased(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	job, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 1, map[string]int{"code": 1}, time.Millisecond)
+	job, err := store.ClaimNextJob(ctx, identity("runner-1"), []string{"code"}, 1, map[string]int{"code": 1}, time.Millisecond)
 	if err != nil || job == nil {
 		t.Fatalf("claim job=%#v err=%v", job, err)
 	}
 	time.Sleep(2 * time.Millisecond)
-	released, err := store.ReleaseExpiredLeases(ctx, time.Now().UTC())
+	released, err := store.ReleaseExpiredLeases(ctx, time.Now().UTC(), time.Now().UTC(), "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,11 +310,11 @@ func TestClaimRespectsGlobalAndRouteConcurrency(t *testing.T) {
 	defer store.Close()
 	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", Priority: 10, DedupeKey: "claim-4"})
 	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-2", RouteName: "code", Kind: "code", Priority: 9, DedupeKey: "claim-5"})
-	first, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 1, map[string]int{"code": 2}, 30*time.Minute)
+	first, err := store.ClaimNextJob(ctx, identity("runner-1"), []string{"code"}, 1, map[string]int{"code": 2}, 30*time.Minute)
 	if err != nil || first == nil {
 		t.Fatalf("first claim job=%#v err=%v", first, err)
 	}
-	blockedGlobal, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 1, map[string]int{"code": 2}, 30*time.Minute)
+	blockedGlobal, err := store.ClaimNextJob(ctx, identity("runner-1"), []string{"code"}, 1, map[string]int{"code": 2}, 30*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -319,12 +325,12 @@ func TestClaimRespectsGlobalAndRouteConcurrency(t *testing.T) {
 	if err := store.FinalizeJob(ctx, first.ID, model.JobFinalize{Status: model.JobStatusSucceeded}); err != nil {
 		t.Fatal(err)
 	}
-	second, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 2, map[string]int{"code": 1}, 30*time.Minute)
+	second, err := store.ClaimNextJob(ctx, identity("runner-1"), []string{"code"}, 2, map[string]int{"code": 1}, 30*time.Minute)
 	if err != nil || second == nil {
 		t.Fatalf("second claim job=%#v err=%v", second, err)
 	}
 	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-3", RouteName: "code", Kind: "code", Priority: 8, DedupeKey: "claim-6"})
-	blockedRoute, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 2, map[string]int{"code": 1}, 30*time.Minute)
+	blockedRoute, err := store.ClaimNextJob(ctx, identity("runner-1"), []string{"code"}, 2, map[string]int{"code": 1}, 30*time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,5 +376,296 @@ func TestTransitionCountIncrements(t *testing.T) {
 	count, err = store.IncrementTransitions(ctx, issue.IssueKey)
 	if err != nil || count != 2 {
 		t.Fatalf("count=%d err=%v", count, err)
+	}
+}
+
+func TestFormattedTimesSortLexicographically(t *testing.T) {
+	early := time.Date(2026, 1, 1, 0, 0, 0, 9, time.UTC)
+	late := time.Date(2026, 1, 1, 0, 0, 0, 10, time.UTC)
+	if !(formatTime(early) < formatTime(late)) {
+		t.Fatalf("formatted times do not sort: %q >= %q", formatTime(early), formatTime(late))
+	}
+	if got := parseTime(formatTime(late)); !got.Equal(late) {
+		t.Fatalf("parse formatted time = %s, want %s", got, late)
+	}
+	legacy := "2026-01-01T00:00:00.9Z"
+	if got := parseTime(legacy); got.IsZero() {
+		t.Fatalf("legacy RFC3339Nano time did not parse")
+	}
+}
+
+func TestHeartbeatRunnerInsertUpdateDeleteAndPrune(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+
+	id := identity("runner-hb")
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if err := store.HeartbeatRunner(ctx, id, 123, now); err != nil {
+		t.Fatalf("HeartbeatRunner insert error = %v", err)
+	}
+	if err := store.HeartbeatRunner(ctx, id, 456, now.Add(time.Minute)); err != nil {
+		t.Fatalf("HeartbeatRunner update error = %v", err)
+	}
+	var pid int
+	var heartbeatAt string
+	if err := store.db.QueryRowContext(ctx, `SELECT pid, heartbeat_at FROM runner_heartbeats WHERE runner_instance_id = ?`, id.InstanceID).Scan(&pid, &heartbeatAt); err != nil {
+		t.Fatal(err)
+	}
+	if pid != 456 || parseTime(heartbeatAt) != now.Add(time.Minute) {
+		t.Fatalf("heartbeat pid=%d at=%s", pid, heartbeatAt)
+	}
+	pruned, err := store.PruneStaleRunnerHeartbeats(ctx, now.Add(2*time.Minute))
+	if err != nil || pruned != 1 {
+		t.Fatalf("PruneStaleRunnerHeartbeats pruned=%d err=%v", pruned, err)
+	}
+	if err := store.HeartbeatRunner(ctx, id, 789, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteRunnerHeartbeat(ctx, id.InstanceID); err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM runner_heartbeats`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("heartbeats count = %d, want 0", count)
+	}
+}
+
+func TestOwnedJobMutationsRequireRunnerInstance(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	_, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", DedupeKey: "owned-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := identity("runner-owned")
+	job, err := store.ClaimNextJob(ctx, owner, []string{"code"}, 1, map[string]int{"code": 1}, 30*time.Minute)
+	if err != nil || job == nil {
+		t.Fatalf("claim job=%#v err=%v", job, err)
+	}
+	if err := store.AssertJobOwned(ctx, job.ID, owner.InstanceID); err != nil {
+		t.Fatalf("AssertJobOwned owner error = %v", err)
+	}
+	if err := store.AssertJobOwned(ctx, job.ID, "other-instance"); !errors.Is(err, storepkg.ErrNotOwner) {
+		t.Fatalf("AssertJobOwned wrong error = %v, want ErrNotOwner", err)
+	}
+	if err := store.RenewJobLease(ctx, job.ID, "other-instance", time.Minute); !errors.Is(err, storepkg.ErrNotOwner) {
+		t.Fatalf("RenewJobLease wrong error = %v, want ErrNotOwner", err)
+	}
+	if err := store.RenewJobLease(ctx, job.ID, owner.InstanceID, time.Minute); err != nil {
+		t.Fatalf("RenewJobLease owner error = %v", err)
+	}
+	if err := store.UpdateJobArtifactsOwned(ctx, job.ID, "other-instance", "ctx", "res", "out", "err", 1); !errors.Is(err, storepkg.ErrNotOwner) {
+		t.Fatalf("UpdateJobArtifactsOwned wrong error = %v, want ErrNotOwner", err)
+	}
+	if err := store.UpdateJobArtifactsOwned(ctx, job.ID, owner.InstanceID, "ctx", "res", "out", "err", 123); err != nil {
+		t.Fatalf("UpdateJobArtifactsOwned owner error = %v", err)
+	}
+	if err := store.UpdateJobAttemptsOwned(ctx, job.ID, "other-instance", 2); !errors.Is(err, storepkg.ErrNotOwner) {
+		t.Fatalf("UpdateJobAttemptsOwned wrong error = %v, want ErrNotOwner", err)
+	}
+	if err := store.UpdateJobAttemptsOwned(ctx, job.ID, owner.InstanceID, 2); err != nil {
+		t.Fatalf("UpdateJobAttemptsOwned owner error = %v", err)
+	}
+	if err := store.FinalizeJobOwned(ctx, job.ID, "other-instance", model.JobFinalize{Status: model.JobStatusSucceeded}); !errors.Is(err, storepkg.ErrNotOwner) {
+		t.Fatalf("FinalizeJobOwned wrong error = %v, want ErrNotOwner", err)
+	}
+	if err := store.FinalizeJobOwned(ctx, job.ID, owner.InstanceID, model.JobFinalize{Status: model.JobStatusSucceeded}); err != nil {
+		t.Fatalf("FinalizeJobOwned owner error = %v", err)
+	}
+}
+
+func TestOwnedJobMutationFailsAfterLeaseExpiry(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	_, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", DedupeKey: "owned-expired"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := identity("runner-expired")
+	job, err := store.ClaimNextJob(ctx, owner, []string{"code"}, 1, map[string]int{"code": 1}, time.Millisecond)
+	if err != nil || job == nil {
+		t.Fatalf("claim job=%#v err=%v", job, err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	if err := store.UpdateJobArtifactsOwned(ctx, job.ID, owner.InstanceID, "ctx", "res", "out", "err", 1); !errors.Is(err, storepkg.ErrLostLease) {
+		t.Fatalf("UpdateJobArtifactsOwned expired error = %v, want ErrLostLease", err)
+	}
+	if err := store.RenewJobLease(ctx, job.ID, owner.InstanceID, time.Minute); !errors.Is(err, storepkg.ErrLostLease) {
+		t.Fatalf("RenewJobLease expired error = %v, want ErrLostLease", err)
+	}
+}
+
+func TestIncrementAttemptsForJobIsAtomicWithOwnership(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	_, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", DedupeKey: "owned-attempt"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := identity("runner-attempt")
+	job, err := store.ClaimNextJob(ctx, owner, []string{"code"}, 1, map[string]int{"code": 1}, 30*time.Minute)
+	if err != nil || job == nil {
+		t.Fatalf("claim job=%#v err=%v", job, err)
+	}
+	if attempts, err := store.IncrementAttemptsForJob(ctx, job.ID, "other-instance", "issue-1", 0, "code"); !errors.Is(err, storepkg.ErrNotOwner) || attempts != 0 {
+		t.Fatalf("wrong owner attempts=%d err=%v", attempts, err)
+	}
+	var routeRows int
+	if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM route_attempts`).Scan(&routeRows); err != nil {
+		t.Fatal(err)
+	}
+	if routeRows != 0 {
+		t.Fatalf("route_attempts rows = %d, want 0", routeRows)
+	}
+	attempts, err := store.IncrementAttemptsForJob(ctx, job.ID, owner.InstanceID, "issue-1", 0, "code")
+	if err != nil || attempts != 1 {
+		t.Fatalf("owner attempts=%d err=%v", attempts, err)
+	}
+}
+
+func TestHeartbeatAwareExpiredLeaseRecovery(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	now := time.Now().UTC()
+
+	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", DedupeKey: "recover-stale"})
+	stale := identity("stale")
+	staleJob, _ := store.ClaimNextJob(ctx, stale, []string{"code"}, 10, map[string]int{"code": 10}, time.Minute)
+	_ = store.UpdateJobArtifactsOwned(ctx, staleJob.ID, stale.InstanceID, "ctx", "res", "out", "err", 111)
+	_, _ = store.db.ExecContext(ctx, `UPDATE jobs SET lease_until = ? WHERE id = ?`, formatTime(now.Add(-time.Millisecond)), staleJob.ID)
+	_ = store.HeartbeatRunner(ctx, stale, 111, now.Add(-time.Hour))
+
+	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-2", RouteName: "code", Kind: "code", DedupeKey: "recover-fresh"})
+	fresh := identity("fresh")
+	freshJob, _ := store.ClaimNextJob(ctx, fresh, []string{"code"}, 10, map[string]int{"code": 10}, time.Minute)
+	_, _ = store.db.ExecContext(ctx, `UPDATE jobs SET lease_until = ? WHERE id = ?`, formatTime(now.Add(-time.Millisecond)), freshJob.ID)
+	_ = store.HeartbeatRunner(ctx, fresh, 222, now)
+
+	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-3", RouteName: "code", Kind: "code", DedupeKey: "recover-active"})
+	active := identity("active")
+	activeJob, _ := store.ClaimNextJob(ctx, active, []string{"code"}, 10, map[string]int{"code": 10}, time.Minute)
+	_, _ = store.db.ExecContext(ctx, `UPDATE jobs SET lease_until = ? WHERE id = ?`, formatTime(now.Add(-time.Millisecond)), activeJob.ID)
+	_ = store.HeartbeatRunner(ctx, active, 333, now.Add(-time.Hour))
+
+	// Backward compatibility: old running row with no runner_instance_id is recoverable.
+	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-4", RouteName: "code", Kind: "code", DedupeKey: "recover-legacy"})
+	legacy := identity("legacy")
+	legacyJob, _ := store.ClaimNextJob(ctx, legacy, []string{"code"}, 10, map[string]int{"code": 10}, time.Minute)
+	_, _ = store.db.ExecContext(ctx, `UPDATE jobs SET runner_instance_id = NULL, lease_until = ? WHERE id = ?`, formatTime(now.Add(-time.Millisecond)), legacyJob.ID)
+
+	released, err := store.ReleaseExpiredLeases(ctx, time.Now().UTC(), now.Add(-time.Minute), active.InstanceID, []string{activeJob.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released != 2 {
+		t.Fatalf("released = %d, want 2", released)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]model.Job{}
+	for _, job := range jobs {
+		byID[job.ID] = job
+	}
+	if got := byID[staleJob.ID]; got.Status != model.JobStatusPending || got.LockedBy != "" || got.RunnerInstanceID != "" || got.LeaseUntil != nil || got.PID != 0 || got.ContextPath != "ctx" || got.Attempts != 0 {
+		t.Fatalf("stale recovered job = %#v", got)
+	}
+	if got := byID[legacyJob.ID]; got.Status != model.JobStatusPending || got.RunnerInstanceID != "" {
+		t.Fatalf("legacy recovered job = %#v", got)
+	}
+	if got := byID[freshJob.ID]; got.Status != model.JobStatusRunning || got.RunnerInstanceID != fresh.InstanceID {
+		t.Fatalf("fresh job = %#v", got)
+	}
+	if got := byID[activeJob.ID]; got.Status != model.JobStatusRunning || got.RunnerInstanceID != active.InstanceID {
+		t.Fatalf("active job = %#v", got)
+	}
+}
+
+func TestTwoStoreInstancesDoNotOverclaimGlobalCapacity(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "issueq.db")
+	storeA, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeA.Close()
+	storeB, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer storeB.Close()
+	_, _, _ = storeA.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", Priority: 10, DedupeKey: "overclaim-1"})
+	_, _, _ = storeA.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-2", RouteName: "code", Kind: "code", Priority: 9, DedupeKey: "overclaim-2"})
+
+	type claimResult struct {
+		job *model.Job
+		err error
+	}
+	results := make(chan claimResult, 2)
+	go func() {
+		job, err := storeA.ClaimNextJob(ctx, identity("runner-overclaim-a"), []string{"code"}, 1, map[string]int{"code": 2}, time.Minute)
+		results <- claimResult{job: job, err: err}
+	}()
+	go func() {
+		job, err := storeB.ClaimNextJob(ctx, identity("runner-overclaim-b"), []string{"code"}, 1, map[string]int{"code": 2}, time.Minute)
+		results <- claimResult{job: job, err: err}
+	}()
+
+	claimed := 0
+	for i := 0; i < 2; i++ {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("claim error = %v", result.err)
+		}
+		if result.job != nil {
+			claimed++
+		}
+	}
+	if claimed != 1 {
+		t.Fatalf("claimed = %d, want 1", claimed)
+	}
+}
+
+func TestClaimUsesRouteNameConcurrencyNotKindFallback(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code-a", Kind: "code", Priority: 10, DedupeKey: "route-name-1"})
+	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-2", RouteName: "code-b", Kind: "code", Priority: 9, DedupeKey: "route-name-2"})
+	first, err := store.ClaimNextJob(ctx, identity("runner-route-1"), []string{"code"}, 2, map[string]int{"code-a": 1, "code-b": 1, "code": 1}, 30*time.Minute)
+	if err != nil || first == nil || first.RouteName != "code-a" {
+		t.Fatalf("first=%#v err=%v", first, err)
+	}
+	second, err := store.ClaimNextJob(ctx, identity("runner-route-2"), []string{"code"}, 2, map[string]int{"code-a": 1, "code-b": 1, "code": 1}, 30*time.Minute)
+	if err != nil || second == nil || second.RouteName != "code-b" {
+		t.Fatalf("second=%#v err=%v", second, err)
+	}
+}
+
+func TestClaimFrontierRestrictsEligibleJobs(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	first, _, _ := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "frontier-1"})
+	second, _, _ := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-2", RouteName: "code", Kind: "code", Priority: 10, DedupeKey: "frontier-2"})
+	ids, err := store.ListEligibleJobIDs(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 2 || ids[0] != second.ID || ids[1] != first.ID {
+		t.Fatalf("eligible ids = %#v", ids)
+	}
+	job, err := store.ClaimNextJobInFrontier(ctx, identity("runner-frontier"), []string{"code"}, 1, map[string]int{"code": 1}, time.Minute, []string{first.ID})
+	if err != nil || job == nil || job.ID != first.ID {
+		t.Fatalf("frontier claim job=%#v err=%v", job, err)
 	}
 }

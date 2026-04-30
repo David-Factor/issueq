@@ -152,7 +152,11 @@ func dispatchCommand(configPath *string) *cobra.Command {
 			return err
 		}
 		defer store.Close()
-		if _, err := store.ReleaseExpiredLeases(cmd.Context(), time.Now().UTC()); err != nil {
+		heartbeatGrace := config.DefaultLeaseDuration
+		if cfg.Queue.LeaseDuration.Duration > 0 {
+			heartbeatGrace = cfg.Queue.LeaseDuration.Duration
+		}
+		if _, err := store.ReleaseExpiredLeases(cmd.Context(), time.Now().UTC(), time.Now().UTC().Add(-heartbeatGrace), "", nil); err != nil {
 			return err
 		}
 		result, err := dispatcher.DispatchWithGitHub(cmd.Context(), *cfg, store, gh)

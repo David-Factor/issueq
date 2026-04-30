@@ -27,7 +27,8 @@ func Dispatch(ctx context.Context, cfg config.Config, queue store.QueueStore) (R
 }
 
 func DispatchWithGitHub(ctx context.Context, cfg config.Config, queue store.QueueStore, gh issuegithub.Client) (Result, error) {
-	runnerInfo := model.RunnerInfo{ID: runnerID(cfg), Name: cfg.Runner.Name}
+	runnerIdentity := model.RunnerIdentity{RunnerID: runnerID(cfg), InstanceID: runnerID(cfg)}
+	runnerInfo := model.RunnerInfo{ID: runnerIdentity.RunnerID, Name: cfg.Runner.Name}
 	limits := perRouteLimits(cfg)
 	maxGlobal := cfg.Queue.MaxGlobalConcurrency
 	if maxGlobal <= 0 {
@@ -40,7 +41,7 @@ func DispatchWithGitHub(ctx context.Context, cfg config.Config, queue store.Queu
 
 	var result Result
 	for {
-		job, err := queue.ClaimNextJob(ctx, runnerInfo.ID, cfg.Runner.Capabilities, maxGlobal, limits, lease)
+		job, err := queue.ClaimNextJob(ctx, runnerIdentity, cfg.Runner.Capabilities, maxGlobal, limits, lease)
 		if err != nil {
 			return result, err
 		}

@@ -41,27 +41,28 @@ type JobCreate struct {
 }
 
 type Job struct {
-	ID          string
-	IssueKey    string
-	RouteName   string
-	Kind        string
-	Status      string
-	Priority    int
-	Attempts    int
-	DedupeKey   string
-	AvailableAt time.Time
-	LockedBy    string
-	LeaseUntil  *time.Time
-	PID         int
-	ContextPath string
-	ResultPath  string
-	StdoutPath  string
-	StderrPath  string
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
-	StartedAt   *time.Time
-	FinishedAt  *time.Time
-	LastError   string
+	ID               string
+	IssueKey         string
+	RouteName        string
+	Kind             string
+	Status           string
+	Priority         int
+	Attempts         int
+	DedupeKey        string
+	AvailableAt      time.Time
+	LockedBy         string
+	RunnerInstanceID string
+	LeaseUntil       *time.Time
+	PID              int
+	ContextPath      string
+	ResultPath       string
+	StdoutPath       string
+	StderrPath       string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	StartedAt        *time.Time
+	FinishedAt       *time.Time
+	LastError        string
 }
 
 type JobEvent struct {
@@ -77,6 +78,11 @@ type JobEvent struct {
 type RunnerInfo struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+}
+
+type RunnerIdentity struct {
+	RunnerID   string
+	InstanceID string
 }
 
 type JobFinalize struct {

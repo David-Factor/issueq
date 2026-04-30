@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   dedupe_key text not null unique,
   available_at text not null,
   locked_by text,
+  runner_instance_id text,
   lease_until text,
   pid integer,
   context_path text,
@@ -39,6 +40,8 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_status_priority_created ON jobs(status, priority DESC, created_at ASC);
 CREATE INDEX IF NOT EXISTS idx_jobs_issue_key ON jobs(issue_key);
+CREATE INDEX IF NOT EXISTS idx_jobs_status_lease_runner ON jobs(status, lease_until, runner_instance_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_status_route_name ON jobs(status, route_name);
 
 CREATE TABLE IF NOT EXISTS issue_state (
   issue_key text primary key,
@@ -57,6 +60,17 @@ CREATE TABLE IF NOT EXISTS route_attempts (
   updated_at text not null,
   primary key (issue_key, generation, route_name)
 );
+
+CREATE TABLE IF NOT EXISTS runner_heartbeats (
+  runner_instance_id text primary key,
+  runner_id text not null,
+  pid integer,
+  heartbeat_at text not null,
+  created_at text not null,
+  updated_at text not null
+);
+
+CREATE INDEX IF NOT EXISTS idx_runner_heartbeats_instance_heartbeat ON runner_heartbeats(runner_instance_id, heartbeat_at);
 
 CREATE TABLE IF NOT EXISTS job_events (
   id text primary key,

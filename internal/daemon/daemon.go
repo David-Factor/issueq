@@ -33,7 +33,11 @@ func Once(ctx context.Context, cfg config.Config, queue store.QueueStore, gh iss
 		return result, err
 	}
 	result.Route = routeResult
-	if _, err := queue.ReleaseExpiredLeases(ctx, time.Now().UTC()); err != nil {
+	heartbeatGrace := cfg.Queue.LeaseDuration.Duration
+	if heartbeatGrace <= 0 {
+		heartbeatGrace = config.DefaultLeaseDuration
+	}
+	if _, err := queue.ReleaseExpiredLeases(ctx, time.Now().UTC(), time.Now().UTC().Add(-heartbeatGrace), "", nil); err != nil {
 		return result, err
 	}
 	dispatchResult, err := dispatcher.DispatchWithGitHub(ctx, cfg, queue, gh)
