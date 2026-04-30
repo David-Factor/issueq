@@ -3,7 +3,11 @@ package dispatcher
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"sync"
+	"time"
 
 	"issueq/internal/actions"
 	"issueq/internal/config"
@@ -23,10 +27,13 @@ type Result struct {
 }
 
 func Dispatch(ctx context.Context, cfg config.Config, queue store.QueueStore) (Result, error) {
-	return DispatchWithGitHub(ctx, cfg, queue, nil)
+	return dispatchLocal(ctx, cfg, queue)
 }
 
 func DispatchWithGitHub(ctx context.Context, cfg config.Config, queue store.QueueStore, gh issuegithub.Client) (Result, error) {
+	if gh == nil {
+		return dispatchLocal(ctx, cfg, queue)
+	}
 	runnerIdentity := model.RunnerIdentity{RunnerID: runnerID(cfg), InstanceID: runnerID(cfg)}
 	runnerInfo := model.RunnerInfo{ID: runnerIdentity.RunnerID, Name: cfg.Runner.Name}
 	limits := perRouteLimits(cfg)
@@ -220,6 +227,236 @@ func DispatchWithGitHub(ctx context.Context, cfg config.Config, queue store.Queu
 	}
 }
 
+func dispatchLocal(ctx context.Context, cfg config.Config, queue store.QueueStore) (Result, error) {
+	runnerIdentity := newRunnerIdentity(cfg)
+	runnerInfo := model.RunnerInfo{ID: runnerIdentity.RunnerID, Name: cfg.Runner.Name}
+	limits := perRouteLimits(cfg)
+	maxGlobal := cfg.Queue.MaxGlobalConcurrency
+	if maxGlobal <= 0 {
+		maxGlobal = 1
+	}
+	lease := cfg.Queue.LeaseDuration.Duration
+	if lease <= 0 {
+		lease = config.DefaultLeaseDuration
+	}
+	now := time.Now().UTC()
+	if err := queue.HeartbeatRunner(ctx, runnerIdentity, os.Getpid(), now); err != nil {
+		return Result{}, err
+	}
+	staleBefore := now.Add(-lease)
+	if _, err := queue.ReleaseExpiredLeases(ctx, now, staleBefore, runnerIdentity.InstanceID, nil); err != nil {
+		return Result{}, err
+	}
+	frontier, err := queue.ListEligibleJobIDs(ctx, now)
+	if err != nil {
+		return Result{}, err
+	}
+
+	active := map[string]*localActiveJob{}
+	frontierRemaining := stringSet(frontier)
+	var result Result
+	for len(frontierRemaining) > 0 || len(active) > 0 {
+		if err := queue.HeartbeatRunner(ctx, runnerIdentity, os.Getpid(), time.Now().UTC()); err != nil {
+			cancelActive(active, err)
+			_ = waitActive(ctx, queue, runnerIdentity, active, &result)
+			return result, err
+		}
+		for len(active) < maxGlobal && len(frontierRemaining) > 0 {
+			job, err := queue.ClaimNextJobInFrontier(ctx, runnerIdentity, cfg.Runner.Capabilities, maxGlobal, limits, lease, keys(frontierRemaining))
+			if err != nil {
+				cancelActive(active, err)
+				_ = waitActive(ctx, queue, runnerIdentity, active, &result)
+				return result, err
+			}
+			if job == nil {
+				break
+			}
+			delete(frontierRemaining, job.ID)
+			result.Claimed++
+			route, ok := findRoute(cfg, job.RouteName)
+			if !ok {
+				if err := queue.FinalizeJobOwned(ctx, job.ID, runnerIdentity.InstanceID, model.JobFinalize{Status: model.JobStatusFailed, LastError: "route not found"}); err != nil {
+					return result, err
+				}
+				result.Failed++
+				continue
+			}
+			issue, err := queue.GetIssue(ctx, job.IssueKey)
+			if err != nil {
+				if err := queue.FinalizeJobOwned(ctx, job.ID, runnerIdentity.InstanceID, model.JobFinalize{Status: model.JobStatusFailed, LastError: fmt.Sprintf("load issue: %v", err)}); err != nil {
+					return result, err
+				}
+				result.Failed++
+				continue
+			}
+			handle, err := runner.Start(ctx, cfg, route, *job, issue, runnerInfo)
+			if err != nil {
+				var startErr runner.StartError
+				if !errors.As(err, &startErr) {
+					return result, err
+				}
+				if err := queue.UpdateJobArtifactsOwned(ctx, job.ID, runnerIdentity.InstanceID, startErr.Result.Paths.ContextPath, startErr.Result.Paths.ResultPath, startErr.Result.Paths.StdoutPath, startErr.Result.Paths.StderrPath, startErr.Result.PID); err != nil {
+					return result, err
+				}
+				if err := queue.FinalizeJobOwned(ctx, job.ID, runnerIdentity.InstanceID, model.JobFinalize{Status: model.JobStatusFailed, LastError: startErr.Result.ErrorString(), FinishedAt: startErr.Result.FinishedAt}); err != nil {
+					return result, err
+				}
+				result.Failed++
+				continue
+			}
+			if err := queue.UpdateJobArtifactsOwned(ctx, job.ID, runnerIdentity.InstanceID, handle.Paths.ContextPath, handle.Paths.ResultPath, handle.Paths.StdoutPath, handle.Paths.StderrPath, handle.PID); err != nil {
+				handle.Cancel(err)
+				_ = runner.Wait(handle)
+				return result, err
+			}
+			active[job.ID] = &localActiveJob{job: job, handle: handle}
+		}
+		if len(active) == 0 {
+			if len(frontierRemaining) > 0 {
+				return result, nil
+			}
+			continue
+		}
+		waitCh := firstDone(active)
+		heartbeatTimer := time.NewTimer(heartbeatInterval(lease))
+		select {
+		case <-ctx.Done():
+			if !heartbeatTimer.Stop() {
+				<-heartbeatTimer.C
+			}
+			cancelActive(active, context.Cause(ctx))
+			_ = waitActive(ctx, queue, runnerIdentity, active, &result)
+			return result, ctx.Err()
+		case <-waitCh:
+			if !heartbeatTimer.Stop() {
+				<-heartbeatTimer.C
+			}
+		case <-heartbeatTimer.C:
+			if err := renewActive(ctx, queue, runnerIdentity, active, lease); err != nil {
+				cancelActive(active, err)
+				_ = waitActive(ctx, queue, runnerIdentity, active, &result)
+				return result, err
+			}
+			continue
+		}
+		if err := reapReady(ctx, queue, runnerIdentity, active, &result); err != nil {
+			cancelActive(active, err)
+			_ = waitActive(ctx, queue, runnerIdentity, active, &result)
+			return result, err
+		}
+	}
+	return result, nil
+}
+
+type localActiveJob struct {
+	job    *model.Job
+	handle *runner.Handle
+}
+
+func renewActive(ctx context.Context, queue store.QueueStore, identity model.RunnerIdentity, active map[string]*localActiveJob, lease time.Duration) error {
+	if err := queue.HeartbeatRunner(ctx, identity, os.Getpid(), time.Now().UTC()); err != nil {
+		return err
+	}
+	for _, activeJob := range active {
+		if err := queue.RenewJobLease(ctx, activeJob.job.ID, identity.InstanceID, lease); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cancelActive(active map[string]*localActiveJob, cause error) {
+	for _, activeJob := range active {
+		activeJob.handle.Cancel(cause)
+	}
+}
+
+func waitActive(ctx context.Context, queue store.QueueStore, identity model.RunnerIdentity, active map[string]*localActiveJob, result *Result) error {
+	for len(active) > 0 {
+		<-firstDone(active)
+		if err := reapReady(ctx, queue, identity, active, result); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func reapReady(ctx context.Context, queue store.QueueStore, identity model.RunnerIdentity, active map[string]*localActiveJob, result *Result) error {
+	for id, activeJob := range active {
+		select {
+		case <-activeJob.handle.Done:
+		case <-activeJob.handle.ContextDone:
+		default:
+			continue
+		}
+		delete(active, id)
+		runResult := runner.Wait(activeJob.handle)
+		_ = queue.UpdateJobArtifactsOwned(ctx, activeJob.job.ID, identity.InstanceID, runResult.Paths.ContextPath, runResult.Paths.ResultPath, runResult.Paths.StdoutPath, runResult.Paths.StderrPath, runResult.PID)
+		status := model.JobStatusSucceeded
+		lastErr := ""
+		if runResult.Error != nil || runResult.ExitCode != 0 {
+			status = model.JobStatusFailed
+			lastErr = runResult.ErrorString()
+		}
+		if status == model.JobStatusSucceeded && runResult.Paths.ResultPath != "" {
+			_, _, parseErr := actions.ParseResultFile(runResult.Paths.ResultPath)
+			if parseErr != nil {
+				status = model.JobStatusFailed
+				lastErr = parseErr.Error()
+			}
+		}
+		if err := queue.FinalizeJobOwned(ctx, activeJob.job.ID, identity.InstanceID, model.JobFinalize{Status: status, LastError: lastErr, ResultPath: runResult.Paths.ResultPath, StdoutPath: runResult.Paths.StdoutPath, StderrPath: runResult.Paths.StderrPath, FinishedAt: runResult.FinishedAt}); err != nil {
+			return err
+		}
+		_, _ = queue.InsertJobEvent(ctx, model.JobEvent{JobID: activeJob.job.ID, IssueKey: activeJob.job.IssueKey, EventType: "job_" + status, Message: lastErr})
+		if status == model.JobStatusSucceeded {
+			result.Succeeded++
+		} else {
+			result.Failed++
+		}
+	}
+	return nil
+}
+
+func firstDone(active map[string]*localActiveJob) <-chan struct{} {
+	out := make(chan struct{})
+	var once sync.Once
+	for _, activeJob := range active {
+		go func(done <-chan struct{}, contextDone <-chan struct{}) {
+			select {
+			case <-done:
+			case <-contextDone:
+			}
+			once.Do(func() { close(out) })
+		}(activeJob.handle.Done, activeJob.handle.ContextDone)
+	}
+	return out
+}
+
+func heartbeatInterval(lease time.Duration) time.Duration {
+	interval := lease / 4
+	if interval <= 0 || interval > time.Second {
+		interval = time.Second
+	}
+	return interval
+}
+
+func stringSet(values []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	return set
+}
+
+func keys(set map[string]struct{}) []string {
+	values := make([]string, 0, len(set))
+	for value := range set {
+		values = append(values, value)
+	}
+	return values
+}
+
 func findRoute(cfg config.Config, name string) (config.RouteConfig, bool) {
 	for _, route := range cfg.Routes {
 		if route.Name == name {
@@ -235,6 +472,11 @@ func perRouteLimits(cfg config.Config) map[string]int {
 		limits[route.Name] = route.Job.Concurrency
 	}
 	return limits
+}
+
+func newRunnerIdentity(cfg config.Config) model.RunnerIdentity {
+	id := runnerID(cfg)
+	return model.RunnerIdentity{RunnerID: id, InstanceID: fmt.Sprintf("%s-%d-%d", id, os.Getpid(), time.Now().UTC().UnixNano())}
 }
 
 func runnerID(cfg config.Config) string {

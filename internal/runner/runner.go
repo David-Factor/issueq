@@ -157,15 +157,17 @@ func currentProcessStarter() ProcessStarter {
 }
 
 type Handle struct {
-	Job       model.Job
-	Issue     model.IssueSnapshot
-	Route     config.RouteConfig
-	Runner    model.RunnerInfo
-	Paths     Paths
-	PID       int
-	StartedAt time.Time
-	Timeout   time.Duration
-	Done      <-chan struct{}
+	Job         model.Job
+	Issue       model.IssueSnapshot
+	Route       config.RouteConfig
+	Runner      model.RunnerInfo
+	Paths       Paths
+	PID         int
+	StartedAt   time.Time
+	Timeout     time.Duration
+	Done        <-chan struct{}
+	ContextDone <-chan struct{}
+	Ready       <-chan struct{}
 
 	ctx        context.Context
 	cancel     context.CancelCauseFunc
@@ -261,31 +263,33 @@ func Start(ctx context.Context, cfg config.Config, route config.RouteConfig, job
 		_ = stderr.Close()
 		return nil, StartError{Result: Result{ExitCode: -1, Error: fmt.Errorf("start subprocess: %w", err), Paths: paths, StartedAt: started, FinishedAt: time.Now().UTC()}}
 	}
-	done := make(chan struct{})
+	ready := make(chan struct{})
 	handle := &Handle{
-		Job:       job,
-		Issue:     issue,
-		Route:     route,
-		Runner:    runnerInfo,
-		Paths:     paths,
-		PID:       proc.PID(),
-		StartedAt: started,
-		Timeout:   timeout,
-		ctx:       procCtx,
-		cancel:    cancel,
-		timer:     timeoutTimer,
-		process:   proc,
-		stdout:    stdout,
-		stderr:    stderr,
-		done:      done,
-		Done:      done,
+		Job:         job,
+		Issue:       issue,
+		Route:       route,
+		Runner:      runnerInfo,
+		Paths:       paths,
+		PID:         proc.PID(),
+		StartedAt:   started,
+		Timeout:     timeout,
+		ctx:         procCtx,
+		cancel:      cancel,
+		timer:       timeoutTimer,
+		process:     proc,
+		stdout:      stdout,
+		stderr:      stderr,
+		done:        ready,
+		Done:        ready,
+		ContextDone: procCtx.Done(),
+		Ready:       ready,
 	}
 	go func() {
 		err := proc.Wait()
 		handle.waitErrMu.Lock()
 		handle.waitErr = err
 		handle.waitErrMu.Unlock()
-		close(done)
+		close(ready)
 	}()
 	return handle, nil
 }

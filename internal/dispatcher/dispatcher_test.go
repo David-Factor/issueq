@@ -72,6 +72,157 @@ func TestDispatchTimeout(t *testing.T) {
 	}
 }
 
+func TestDispatchLocalMalformedResultFailsJob(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, `#!/bin/sh
+printf '{' > "$2"
+`)
+	defer store.Close()
+	result, err := Dispatch(ctx, cfg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Failed != 1 || result.Succeeded != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	jobs, _ := store.ListJobs(ctx)
+	if jobs[0].Status != model.JobStatusFailed || !strings.Contains(jobs[0].LastError, "parse result JSON") {
+		t.Fatalf("job = %#v", jobs[0])
+	}
+}
+
+func TestDispatchLocalRunsJobsConcurrently(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, `#!/bin/sh
+sleep 0.2
+`)
+	defer store.Close()
+	cfg.Queue.MaxGlobalConcurrency = 2
+	cfg.Routes[0].Job.Concurrency = 2
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "dedupe-2"}); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	result, err := Dispatch(ctx, cfg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(started)
+	if result.Claimed != 2 || result.Succeeded != 2 {
+		t.Fatalf("result = %#v", result)
+	}
+	if elapsed >= 350*time.Millisecond {
+		t.Fatalf("dispatch took %s, want overlapping jobs", elapsed)
+	}
+}
+
+func TestDispatchLocalGlobalConcurrencyOneIsSerial(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, `#!/bin/sh
+sleep 0.12
+`)
+	defer store.Close()
+	cfg.Queue.MaxGlobalConcurrency = 1
+	cfg.Routes[0].Job.Concurrency = 2
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "dedupe-2"}); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	result, err := Dispatch(ctx, cfg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(started)
+	if result.Claimed != 2 || result.Succeeded != 2 {
+		t.Fatalf("result = %#v", result)
+	}
+	if elapsed < 220*time.Millisecond {
+		t.Fatalf("dispatch took %s, want serial jobs", elapsed)
+	}
+}
+
+func TestDispatchLocalSameRouteConcurrencyOnePreventsOverlap(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, `#!/bin/sh
+sleep 0.12
+`)
+	defer store.Close()
+	cfg.Queue.MaxGlobalConcurrency = 2
+	cfg.Routes[0].Job.Concurrency = 1
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "dedupe-2"}); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	result, err := Dispatch(ctx, cfg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(started)
+	if result.Claimed != 2 || result.Succeeded != 2 {
+		t.Fatalf("result = %#v", result)
+	}
+	if elapsed < 220*time.Millisecond {
+		t.Fatalf("dispatch took %s, want route-serial jobs", elapsed)
+	}
+}
+
+func TestDispatchLocalHeartbeatsWhileJobsRun(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, `#!/bin/sh
+sleep 0.12
+`)
+	defer store.Close()
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 40 * time.Millisecond}
+	cfg.Routes[0].Job.Timeout = config.Duration{Duration: time.Second}
+	result, err := Dispatch(ctx, cfg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Succeeded != 1 || result.Failed != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	jobs, _ := store.ListJobs(ctx)
+	if jobs[0].Status != model.JobStatusSucceeded {
+		t.Fatalf("job = %#v", jobs[0])
+	}
+}
+
+func TestDispatchLocalDrainsInitialBacklogButNotNewJobs(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	script := filepath.Join(dir, "task.sh")
+	marker := filepath.Join(dir, "marker")
+	body := "#!/bin/sh\nif [ ! -f " + marker + " ]; then touch " + marker + "; fi\n"
+	store, cfg := setupDispatch(t, body)
+	defer store.Close()
+	cfg.Queue.MaxGlobalConcurrency = 1
+	cfg.Routes[0].Job.Concurrency = 1
+	cfg.Routes[0].Job.Command = []string{script}
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "initial-2"}); err != nil {
+		t.Fatal(err)
+	}
+	future, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 10, DedupeKey: "future", AvailableAt: time.Now().Add(time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := Dispatch(ctx, cfg, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Claimed != 2 || result.Succeeded != 2 {
+		t.Fatalf("result = %#v", result)
+	}
+	jobs, _ := store.ListJobs(ctx)
+	for _, job := range jobs {
+		if job.ID == future.ID && job.Status != model.JobStatusPending {
+			t.Fatalf("future job status = %s, want pending", job.Status)
+		}
+	}
+}
+
 func setupDispatch(t *testing.T, scriptBody string) (*sqlitestore.Store, config.Config) {
 	t.Helper()
 	ctx := context.Background()
