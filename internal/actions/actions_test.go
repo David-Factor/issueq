@@ -2,6 +2,7 @@ package actions
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -82,6 +83,31 @@ func TestApplyNoOpLabelsAndCommentsDoNotCountAsChanged(t *testing.T) {
 		t.Fatal("Changed = true, want false")
 	}
 	if got := strings.Join(gh.calls, "|"); got != "get|remove:missing|add:agent-ready|comment|get" {
+		t.Fatalf("calls = %s", got)
+	}
+}
+
+func TestApplyWithHooksChecksBeforeEverySideEffect(t *testing.T) {
+	ctx := context.Background()
+	queue, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "issueq.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	issue := testIssue([]string{"agent-ready"})
+	gh := &fakeClient{issues: []model.IssueSnapshot{issue}}
+	checks := 0
+	_, err = ApplyWithHooks(ctx, testConfig(), gh, queue, issue, config.ActionConfig{LabelsRemove: []string{"agent-ready"}, LabelsAdd: []string{"agent-running"}, Comment: "started"}, ApplyHooks{BeforeSideEffect: func() error {
+		checks++
+		if checks == 3 {
+			return errors.New("lost")
+		}
+		return nil
+	}})
+	if err == nil || err.Error() != "lost" {
+		t.Fatalf("err = %v, want lost", err)
+	}
+	if got := strings.Join(gh.calls, "|"); got != "get|remove:agent-ready" {
 		t.Fatalf("calls = %s", got)
 	}
 }

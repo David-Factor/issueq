@@ -30,6 +30,7 @@ type QueueStore interface {
 	UpdateJobAttemptsOwned(ctx context.Context, jobID, runnerInstanceID string, attempts int) error
 	IncrementAttempts(ctx context.Context, issueKey string, generation int, routeName string) (int, error)
 	IncrementAttemptsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string, generation int, routeName string) (int, error)
+	IncrementTransitionsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string) (int, error)
 	GetIssueState(ctx context.Context, issueKey string) (generation int, transitions int, err error)
 	IncrementTransitions(ctx context.Context, issueKey string) (int, error)
 	HeartbeatRunner(ctx context.Context, identity model.RunnerIdentity, pid int, now time.Time) error

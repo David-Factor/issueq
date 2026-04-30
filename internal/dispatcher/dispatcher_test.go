@@ -271,6 +271,7 @@ type fakeGitHub struct {
 	comments  []string
 	errOn     map[string]error
 	errOnCall map[string]int
+	afterCall func(name string)
 }
 
 func (f *fakeGitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]model.IssueSnapshot, error) {
@@ -319,6 +320,11 @@ func (f *fakeGitHub) CreateComment(ctx context.Context, owner, repo string, numb
 }
 
 func (f *fakeGitHub) callError(name string) error {
+	defer func() {
+		if f.afterCall != nil {
+			f.afterCall(name)
+		}
+	}()
 	if f.errOnCall != nil {
 		f.errOnCall[name]--
 		if f.errOnCall[name] == 0 {
@@ -327,6 +333,144 @@ func (f *fakeGitHub) callError(name string) error {
 		return nil
 	}
 	return f.errOn[name]
+}
+
+func TestDispatchWithGitHubRunsJobsConcurrently(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, `#!/bin/sh
+sleep 0.2
+`)
+	defer store.Close()
+	cfg.Queue.MaxGlobalConcurrency = 2
+	cfg.Routes[0].Job.Concurrency = 2
+	cfg.Routes[0].When = config.PredicateConfig{LabelsInclude: []string{"agent-ready"}}
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "dedupe-2"}); err != nil {
+		t.Fatal(err)
+	}
+	gh := &fakeGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
+	started := time.Now()
+	result, err := DispatchWithGitHub(ctx, cfg, store, gh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	elapsed := time.Since(started)
+	if result.Claimed != 2 || result.Succeeded != 2 {
+		t.Fatalf("result = %#v", result)
+	}
+	if elapsed >= 350*time.Millisecond {
+		t.Fatalf("dispatch took %s, want overlapping GitHub jobs", elapsed)
+	}
+}
+
+func TestDispatchWithGitHubLostOwnershipBeforeOnStartSkipsGitHubAction(t *testing.T) {
+	ctx := context.Background()
+	baseStore, cfg := setupDispatch(t, "#!/bin/sh\necho should-not-run\n")
+	defer baseStore.Close()
+	cfg.Routes[0].When = config.PredicateConfig{LabelsInclude: []string{"agent-ready"}}
+	cfg.Routes[0].Job.OnStart = config.ActionConfig{LabelsAdd: []string{"agent-running"}, Comment: "starting"}
+	wrapped := &renewInjectStore{Store: baseStore}
+	gh := &fakeGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
+	gh.afterCall = func(name string) {
+		if name != "get" {
+			return
+		}
+		jobs, _ := baseStore.ListJobs(ctx)
+		if len(jobs) == 0 || jobs[0].RunnerInstanceID == "" {
+			return
+		}
+		wrapped.renewErrs = []error{nil, nil, storepkg.ErrNotOwner}
+		gh.afterCall = nil
+	}
+	result, err := DispatchWithGitHub(ctx, cfg, wrapped, gh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Claimed != 1 || result.Succeeded != 0 || result.Failed != 0 || result.Skipped != 0 || result.Dead != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	for _, call := range gh.calls {
+		if strings.HasPrefix(call, "add:") || call == "comment" || strings.HasPrefix(call, "remove:") {
+			t.Fatalf("unexpected GitHub side effect calls = %#v", gh.calls)
+		}
+	}
+	jobs, _ := baseStore.ListJobs(ctx)
+	if jobs[0].Status != model.JobStatusRunning || jobs[0].Attempts != 1 {
+		t.Fatalf("job = %#v", jobs[0])
+	}
+}
+
+func TestDispatchWithGitHubLostOwnershipBeforeResultActionSkipsGitHubAction(t *testing.T) {
+	ctx := context.Background()
+	baseStore, cfg := setupDispatch(t, `#!/bin/sh
+cat > "$2" <<'JSON'
+{"comment":"done","labels_add":["agent-review"]}
+JSON
+`)
+	defer baseStore.Close()
+	cfg.Routes[0].When = config.PredicateConfig{LabelsInclude: []string{"agent-ready"}}
+	wrapped := &renewInjectStore{Store: baseStore, renewErrs: []error{nil, nil, nil, nil, nil, storepkg.ErrLostLease}}
+	proc := newDispatcherFakeProcess(3001)
+	fakeStarter := &dispatcherFakeStarter{processes: []*dispatcherFakeProcess{proc}}
+	restore := runner.SetProcessStarterForTest(fakeStarter)
+	defer restore()
+	gh := &fakeGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
+	go func() { proc.waitCh <- nil }()
+	result, err := DispatchWithGitHub(ctx, cfg, wrapped, gh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Claimed != 1 || result.Succeeded != 0 || result.Failed != 0 || result.Dead != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	for _, call := range gh.calls {
+		if strings.HasPrefix(call, "add:agent-review") || call == "comment" {
+			t.Fatalf("unexpected result GitHub side effect calls = %#v", gh.calls)
+		}
+	}
+	jobs, _ := baseStore.ListJobs(ctx)
+	if jobs[0].Status != model.JobStatusRunning {
+		t.Fatalf("job = %#v", jobs[0])
+	}
+}
+
+func TestDispatchWithGitHubLostOwnershipBeforeAttemptsPreventsAttemptMutation(t *testing.T) {
+	ctx := context.Background()
+	baseStore, cfg := setupDispatch(t, "#!/bin/sh\necho should-not-run\n")
+	defer baseStore.Close()
+	cfg.Routes[0].When = config.PredicateConfig{LabelsInclude: []string{"agent-ready"}}
+	wrapped := &renewInjectStore{Store: baseStore, incrementAttemptsErrs: []error{storepkg.ErrNotOwner}}
+	gh := &fakeGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
+	result, err := DispatchWithGitHub(ctx, cfg, wrapped, gh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Claimed != 1 || result.Succeeded != 0 || result.Failed != 0 || result.Dead != 0 || result.Skipped != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	jobs, _ := baseStore.ListJobs(ctx)
+	if jobs[0].Attempts != 0 || jobs[0].Status != model.JobStatusRunning {
+		t.Fatalf("job = %#v", jobs[0])
+	}
+}
+
+func TestDispatchWithGitHubStartFailureAppliesFailureAction(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, "#!/bin/sh\necho should-not-run\n")
+	defer store.Close()
+	cfg.Routes[0].When = config.PredicateConfig{LabelsInclude: []string{"agent-ready"}}
+	cfg.Routes[0].Job.Command = nil
+	cfg.Routes[0].Job.OnFailure = config.ActionConfig{LabelsAdd: []string{"agent-failed"}, Comment: "failed"}
+	gh := &fakeGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
+	result, err := DispatchWithGitHub(ctx, cfg, store, gh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Failed != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	if len(gh.comments) != 1 || gh.comments[0] != "failed" {
+		t.Fatalf("comments = %#v calls = %#v", gh.comments, gh.calls)
+	}
 }
 
 func TestDispatchWithGitHubStaleJobSkipped(t *testing.T) {
@@ -600,15 +744,48 @@ func (p *dispatcherFakeProcess) KillTree() error {
 
 type renewInjectStore struct {
 	*sqlitestore.Store
-	renewErrs       []error
-	renewCalls      int
-	onRenew         func(call int)
-	artifactErrs    []error
-	artifactCalls   int
-	finalizeErrs    []error
-	finalizeCalls   int
-	finalizedJobIDs []string
-	artifactJobIDs  []string
+	assertErrs                []error
+	assertCalls               int
+	incrementAttemptsErrs     []error
+	incrementAttemptsCalls    int
+	incrementTransitionsErrs  []error
+	incrementTransitionsCalls int
+	renewErrs                 []error
+	renewCalls                int
+	onRenew                   func(call int)
+	artifactErrs              []error
+	artifactCalls             int
+	finalizeErrs              []error
+	finalizeCalls             int
+	finalizedJobIDs           []string
+	artifactJobIDs            []string
+}
+
+func (s *renewInjectStore) AssertJobOwned(ctx context.Context, jobID, runnerInstanceID string) error {
+	s.assertCalls++
+	call := s.assertCalls
+	if call <= len(s.assertErrs) && s.assertErrs[call-1] != nil {
+		return s.assertErrs[call-1]
+	}
+	return s.Store.AssertJobOwned(ctx, jobID, runnerInstanceID)
+}
+
+func (s *renewInjectStore) IncrementAttemptsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string, generation int, routeName string) (int, error) {
+	s.incrementAttemptsCalls++
+	call := s.incrementAttemptsCalls
+	if call <= len(s.incrementAttemptsErrs) && s.incrementAttemptsErrs[call-1] != nil {
+		return 0, s.incrementAttemptsErrs[call-1]
+	}
+	return s.Store.IncrementAttemptsForJob(ctx, jobID, runnerInstanceID, issueKey, generation, routeName)
+}
+
+func (s *renewInjectStore) IncrementTransitionsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string) (int, error) {
+	s.incrementTransitionsCalls++
+	call := s.incrementTransitionsCalls
+	if call <= len(s.incrementTransitionsErrs) && s.incrementTransitionsErrs[call-1] != nil {
+		return 0, s.incrementTransitionsErrs[call-1]
+	}
+	return s.Store.IncrementTransitionsForJob(ctx, jobID, runnerInstanceID, issueKey)
 }
 
 func (s *renewInjectStore) RenewJobLease(ctx context.Context, jobID, runnerInstanceID string, leaseDuration time.Duration) error {

@@ -530,6 +530,39 @@ func TestIncrementAttemptsForJobIsAtomicWithOwnership(t *testing.T) {
 	}
 }
 
+func TestIncrementTransitionsForJobIsOwnershipGuarded(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	issue := model.IssueSnapshot{IssueKey: "issue-1", Host: "github.com", Owner: "o", Repo: "r", Number: 1, State: "open"}
+	if err := store.UpsertIssue(ctx, issue); err != nil {
+		t.Fatal(err)
+	}
+	job, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: issue.IssueKey, RouteName: "code", Kind: "code", DedupeKey: "transition"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := identity("owner")
+	claimed, err := store.ClaimNextJob(ctx, owner, []string{"code"}, 1, map[string]int{"code": 1}, time.Minute)
+	if err != nil || claimed.ID != job.ID {
+		t.Fatalf("claimed=%#v err=%v", claimed, err)
+	}
+	if transitions, err := store.IncrementTransitionsForJob(ctx, job.ID, "other", issue.IssueKey); !errors.Is(err, storepkg.ErrNotOwner) || transitions != 0 {
+		t.Fatalf("wrong owner transitions=%d err=%v", transitions, err)
+	}
+	_, transitions, err := store.GetIssueState(ctx, issue.IssueKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transitions != 0 {
+		t.Fatalf("transitions = %d, want 0 after denied increment", transitions)
+	}
+	transitions, err = store.IncrementTransitionsForJob(ctx, job.ID, owner.InstanceID, issue.IssueKey)
+	if err != nil || transitions != 1 {
+		t.Fatalf("owner transitions=%d err=%v", transitions, err)
+	}
+}
+
 func TestHeartbeatAwareExpiredLeaseRecovery(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t, ctx)

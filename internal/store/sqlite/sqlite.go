@@ -506,6 +506,30 @@ WHERE issue_key = ? AND generation = ? AND route_name = ?`, now, issueKey, gener
 	return attempts, nil
 }
 
+func (s *Store) IncrementTransitionsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string) (int, error) {
+	tx, err := s.beginImmediate(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin job transition increment: %w", err)
+	}
+	defer tx.Rollback()
+	if err := assertJobOwnedTx(ctx, tx, jobID, runnerInstanceID); err != nil {
+		return 0, err
+	}
+	now := formatTime(time.Now().UTC())
+	_, err = tx.ExecContext(ctx, `UPDATE issue_state SET transition_count = transition_count + 1, updated_at = ? WHERE issue_key = ?`, now, issueKey)
+	if err != nil {
+		return 0, fmt.Errorf("increment owned transitions: %w", err)
+	}
+	var transitions int
+	if err := tx.QueryRowContext(ctx, `SELECT transition_count FROM issue_state WHERE issue_key = ?`, issueKey).Scan(&transitions); err != nil {
+		return 0, fmt.Errorf("select owned transitions: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit owned transition increment: %w", err)
+	}
+	return transitions, nil
+}
+
 func (s *Store) GetIssueState(ctx context.Context, issueKey string) (generation int, transitions int, err error) {
 	err = s.db.QueryRowContext(ctx, `SELECT generation, transition_count FROM issue_state WHERE issue_key = ?`, issueKey).Scan(&generation, &transitions)
 	if err != nil {

@@ -92,7 +92,25 @@ type ApplyResult struct {
 	Changed      bool
 }
 
+type ApplyHooks struct {
+	BeforeSideEffect func() error
+}
+
+func (h ApplyHooks) beforeSideEffect() error {
+	if h.BeforeSideEffect == nil {
+		return nil
+	}
+	return h.BeforeSideEffect()
+}
+
 func Apply(ctx context.Context, cfg config.Config, client issuegithub.Client, queue store.QueueStore, issue model.IssueSnapshot, action config.ActionConfig) (ApplyResult, error) {
+	return ApplyWithHooks(ctx, cfg, client, queue, issue, action, ApplyHooks{})
+}
+
+func ApplyWithHooks(ctx context.Context, cfg config.Config, client issuegithub.Client, queue store.QueueStore, issue model.IssueSnapshot, action config.ActionConfig, hooks ApplyHooks) (ApplyResult, error) {
+	if err := hooks.beforeSideEffect(); err != nil {
+		return ApplyResult{}, err
+	}
 	latest, err := client.GetIssue(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number)
 	if err != nil {
 		return ApplyResult{}, fmt.Errorf("refresh issue before action: %w", err)
@@ -100,30 +118,45 @@ func Apply(ctx context.Context, cfg config.Config, client issuegithub.Client, qu
 	beforeLabels := append([]string{}, latest.Labels...)
 	mutated := false
 	if len(action.LabelsRemove) > 0 {
+		if err := hooks.beforeSideEffect(); err != nil {
+			return ApplyResult{}, err
+		}
 		if err := client.RemoveLabels(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number, action.LabelsRemove); err != nil && !isAbsentLabelError(err) {
 			return ApplyResult{}, fmt.Errorf("remove labels: %w", err)
 		}
 		mutated = true
 	}
 	if len(action.LabelsAdd) > 0 {
+		if err := hooks.beforeSideEffect(); err != nil {
+			return ApplyResult{}, err
+		}
 		if err := client.AddLabels(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number, action.LabelsAdd); err != nil {
 			return ApplyResult{}, fmt.Errorf("add labels: %w", err)
 		}
 		mutated = true
 	}
 	if strings.TrimSpace(action.Comment) != "" {
+		if err := hooks.beforeSideEffect(); err != nil {
+			return ApplyResult{}, err
+		}
 		if err := client.CreateComment(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number, action.Comment); err != nil {
 			return ApplyResult{}, fmt.Errorf("create comment: %w", err)
 		}
 		mutated = true
 	}
 	if mutated {
+		if err := hooks.beforeSideEffect(); err != nil {
+			return ApplyResult{}, err
+		}
 		latest, err = client.GetIssue(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number)
 		if err != nil {
 			return ApplyResult{}, fmt.Errorf("refresh issue after action: %w", err)
 		}
 	}
 	latest.IssueKey = model.IssueKey(latest.Host, latest.Owner, latest.Repo, latest.Number)
+	if err := hooks.beforeSideEffect(); err != nil {
+		return ApplyResult{}, err
+	}
 	if err := queue.UpsertIssue(ctx, latest); err != nil {
 		return ApplyResult{}, fmt.Errorf("update local issue snapshot: %w", err)
 	}
