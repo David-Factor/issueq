@@ -1,0 +1,60 @@
+runner:
+  name: local-issueq
+  capabilities: [triage, code, review]
+  env:
+    inherit: false
+    pass: [PATH, HOME]
+
+queue:
+  backend: sqlite
+  sqlite:
+    path: ./issueq.db
+  max_global_concurrency: 1
+  lease_duration: 30m
+
+workdir:
+  path: ./.issueq
+
+polling:
+  interval: 3m
+
+github:
+  host: github.com
+  owner: example-org
+  repo: example-repo
+  token_env: GITHUB_TOKEN
+
+terminal_labels: [agent-done, agent-failed, agent-needs-human, manual-only]
+workflow:
+  max_transitions_per_issue: 10
+  on_transitions_exceeded:
+    labels_add: [agent-failed, agent-needs-human]
+    labels_remove: [agent-running, agent-ready, agent-review]
+    comment: "Automation stopped after too many transitions."
+
+routes:
+  - name: code
+    when:
+      labels_include: [agent-ready]
+      labels_exclude: [agent-running, agent-done, agent-failed, agent-needs-human, manual-only]
+    job:
+      kind: code
+      command: ["./examples/tasks/success.sh"]
+      timeout: 5m
+      concurrency: 1
+      max_attempts: 2
+      on_start:
+        labels_remove: [agent-ready]
+        labels_add: [agent-running]
+      on_success:
+        labels_remove: [agent-running]
+        labels_add: [agent-review]
+        comment: "Automation finished. Review queued."
+      on_failure:
+        labels_remove: [agent-running]
+        labels_add: [agent-failed]
+        comment: "Automation failed."
+      on_attempts_exceeded:
+        labels_remove: [agent-running, agent-ready]
+        labels_add: [agent-failed, agent-needs-human]
+        comment: "Automation stopped after too many attempts."

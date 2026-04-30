@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -40,23 +41,6 @@ func TestRootCommandHelpIncludesPhase0Commands(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("help output missing %q:\n%s", want, out)
 		}
-	}
-}
-
-func TestStubCommandsAcceptConfigFlag(t *testing.T) {
-	cmd := newRootCommand()
-	buf := new(bytes.Buffer)
-	cmd.SetOut(buf)
-	cmd.SetErr(buf)
-	cmd.SetArgs([]string{"--config", "custom.yaml", "daemon"})
-
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("Execute() error = %v", err)
-	}
-
-	want := "daemon is not implemented yet (config: custom.yaml)"
-	if !strings.Contains(buf.String(), want) {
-		t.Fatalf("output missing %q:\n%s", want, buf.String())
 	}
 }
 
@@ -193,6 +177,43 @@ func TestRouteCommandSeedsJobFromStoredIssue(t *testing.T) {
 	}
 }
 
+func TestInspectCommandsJSON(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "issueq.yaml")
+	dbPath := filepath.Join(dir, "issueq.db")
+	writeConfig(t, configPath, dbPath)
+	ctx := context.Background()
+	store, err := sqlitestore.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issue := model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "JSON issue", Labels: []string{"agent-triage"}, State: "open"}
+	if err := store.UpsertIssue(ctx, issue); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: issue.IssueKey, RouteName: "triage", Kind: "triage", DedupeKey: "json"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Close()
+	for _, name := range []string{"jobs", "issues"} {
+		cmd := newRootCommand()
+		buf := new(bytes.Buffer)
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"--config", configPath, name, "--json"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatal(err)
+		}
+		var parsed []map[string]any
+		if err := json.Unmarshal(buf.Bytes(), &parsed); err != nil {
+			t.Fatalf("%s output not JSON: %q err=%v", name, buf.String(), err)
+		}
+		if len(parsed) != 1 {
+			t.Fatalf("%s parsed len = %d", name, len(parsed))
+		}
+	}
+}
+
 func TestDispatchCommandRunsSeededJob(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "issueq.yaml")
@@ -266,8 +287,8 @@ func TestJobsAndIssuesCommandsWorkOnEmptyDB(t *testing.T) {
 			if err := cmd.Execute(); err != nil {
 				t.Fatalf("Execute() error = %v", err)
 			}
-			if buf.String() != "" {
-				t.Fatalf("output = %q, want empty", buf.String())
+			if !strings.Contains(buf.String(), "\t") {
+				t.Fatalf("output = %q, want table header", buf.String())
 			}
 		})
 	}
