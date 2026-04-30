@@ -1,48 +1,61 @@
 # issueq v1 Design Spec
 
-## 1. Summary
+## 1. Purpose
 
 `issueq` is a small local automation runner for GitHub issues.
 
-It polls GitHub on a configurable interval, stores issue snapshots locally, evaluates simple route predicates, enqueues jobs into SQLite, and dispatches configured subprocesses with explicit concurrency limits.
+It polls one GitHub repository on a configurable interval, stores issue snapshots in SQLite, evaluates simple label-based route predicates, enqueues matching jobs, and dispatches bounded subprocesses such as triage scripts, coding agents, review agents, and cleanup tasks.
 
-The intended first use case is lightweight coding-agent automation:
+V1 is local-first. GitHub labels/comments are the durable, human-visible workflow state. SQLite is the local queue, attempt counter, lease store, and audit log.
 
-1. A human creates or labels a GitHub issue.
-2. `issueq` sees the issue during polling.
-3. Labels/predicates route the issue into a local queue.
-4. A dispatcher starts a configured subprocess when capacity is available.
-5. The subprocess handles triage, coding, review, etc.
-6. `issueq` applies configured GitHub label/comment transitions based on the result.
+This document is the product/technical specification. The phased build plan lives separately in [`v1-implementation-plan.md`](v1-implementation-plan.md).
 
-V1 is deliberately local-first and simple. GitHub labels remain the durable, human-visible workflow state. SQLite is the local execution backlog and bookkeeping store.
+## 2. Definitions
 
-## 2. Goals
+- **Issue snapshot**: Local SQLite copy of selected GitHub issue fields.
+- **Route**: Configured predicate plus job definition. Example: `label agent-ready -> run code job`.
+- **Job**: A queued execution request created by a route.
+- **Dispatcher**: The long-running supervisor that claims queued jobs and spawns subprocesses.
+- **Subprocess**: Configured command invoked for a job. It is not a long-lived worker.
+- **Runner**: One running `issueq` process with a stable `runner.id`/`runner.name`.
+- **Lease**: Time-bounded local claim on a queued job.
+- **Generation**: Per-issue counter used to reset route attempts after human intervention. Schema supports it in v1; automatic reset may come later.
+- **Terminal label**: Label that prevents further automation for an issue.
 
-### 2.1 Primary goals
+## 3. Goals and non-goals
 
-- Run as a local CLI or long-running daemon.
+### 3.1 Goals
+
+V1 must:
+
+- Run as a CLI and as a long-running daemon.
 - Poll GitHub issues every few minutes or on demand.
-- Use labels and simple predicates to decide which jobs to enqueue.
-- Store queue state in local SQLite.
-- Spawn configured subprocesses only when matching work exists.
+- Support one configured GitHub repository per config file.
+- Route issues to jobs using simple label include/exclude predicates.
+- Store issue snapshots, jobs, leases, attempts, and events in SQLite.
+- Spawn configured subprocesses only when matching work exists and capacity is available.
 - Enforce global and per-route/per-kind concurrency limits.
 - Track attempts and prevent infinite automation loops.
-- Update GitHub labels/comments on job start, success, failure, skip, or terminalization.
-- Keep GitHub as the public state machine.
+- Update GitHub labels/comments on job start, success, failure, and terminal states; record skipped stale jobs locally.
+- Pass issue/job context to subprocesses through files and environment variables.
+- Avoid shell interpolation of issue content.
 - Keep the architecture compatible with a future centralized queue backend.
 
-### 2.2 Non-goals for v1
+### 3.2 Non-goals
 
-- No web UI.
-- No distributed queue.
-- No webhook server requirement.
-- No complex workflow engine.
-- No need for Redis, Kubernetes, or external workers.
-- No requirement to run arbitrary untrusted code safely beyond local process isolation and user-configured commands.
-- No attempt to fully solve multi-runner coordination in v1.
+V1 will not include:
 
-## 3. Core mental model
+- Web UI.
+- Distributed queue.
+- Required webhook server.
+- Complex workflow engine.
+- Redis/Kubernetes/external queue dependency.
+- Strong multi-runner coordination.
+- Security sandbox for untrusted subprocesses.
+- Multiple repositories in a single config.
+- Rich predicate expression language.
+
+## 4. System model
 
 ```text
 GitHub issues/labels/comments
@@ -56,15 +69,19 @@ configured subprocesses
 GitHub labels/comments + queue state
 ```
 
-Three layers should remain separate:
+Design separation:
 
 1. **GitHub labels** define durable public workflow state.
 2. **SQLite queue** defines local execution backlog and operational state.
 3. **Subprocess jobs** perform configurable work.
 
-## 4. Workflow labels
+The queue is a projection of GitHub state plus local execution bookkeeping. If SQLite is deleted, some counters/history are lost in v1, but routeable work can be rebuilt by polling GitHub.
 
-Recommended labels for early use:
+## 5. Workflow labels
+
+`issueq` does not hardcode label names. Labels are configured in routes and actions.
+
+Recommended starter labels:
 
 ```text
 agent-triage       issue should be triaged
@@ -78,9 +95,7 @@ agent-needs-human  automation stopped; human intervention required
 manual-only        automation must ignore this issue
 ```
 
-V1 should not require these exact labels. They are configured by routes and actions.
-
-Terminal/blocking labels should commonly include:
+Recommended terminal/blocking labels:
 
 ```text
 agent-done
@@ -89,9 +104,13 @@ agent-needs-human
 manual-only
 ```
 
-All routes should normally exclude terminal labels.
+Routes should normally exclude every terminal label.
 
-## 5. Example lifecycle
+A single global `agent-running` label is the v1 default recommendation. Route-specific running labels such as `agent-running-code` can be implemented purely through config if desired.
+
+## 6. Example workflows
+
+### 6.1 Happy path
 
 ```text
 agent-triage
@@ -103,32 +122,33 @@ agent-triage
   → agent-done
 ```
 
-If triage fails due to missing details:
+### 6.2 Needs information
 
 ```text
 agent-triage
-  → triage job
+  → triage job exits nonzero
   → agent-needs-info
 ```
 
-If review repeatedly requests changes:
+### 6.3 Review loop with circuit breaker
 
 ```text
 agent-ready
   → code
   → agent-review
-  → review says changes needed
-  → agent-ready
+  → review exits nonzero, returns to agent-ready
   → code
   → agent-review
-  → review says changes needed
+  → review exits nonzero again
   → ... max attempts exceeded ...
   → agent-needs-human + agent-failed
 ```
 
-## 6. CLI shape
+## 7. CLI specification
 
-Initial commands:
+All commands accept `--config <path>`. Default config path may be `./issueq.yaml`.
+
+### 7.1 Required v1 commands
 
 ```bash
 issueq daemon --config issueq.yaml
@@ -140,9 +160,9 @@ issueq jobs --config issueq.yaml
 issueq issues --config issueq.yaml
 ```
 
-### 6.1 `daemon`
+### 7.2 `daemon`
 
-Runs a loop:
+Runs until interrupted:
 
 1. release expired local leases
 2. poll GitHub if poll interval elapsed
@@ -151,35 +171,40 @@ Runs a loop:
 5. reap finished child processes
 6. sleep briefly
 
-The polling interval can be long. A default of `3m` is acceptable.
+Default poll interval: `3m`.
 
-### 6.2 `once`
+### 7.3 `once`
 
-Runs one full reconciliation cycle:
+Runs one reconciliation cycle:
 
 1. poll
 2. route
 3. dispatch available jobs
-4. optionally wait for spawned jobs if `--wait` is supplied
 
-### 6.3 Debug commands
+Final v1 behavior:
 
-`jobs` and `issues` inspect local SQLite state.
+- `issueq once` starts eligible jobs and waits for jobs it spawned to finish.
+- `issueq once --no-wait` starts eligible jobs and returns immediately after spawning.
 
-Future useful commands:
+### 7.4 Debug commands
+
+`jobs` prints local jobs. `issues` prints local issue snapshots.
+
+Output may start as human-readable tables. A `--json` flag is desirable before v1 is considered complete.
+
+Future commands:
 
 ```bash
 issueq retry <job-id>
 issueq cancel <job-id>
 issueq run-one --kind code
+issueq reset <issue-key>
 issueq doctor
 ```
 
-## 7. Configuration
+## 8. Configuration specification
 
-V1 uses a YAML config file.
-
-Example:
+V1 uses YAML.
 
 ```yaml
 runner:
@@ -191,6 +216,10 @@ queue:
   sqlite:
     path: ./issueq.db
   max_global_concurrency: 2
+  lease_duration: 30m
+
+workdir:
+  path: ./.issueq
 
 polling:
   interval: 3m
@@ -200,7 +229,6 @@ github:
   owner: example-org
   repo: example-repo
   token_env: GITHUB_TOKEN
-  query: 'is:issue is:open label:agent-triage,label:agent-ready,label:agent-review'
 
 terminal_labels:
   - agent-done
@@ -210,6 +238,10 @@ terminal_labels:
 
 workflow:
   max_transitions_per_issue: 10
+  on_transitions_exceeded:
+    labels_remove: [agent-triage, agent-ready, agent-review, agent-running]
+    labels_add: [agent-failed, agent-needs-human]
+    comment: "Automation stopped after too many state transitions. Human intervention is needed."
 
 routes:
   - name: triage
@@ -222,6 +254,7 @@ routes:
       timeout: 10m
       concurrency: 2
       max_attempts: 2
+      priority: 10
       on_start:
         labels_add: [agent-running]
       on_success:
@@ -232,6 +265,10 @@ routes:
         labels_remove: [agent-running, agent-triage]
         labels_add: [agent-needs-info]
         comment: "Automation could not triage this issue. More detail is needed."
+      on_attempts_exceeded:
+        labels_remove: [agent-running, agent-triage]
+        labels_add: [agent-needs-human, agent-failed]
+        comment: "Automation stopped after too many triage attempts."
 
   - name: code
     when:
@@ -243,6 +280,7 @@ routes:
       timeout: 90m
       concurrency: 1
       max_attempts: 3
+      priority: 20
       on_start:
         labels_remove: [agent-ready]
         labels_add: [agent-running]
@@ -269,6 +307,7 @@ routes:
       timeout: 30m
       concurrency: 1
       max_attempts: 3
+      priority: 15
       on_start:
         labels_add: [agent-running]
       on_success:
@@ -285,17 +324,29 @@ routes:
         comment: "Automation stopped after 3 review rounds. This likely needs human direction."
 ```
 
-## 8. Routing
+### 8.1 Config validation
+
+Startup must fail fast if:
+
+- no GitHub owner/repo is configured
+- token env var is missing for commands that contact GitHub
+- SQLite path is empty
+- route names are empty or duplicated
+- route kind is empty
+- command is empty for a dispatchable job
+- timeout is missing or non-positive
+- concurrency is missing or non-positive
+- max attempts is missing or non-positive
+- label include/exclude contains duplicate conflicts within one predicate
+- action contains the same label in both add and remove lists
+
+Warnings are acceptable for missing recommended terminal labels.
+
+## 9. Routing specification
 
 Routes map issue predicates to job specs.
 
-A route has:
-
-- `name`
-- `when`
-- `job`
-
-V1 predicates should stay simple:
+V1 predicate shape:
 
 ```yaml
 when:
@@ -303,7 +354,16 @@ when:
   labels_exclude: [...]
 ```
 
-Possible v1.1 predicate additions:
+A predicate matches when:
+
+- every `labels_include` label is present on the issue
+- no `labels_exclude` label is present on the issue
+- issue state is `open`
+- runner capabilities include the job kind, if capabilities are configured
+
+V1 should avoid a rich expression language.
+
+Possible future predicates:
 
 ```yaml
 when:
@@ -314,47 +374,41 @@ when:
   milestone: "..."
 ```
 
-But v1 should avoid a rich expression language.
+### 9.1 Router idempotency
 
-### 8.1 Router idempotency
+Repeated polls/routes must not create unbounded duplicates.
 
-Routing must be idempotent. Repeated polls must not create unbounded duplicate jobs.
+Each enqueued job has a unique `dedupe_key`.
 
-Each enqueued job gets a `dedupe_key`, for example:
-
-```text
-{issue_key}:{route_name}:{label_hash}:{issue_updated_at}
-```
-
-A simpler first implementation may use:
+Recommended v1 dedupe key:
 
 ```text
-{issue_key}:{route_name}:{github_updated_at}
+{issue_key}:{route_name}:{label_hash}:{github_updated_at}
 ```
 
-The queue enforces `unique(dedupe_key)`.
+Where `label_hash` is a stable hash of sorted labels.
 
-### 8.2 Staleness
+The store enforces `unique(dedupe_key)`.
 
-Before dispatching a job, the dispatcher fetches the latest issue from GitHub and re-evaluates the route predicate.
+### 9.2 Stale jobs
 
-If the issue no longer matches, the job is marked `skipped`.
+Before dispatching, `issueq` must fetch the latest issue from GitHub and re-evaluate the route predicate.
 
-## 9. Queue model
+If the latest issue no longer matches, the job is marked `skipped` with a reason. No subprocess is spawned.
 
-V1 uses SQLite. The schema should still resemble a future distributed queue.
+## 10. Queue and SQLite model
 
-### 9.1 Issue key
+### 10.1 Issue key
 
-Use a stable human-readable key:
+Use:
 
 ```text
 github.com/{owner}/{repo}#{number}
 ```
 
-Store GitHub `node_id` if available for future robustness across repo renames/transfers.
+Store GitHub `node_id` when available.
 
-### 9.2 Tables
+### 10.2 Required tables
 
 Conceptual schema:
 
@@ -389,6 +443,8 @@ jobs (
   pid integer,
   context_path text,
   result_path text,
+  stdout_path text,
+  stderr_path text,
   created_at text not null,
   updated_at text not null,
   started_at text,
@@ -425,77 +481,68 @@ job_events (
 );
 ```
 
-### 9.3 Job statuses
+### 10.3 Job statuses
 
 ```text
-pending
-running
-succeeded
-failed
-skipped
-dead
-cancelled
+pending     queued and available at/after available_at
+running     claimed by a runner and currently active or lease-held
+succeeded   subprocess exited 0 and success actions were applied
+failed      subprocess exited nonzero or action application failed
+skipped     job became stale or ineligible before execution
+dead        not retryable, usually attempts/transitions exceeded
+cancelled   manually cancelled
 ```
 
-### 9.4 Leases
+### 10.4 Leases
 
-Even in local SQLite, jobs use leases:
+Jobs use leases even in local SQLite:
 
 - `locked_by`
 - `lease_until`
 - `started_at`
 
-A crashed runner leaves `running` jobs behind. On startup, `issueq` releases expired leases by moving eligible jobs back to `pending` or to `failed`, depending on policy.
+On startup and periodically, expired `running` jobs are released.
 
-For v1, expired `running` jobs may become `pending` if below attempt limits.
+V1 policy:
 
-## 10. Dispatch model
+- If a `running` job lease expires and its process is not known to be alive, mark it `pending` when attempts remain.
+- If attempts are exhausted, mark it `dead` and apply `on_attempts_exceeded` if safe to do so.
 
-There are no long-lived idle coding workers.
+## 11. Dispatch specification
 
-There is one dispatcher loop that supervises child processes:
+There are no idle coding/review workers. The dispatcher is a supervisor that starts child processes only when work exists.
 
-```text
-pending jobs
-  ↓ capacity check
-spawn configured subprocess
-  ↓ monitor pid, timeout, exit code
-apply result actions
-```
+Dispatch flow:
+
+1. compute currently running counts by global and route/kind
+2. select next pending job by priority then creation time
+3. ensure runner capability matches job kind
+4. ensure capacity is available
+5. locally claim job with lease
+6. fetch latest issue from GitHub
+7. re-evaluate route predicate
+8. increment route attempt
+9. if attempts exceed max, apply `on_attempts_exceeded`, mark `dead`, stop
+10. apply `on_start` actions
+11. write context JSON
+12. spawn subprocess
+13. capture stdout/stderr to files
+14. enforce timeout
+15. parse optional result JSON
+16. apply success/failure actions
+17. mark job final status and record event
 
 Capacity limits:
 
-- global max subprocesses
-- per-job-kind or per-route max subprocesses
+- `queue.max_global_concurrency`
+- `route.job.concurrency`
 - runner capabilities
 
-Example:
+## 12. Attempts and loop prevention
 
-```yaml
-queue:
-  max_global_concurrency: 2
+V1 must implement loop prevention.
 
-routes:
-  - name: code
-    job:
-      kind: code
-      concurrency: 1
-```
-
-If 10 code jobs are queued and `code.concurrency = 1`, only one code subprocess runs at a time.
-
-## 11. Attempts and loop prevention
-
-Infinite loops are expected failure modes and must be handled explicitly.
-
-V1 should implement:
-
-1. Per-route `max_attempts`.
-2. Per-issue `max_transitions_per_issue`.
-3. Terminal labels that block all routes.
-4. Attempts incremented on job start, not completion.
-
-### 11.1 Attempts
+### 12.1 Route attempts
 
 Attempt key:
 
@@ -503,40 +550,31 @@ Attempt key:
 issue_key + generation + route_name
 ```
 
-Increment before spawning the subprocess.
+Attempts increment after the latest issue still matches and before `on_start` is applied. This means failures while applying `on_start` still count.
 
-If incremented attempts exceed `max_attempts`, do not spawn. Apply `on_attempts_exceeded`, mark job `dead`, and comment on GitHub.
+If incremented attempts exceed `max_attempts`, no subprocess is spawned. Apply `on_attempts_exceeded`, mark job `dead`, and comment on GitHub if configured.
 
-### 11.2 Transition count
+### 12.2 Transition count
 
-Every successful application of route actions that changes workflow labels increments `transition_count`.
+Every successful action application that changes workflow labels increments `issue_state.transition_count`.
 
-If `transition_count > max_transitions_per_issue`, terminalize the issue:
+If `transition_count` exceeds `workflow.max_transitions_per_issue`, apply `workflow.on_transitions_exceeded` and mark the current job `dead`.
 
-```text
-add: agent-failed, agent-needs-human
-remove: agent-ready, agent-review, agent-running, agent-triage
-```
+### 12.3 Generation
 
-Config should allow customization later. V1 may use route-level `on_attempts_exceeded` plus a default terminal action.
-
-### 11.3 Generation
-
-`generation` allows a human reset later.
-
-V1 may not implement automatic generation reset, but schema should include it.
+V1 schema includes `generation`, but automatic generation reset is optional.
 
 Future reset triggers:
 
 - human removes `agent-needs-human` and adds `agent-ready`
-- command: `issueq reset github.com/org/repo#123`
-- structured state comment updated manually or by CLI
+- `issueq reset <issue-key>`
+- structured state comment edited/rebuilt
 
-## 12. Subprocess contract
+## 13. Subprocess contract
 
-Each job command is spawned with context and result paths.
+### 13.1 Invocation
 
-Command from config:
+Configured command:
 
 ```yaml
 command: ["./tasks/code.sh"]
@@ -548,7 +586,11 @@ Actual invocation:
 ./tasks/code.sh /path/to/context.json /path/to/result.json
 ```
 
-Environment variables should also be set:
+Commands are argv arrays, not shell strings.
+
+### 13.2 Environment
+
+Set at least:
 
 ```text
 ISSUEQ_JOB_ID
@@ -564,9 +606,7 @@ GITHUB_REPO
 GITHUB_ISSUE_NUMBER
 ```
 
-### 12.1 Context JSON
-
-Example:
+### 13.3 Context JSON
 
 ```json
 {
@@ -597,9 +637,9 @@ Example:
 }
 ```
 
-### 12.2 Result JSON
+### 13.4 Result JSON
 
-A subprocess may write a result file:
+Subprocesses may write:
 
 ```json
 {
@@ -610,18 +650,18 @@ A subprocess may write a result file:
 }
 ```
 
-If a result file exists, its actions are merged with or override configured `on_success`/`on_failure` actions. V1 should choose one simple policy:
+V1 result policy:
 
-Recommended v1 policy:
+- exit code `0`: base action is configured `on_success`
+- nonzero exit code or timeout: base action is configured `on_failure`
+- if result JSON exists, merge it after the base action
+- comments are concatenated with a blank line, base comment first
+- label operations are normalized after merge; if a label appears in both add and remove after merge, the result-file operation wins
+- malformed result JSON makes the job fail and applies `on_failure` without result-file actions
 
-- exit code `0`: apply configured `on_success`, then apply result-file additions/removals/comment if present.
-- exit code nonzero: apply configured `on_failure`, then apply result-file additions/removals/comment if present.
+### 13.5 Direct queue appends
 
-This allows jobs to add dynamic comments like PR URLs without controlling the entire workflow.
-
-### 12.3 Direct queue appends
-
-Result JSON may include local follow-up jobs:
+Result JSON may eventually include local follow-up jobs:
 
 ```json
 {
@@ -631,48 +671,33 @@ Result JSON may include local follow-up jobs:
 }
 ```
 
-Guidance:
+V1 may defer `enqueue` support. User-visible workflow follow-ups should normally be represented by GitHub labels and routed by the router.
 
-- User-visible workflow follow-ups should normally be represented by GitHub labels and routed by the router.
-- Direct queue appends are for local/internal tasks such as cleanup or log collection.
+## 14. GitHub interaction
 
-V1 may defer `enqueue` support if needed.
+### 14.1 Authentication
 
-## 13. GitHub interaction
+Token comes from `github.token_env`, usually `GITHUB_TOKEN`.
 
-### 13.1 Authentication
-
-Use token from `github.token_env`, usually:
-
-```text
-GITHUB_TOKEN
-```
-
-Required scopes depend on repo visibility and operations:
+Required permissions:
 
 - read issues
-- write issues/comments/labels
-- possibly read/write pull requests if subprocesses do that separately
+- write labels on issues
+- write issue comments
 
-### 13.2 Polling
+Subprocesses that create branches/PRs manage their own GitHub/git credentials.
 
-Default polling interval: `3m`.
+### 14.2 Polling
 
-V1 should support:
+Recommended v1 implementation:
 
-- GitHub issue search query from config, or
-- list issues for one configured repo and filter locally
+- list open issues for the configured repo
+- store snapshots
+- filter locally through route predicates
 
-Search query is flexible but can be rate-limited. Repo issue listing is simpler and often enough.
+GitHub search query support is optional for v1.
 
-Recommended v1 approach:
-
-- list open issues for configured repo
-- filter locally using route predicates
-
-Support for multiple repos can come later.
-
-### 13.3 Applying actions
+### 14.3 Applying actions
 
 Actions:
 
@@ -685,40 +710,34 @@ comment: "..."
 Application order:
 
 1. refresh issue
-2. add/remove labels
-3. create comment
-4. update local issue snapshot
-5. record event
+2. remove labels
+3. add labels
+4. create comment
+5. refresh/update local issue snapshot
+6. record event
 
-For `on_start`, apply labels before spawning the subprocess.
+Removal before addition makes state transitions like `agent-ready -> agent-running` predictable.
 
-For `on_success`/`on_failure`, apply labels after subprocess exits.
+If label removal fails because the label is absent, treat it as success.
 
-### 13.4 Claim behavior
+### 14.4 Start claim
 
-Before spawning a job:
+`on_start` is the GitHub-visible claim. For code jobs it should usually remove source labels such as `agent-ready` and add `agent-running`.
 
-1. locally claim job
-2. refresh issue from GitHub
-3. re-evaluate route predicate
-4. check attempts
-5. apply `on_start`, commonly adding `agent-running` and removing the source label
-6. write context file
-7. spawn subprocess
+Because v1 is not a distributed queue, this is best-effort coordination only. Dispatch must always re-fetch and re-check before starting.
 
-This limits duplicate processing and stale jobs.
-
-## 14. Safety notes
+## 15. Safety and filesystem behavior
 
 - Issue text must never be interpolated directly into a shell command.
-- Pass issue data via JSON files and environment variables.
-- Commands should be configured as argv arrays, not shell strings.
-- Each job should have a timeout.
-- Logs should be captured per job.
-- Workspaces should be per issue/job where coding agents modify files.
-- V1 does not provide a security sandbox. The user is responsible for what subprocess commands do.
+- Commands must be argv arrays.
+- Issue/job data is passed via JSON files and environment variables.
+- Each job must have a timeout.
+- Stdout/stderr are captured to files under `workdir.path`.
+- Context/result files are written under `workdir.path/jobs/<job-id>/`.
+- Coding-agent task scripts should create per-issue or per-job worktrees/clones if they edit repositories.
+- V1 does not provide a security sandbox.
 
-## 15. Go package layout
+## 16. Go architecture
 
 Proposed layout:
 
@@ -738,7 +757,7 @@ internal/logging
 migrations
 ```
 
-### 15.1 Key interfaces
+### 16.1 Interfaces
 
 ```go
 type QueueStore interface {
@@ -749,6 +768,7 @@ type QueueStore interface {
     CompleteJob(ctx context.Context, jobID string, result JobResult) error
     FailJob(ctx context.Context, jobID string, failure JobFailure) error
     SkipJob(ctx context.Context, jobID string, reason string) error
+    MarkDead(ctx context.Context, jobID string, reason string) error
     RenewLease(ctx context.Context, jobID string, runnerID string, until time.Time) error
     ReleaseExpiredLeases(ctx context.Context) error
     IncrementAttempts(ctx context.Context, issueKey string, generation int, routeName string) (int, error)
@@ -766,63 +786,25 @@ type GitHubClient interface {
 }
 ```
 
-Keep these interfaces small and concrete. Avoid over-abstracting beyond the SQLite/Postgres migration path.
+These interfaces exist to keep GitHub, routing, dispatch, and storage testable and to avoid blocking a future Postgres backend.
 
-## 16. V1 implementation phases
+## 17. Observability
 
-### Phase 1: skeleton
+V1 should provide enough introspection to debug local automation:
 
-- create Go module
-- config loading
-- SQLite migrations
-- basic CLI
-- issue/job tables
+- structured logs to stderr
+- job events in SQLite
+- stdout/stderr files per job
+- `issueq jobs` and `issueq issues`
+- job status, attempts, timestamps, paths, and last error visible in CLI output
 
-### Phase 2: poll and route
+## 18. V2 notes
 
-- GitHub list issues
-- store snapshots
-- route predicates
-- enqueue jobs with dedupe keys
-- inspect `jobs` and `issues`
+V2 is not part of the initial build but should remain feasible.
 
-### Phase 3: dispatch
+### 18.1 Centralized queue
 
-- claim next pending job
-- capacity checks
-- write context JSON
-- spawn subprocess
-- timeout/reap
-- mark success/failure
-
-### Phase 4: GitHub actions
-
-- apply on-start labels
-- apply on-success/on-failure labels/comments
-- re-fetch before dispatch
-- skip stale jobs
-
-### Phase 5: loop prevention
-
-- route attempts
-- max attempts
-- transition count
-- terminal actions
-
-### Phase 6: polish
-
-- logs per job
-- `once`, `daemon`, `retry`, `cancel`
-- systemd example
-- sample config and task scripts
-
-## 17. V2 notes
-
-V2 is not needed initially, but v1 should not block it.
-
-### 17.1 Centralized queue
-
-Add a queue backend:
+Add backend config:
 
 ```yaml
 queue:
@@ -836,12 +818,12 @@ Postgres enables:
 - shared queue for multiple users/runners
 - row-level locking
 - cluster-wide leases
-- global and per-kind concurrency limits
-- better audit/history
+- global/per-kind concurrency limits
+- stronger audit/history
 
 Use `FOR UPDATE SKIP LOCKED` for job claiming.
 
-### 17.2 Runner roles
+### 18.2 Runner roles
 
 Future daemon modes:
 
@@ -853,7 +835,7 @@ issueq daemon --role dispatcher
 
 In distributed mode, prefer one poller and many dispatchers.
 
-### 17.3 Capabilities
+### 18.3 Capabilities
 
 Runners advertise capabilities:
 
@@ -865,9 +847,9 @@ runner:
 
 Jobs can only be claimed by compatible runners.
 
-### 17.4 GitHub-backed durability
+### 18.4 GitHub-backed durability
 
-Local counters disappear if SQLite is deleted. Future option: maintain a structured GitHub comment:
+Future option: maintain a structured GitHub comment:
 
 ```md
 <!-- issueq-state
@@ -875,11 +857,11 @@ Local counters disappear if SQLite is deleted. Future option: maintain a structu
 -->
 ```
 
-This allows rebuilding local state from GitHub.
+This allows rebuilding local counters from GitHub.
 
-### 17.5 Webhooks
+### 18.5 Webhooks
 
-Polling is fine for v1. V2 may support GitHub webhooks:
+Polling is enough for v1. V2 may add:
 
 ```text
 GitHub webhook → enqueue/reconcile issue immediately
@@ -887,35 +869,35 @@ GitHub webhook → enqueue/reconcile issue immediately
 
 Polling should remain as a reconciliation fallback.
 
-### 17.6 More predicates
+### 18.6 More predicates and outcomes
 
-Possible future predicates:
+Possible future additions:
 
 - title/body regex
 - author allow/deny lists
-- assignees
-- milestone
+- assignees/milestone
 - comments contain command
-- files/PR state after implementation
 - custom external predicate command
+- specific exit-code outcome mapping, e.g. `2 -> needs-info`
+- direct queue append support for internal follow-ups
 
-Avoid adding a full expression language unless clearly needed.
+Avoid a full expression language until necessary.
 
-## 18. Open questions
+## 19. Requirement checklist
 
-- Should result JSON override configured actions or only append to them?
-- Should route attempts increment on claim or after `on_start` succeeds?
-- Should a job failure always apply `on_failure`, or should certain exit codes map to specific outcomes?
-- Should v1 support multiple repos or one repo per config?
-- Should logs be stored in SQLite, files, or both?
-- Should `agent-running` be global or route-specific, e.g. `agent-running-code`?
+A v1 implementation is complete when it satisfies these requirements:
 
-## 19. Initial recommendation
-
-Build v1 as:
-
-```text
-Go + SQLite + YAML config + GitHub labels + bounded subprocess dispatcher
-```
-
-Use long polling, e.g. every 3-5 minutes. Keep it boring. Make the queue and store interfaces clean enough that Postgres can be added later, but do not implement distributed coordination until there is real usage pressure.
+- **R1 Config**: load, validate, and expose YAML config matching this spec.
+- **R2 SQLite**: create and migrate required local tables.
+- **R3 Poll**: list open issues for one repo and upsert snapshots.
+- **R4 Route**: evaluate label predicates and enqueue deduplicated jobs.
+- **R5 Inspect**: list jobs and issues from local state.
+- **R6 Dispatch**: claim jobs, enforce leases/capacity, and spawn argv-array subprocesses.
+- **R7 Context**: write context/result paths and expected environment variables.
+- **R8 Results**: handle exit code, timeout, stdout/stderr capture, and optional result JSON.
+- **R9 GitHub actions**: apply start/success/failure/terminal labels and comments.
+- **R10 Staleness**: re-fetch and skip stale jobs before execution.
+- **R11 Loop prevention**: enforce route max attempts and max transitions.
+- **R12 Safety**: avoid shell interpolation and require timeouts.
+- **R13 Observability**: log events and provide useful `jobs`/`issues` output.
+- **R14 Future compatibility**: keep queue behind an interface and use portable IDs/leases.
