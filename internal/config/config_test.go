@@ -1,0 +1,256 @@
+package config
+
+import (
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func TestValidSampleConfigLoads(t *testing.T) {
+	cfg, err := LoadFile(filepath.Join("..", "..", "testdata", "valid-config.yaml"))
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	if cfg.GitHub.Owner != "example-org" || cfg.GitHub.Repo != "example-repo" {
+		t.Fatalf("unexpected github config: %#v", cfg.GitHub)
+	}
+	if len(cfg.Routes) != 3 {
+		t.Fatalf("routes len = %d, want 3", len(cfg.Routes))
+	}
+	if cfg.Routes[1].Job.Command[0] != "./tasks/code.sh" {
+		t.Fatalf("code command = %#v", cfg.Routes[1].Job.Command)
+	}
+}
+
+func TestDefaults(t *testing.T) {
+	cfg, err := LoadBytes([]byte(minimalConfig()))
+	if err != nil {
+		t.Fatalf("LoadBytes() error = %v", err)
+	}
+
+	if cfg.Queue.Backend != DefaultQueueBackend {
+		t.Fatalf("queue backend = %q", cfg.Queue.Backend)
+	}
+	if cfg.Queue.LeaseDuration.Duration != DefaultLeaseDuration {
+		t.Fatalf("lease duration = %s", cfg.Queue.LeaseDuration)
+	}
+	if cfg.Polling.Interval.Duration != DefaultPolling {
+		t.Fatalf("polling interval = %s", cfg.Polling.Interval)
+	}
+	if cfg.Workdir.Path != DefaultWorkdir {
+		t.Fatalf("workdir = %q", cfg.Workdir.Path)
+	}
+	if cfg.GitHub.Host != DefaultGitHubHost || cfg.GitHub.TokenEnv != DefaultGitHubTokenEnv {
+		t.Fatalf("github defaults = %#v", cfg.GitHub)
+	}
+	if cfg.Runner.Env.Inherit {
+		t.Fatal("runner.env.inherit defaulted true; want false")
+	}
+	if got := strings.Join(cfg.Runner.Env.Pass, ","); got != "PATH,HOME" {
+		t.Fatalf("runner.env.pass = %q", got)
+	}
+	if cfg.Workflow.MaxTransitionsPerIssue != 10 {
+		t.Fatalf("workflow max transitions = %d", cfg.Workflow.MaxTransitionsPerIssue)
+	}
+}
+
+func TestValidationFailures(t *testing.T) {
+	tests := []struct {
+		name    string
+		yaml    string
+		wantErr string
+	}{
+		{
+			name:    "missing owner",
+			yaml:    strings.Replace(minimalConfig(), "  owner: example-org\n", "", 1),
+			wantErr: "github.owner is required",
+		},
+		{
+			name:    "missing repo",
+			yaml:    strings.Replace(minimalConfig(), "  repo: example-repo\n", "", 1),
+			wantErr: "github.repo is required",
+		},
+		{
+			name: "duplicate route names",
+			yaml: minimalConfig() + `
+  - name: triage
+    job:
+      kind: code
+      command: ["./tasks/code.sh"]
+      timeout: 10m
+      concurrency: 1
+      max_attempts: 2
+`,
+			wantErr: `routes[1].name "triage" is duplicated`,
+		},
+		{
+			name:    "empty route name",
+			yaml:    replaceOnce("  - name: triage", "  - name: ''"),
+			wantErr: "routes[0].name is required",
+		},
+		{
+			name:    "empty kind",
+			yaml:    replaceOnce("      kind: triage", "      kind: ''"),
+			wantErr: "routes[0].job.kind is required",
+		},
+		{
+			name:    "empty command",
+			yaml:    replaceOnce("      command: [\"./tasks/triage.sh\"]", "      command: []"),
+			wantErr: "routes[0].job.command is required",
+		},
+		{
+			name:    "empty command element",
+			yaml:    replaceOnce("      command: [\"./tasks/triage.sh\"]", "      command: ['']"),
+			wantErr: "routes[0].job.command[0] must not be empty",
+		},
+		{
+			name:    "non-positive timeout",
+			yaml:    replaceOnce("      timeout: 10m", "      timeout: 0s"),
+			wantErr: "routes[0].job.timeout must be positive",
+		},
+		{
+			name:    "missing timeout",
+			yaml:    strings.Replace(minimalConfig(), "      timeout: 10m\n", "", 1),
+			wantErr: "routes[0].job.timeout must be positive",
+		},
+		{
+			name:    "non-positive concurrency",
+			yaml:    replaceOnce("      concurrency: 1", "      concurrency: 0"),
+			wantErr: "routes[0].job.concurrency must be positive",
+		},
+		{
+			name:    "non-positive max attempts",
+			yaml:    replaceOnce("      max_attempts: 2", "      max_attempts: 0"),
+			wantErr: "routes[0].job.max_attempts must be positive",
+		},
+		{
+			name: "action conflict",
+			yaml: strings.Replace(minimalConfig(), "      max_attempts: 2\n", `      max_attempts: 2
+      on_success:
+        labels_add: [agent-running]
+        labels_remove: [agent-running]
+`, 1),
+			wantErr: `routes[0].job.on_success adds and removes label "agent-running"`,
+		},
+		{
+			name:    "predicate conflict",
+			yaml:    strings.Replace(minimalConfig(), "      labels_exclude: [agent-running]", "      labels_exclude: [agent-triage]", 1),
+			wantErr: `routes[0].when includes and excludes label "agent-triage"`,
+		},
+		{
+			name:    "invalid runner env name",
+			yaml:    strings.Replace(minimalConfig(), "github:\n", "runner:\n  env:\n    pass: [BAD-NAME]\n\ngithub:\n", 1),
+			wantErr: `runner.env.pass[0] "BAD-NAME" is not a valid environment variable name`,
+		},
+		{
+			name:    "invalid route env name",
+			yaml:    strings.Replace(minimalConfig(), "      max_attempts: 2\n", "      max_attempts: 2\n      env:\n        pass: [1BAD]\n", 1),
+			wantErr: `routes[0].job.env.pass[0] "1BAD" is not a valid environment variable name`,
+		},
+		{
+			name:    "runner env passes github token",
+			yaml:    strings.Replace(minimalConfig(), "github:\n", "runner:\n  env:\n    pass: [GITHUB_TOKEN]\n\ngithub:\n", 1),
+			wantErr: `runner.env.pass must not include github.token_env "GITHUB_TOKEN"`,
+		},
+		{
+			name:    "route env passes github token",
+			yaml:    strings.Replace(minimalConfig(), "      max_attempts: 2\n", "      max_attempts: 2\n      env:\n        pass: [GITHUB_TOKEN]\n", 1),
+			wantErr: `routes[0].job.env.pass must not include github.token_env "GITHUB_TOKEN"`,
+		},
+		{
+			name:    "empty sqlite path",
+			yaml:    replaceOnce("    path: ./issueq.db", "    path: ''"),
+			wantErr: "queue.sqlite.path is required",
+		},
+		{
+			name:    "unsupported queue backend",
+			yaml:    strings.Replace(minimalConfig(), "queue:\n", "queue:\n  backend: postgres\n", 1),
+			wantErr: `queue.backend "postgres" is not supported in v1`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := LoadBytes([]byte(tt.yaml))
+			if err == nil {
+				t.Fatal("LoadBytes() error = nil")
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCommandStringRejected(t *testing.T) {
+	_, err := LoadBytes([]byte(replaceOnce("      command: [\"./tasks/triage.sh\"]", "      command: ./tasks/triage.sh")))
+	if err == nil {
+		t.Fatal("LoadBytes() error = nil")
+	}
+	if !strings.Contains(err.Error(), "command must be a YAML list of argv strings") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestRequireGitHubToken(t *testing.T) {
+	t.Setenv("ISSUEQ_TEST_TOKEN", "")
+	_ = os.Unsetenv("ISSUEQ_TEST_TOKEN")
+
+	cfgText := strings.Replace(minimalConfig(), "  token_env: GITHUB_TOKEN", "  token_env: ISSUEQ_TEST_TOKEN", 1)
+	_, err := LoadBytesWithOptions([]byte(cfgText), ValidateOptions{RequireGitHubToken: true})
+	if err == nil {
+		t.Fatal("LoadBytesWithOptions() error = nil")
+	}
+	if !strings.Contains(err.Error(), "environment variable ISSUEQ_TEST_TOKEN named by github.token_env is not set") {
+		t.Fatalf("error = %v", err)
+	}
+
+	t.Setenv("ISSUEQ_TEST_TOKEN", "secret")
+	if _, err := LoadBytesWithOptions([]byte(cfgText), ValidateOptions{RequireGitHubToken: true}); err != nil {
+		t.Fatalf("LoadBytesWithOptions() error = %v", err)
+	}
+}
+
+func TestDurationParsing(t *testing.T) {
+	cfg, err := LoadBytes([]byte(replaceOnce("      timeout: 10m", "      timeout: 90m")))
+	if err != nil {
+		t.Fatalf("LoadBytes() error = %v", err)
+	}
+	if cfg.Routes[0].Job.Timeout.Duration != 90*time.Minute {
+		t.Fatalf("timeout = %s", cfg.Routes[0].Job.Timeout)
+	}
+
+	_, err = LoadBytes([]byte(replaceOnce("      timeout: 10m", "      timeout: nope")))
+	if err == nil || !strings.Contains(err.Error(), `invalid duration "nope"`) {
+		t.Fatalf("error = %v, want invalid duration", err)
+	}
+}
+
+func replaceOnce(old, new string) string {
+	return strings.Replace(minimalConfig(), old, new, 1)
+}
+
+func minimalConfig() string {
+	return `github:
+  owner: example-org
+  repo: example-repo
+  token_env: GITHUB_TOKEN
+queue:
+  sqlite:
+    path: ./issueq.db
+routes:
+  - name: triage
+    when:
+      labels_include: [agent-triage]
+      labels_exclude: [agent-running]
+    job:
+      kind: triage
+      command: ["./tasks/triage.sh"]
+      timeout: 10m
+      concurrency: 1
+      max_attempts: 2
+`
+}

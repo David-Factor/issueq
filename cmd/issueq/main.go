@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"os"
 
+	"issueq/internal/config"
+
 	"github.com/spf13/cobra"
 )
-
-const defaultConfigPath = "./issueq.yaml"
 
 func main() {
 	if err := newRootCommand().Execute(); err != nil {
@@ -20,8 +20,10 @@ func newRootCommand() *cobra.Command {
 	var configPath string
 
 	cmd := &cobra.Command{
-		Use:   "issueq",
-		Short: "Local GitHub issue automation queue runner",
+		Use:           "issueq",
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Short:         "Local GitHub issue automation queue runner",
 		Long: "issueq polls GitHub issues, routes matching labels into a local SQLite queue, " +
 			"and dispatches bounded subprocess jobs.",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -29,7 +31,7 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 
-	cmd.PersistentFlags().StringVar(&configPath, "config", defaultConfigPath, "path to issueq YAML config")
+	cmd.PersistentFlags().StringVar(&configPath, "config", config.DefaultConfigPath, "path to issueq YAML config")
 
 	cmd.AddCommand(
 		stubCommand("daemon", "Run the long-lived issueq daemon", &configPath),
@@ -39,7 +41,8 @@ func newRootCommand() *cobra.Command {
 		stubCommand("dispatch", "Dispatch eligible queued jobs", &configPath),
 		stubCommand("jobs", "List local queued jobs", &configPath),
 		stubCommand("issues", "List local issue snapshots", &configPath),
-		stubCommand("doctor", "Check local issueq setup", &configPath),
+		configCheckCommand("config-check", "Validate issueq configuration", &configPath),
+		configCheckCommand("doctor", "Check local issueq setup", &configPath),
 	)
 
 	return cmd
@@ -51,6 +54,20 @@ func stubCommand(use, short string, configPath *string) *cobra.Command {
 		Short: short,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s is not implemented yet (config: %s)\n", use, *configPath)
+			return nil
+		},
+	}
+}
+
+func configCheckCommand(use, short string, configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   use,
+		Short: short,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if _, err := config.LoadFile(*configPath); err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "config OK: %s\n", *configPath)
 			return nil
 		},
 	}
