@@ -6,11 +6,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"issueq/internal/config"
 	"issueq/internal/model"
+	"issueq/internal/runner"
+	storepkg "issueq/internal/store"
 	sqlitestore "issueq/internal/store/sqlite"
 )
 
@@ -555,6 +558,272 @@ func TestTransitionLimitTerminalActionErrorFailsJob(t *testing.T) {
 	}
 	if !hasEvent(events, "terminal_action_failed") {
 		t.Fatalf("events = %#v", events)
+	}
+}
+
+type dispatcherFakeStarter struct {
+	processes []*dispatcherFakeProcess
+	started   int
+}
+
+func (s *dispatcherFakeStarter) StartProcess(spec runner.ProcessSpec) (runner.Process, error) {
+	if s.started >= len(s.processes) {
+		return nil, errors.New("unexpected process start")
+	}
+	proc := s.processes[s.started]
+	s.started++
+	return proc, nil
+}
+
+type dispatcherFakeProcess struct {
+	pid      int
+	waitCh   chan error
+	killOnce sync.Once
+	killCh   chan struct{}
+}
+
+func newDispatcherFakeProcess(pid int) *dispatcherFakeProcess {
+	return &dispatcherFakeProcess{pid: pid, waitCh: make(chan error, 1), killCh: make(chan struct{})}
+}
+
+func (p *dispatcherFakeProcess) PID() int { return p.pid }
+func (p *dispatcherFakeProcess) Wait() error {
+	return <-p.waitCh
+}
+func (p *dispatcherFakeProcess) KillTree() error {
+	p.killOnce.Do(func() {
+		close(p.killCh)
+		p.waitCh <- errors.New("killed")
+	})
+	return nil
+}
+
+type renewInjectStore struct {
+	*sqlitestore.Store
+	renewErrs       []error
+	renewCalls      int
+	onRenew         func(call int)
+	artifactErrs    []error
+	artifactCalls   int
+	finalizeErrs    []error
+	finalizeCalls   int
+	finalizedJobIDs []string
+	artifactJobIDs  []string
+}
+
+func (s *renewInjectStore) RenewJobLease(ctx context.Context, jobID, runnerInstanceID string, leaseDuration time.Duration) error {
+	s.renewCalls++
+	call := s.renewCalls
+	if s.onRenew != nil {
+		s.onRenew(call)
+	}
+	if call <= len(s.renewErrs) && s.renewErrs[call-1] != nil {
+		return s.renewErrs[call-1]
+	}
+	return s.Store.RenewJobLease(ctx, jobID, runnerInstanceID, leaseDuration)
+}
+
+func (s *renewInjectStore) UpdateJobArtifactsOwned(ctx context.Context, jobID, runnerInstanceID, contextPath, resultPath, stdoutPath, stderrPath string, pid int) error {
+	s.artifactCalls++
+	s.artifactJobIDs = append(s.artifactJobIDs, jobID)
+	call := s.artifactCalls
+	if call <= len(s.artifactErrs) && s.artifactErrs[call-1] != nil {
+		return s.artifactErrs[call-1]
+	}
+	return s.Store.UpdateJobArtifactsOwned(ctx, jobID, runnerInstanceID, contextPath, resultPath, stdoutPath, stderrPath, pid)
+}
+
+func (s *renewInjectStore) FinalizeJobOwned(ctx context.Context, jobID string, runnerInstanceID string, result model.JobFinalize) error {
+	s.finalizeCalls++
+	s.finalizedJobIDs = append(s.finalizedJobIDs, jobID)
+	call := s.finalizeCalls
+	if call <= len(s.finalizeErrs) && s.finalizeErrs[call-1] != nil {
+		return s.finalizeErrs[call-1]
+	}
+	return s.Store.FinalizeJobOwned(ctx, jobID, runnerInstanceID, result)
+}
+
+func TestDispatchLocalTransientRenewalErrorRetriesWithoutKillingJob(t *testing.T) {
+	ctx := context.Background()
+	baseStore, cfg := setupDispatch(t, "#!/bin/sh\nexit 0\n")
+	defer baseStore.Close()
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 40 * time.Millisecond}
+	cfg.Routes[0].Job.Timeout = config.Duration{Duration: time.Second}
+	proc := newDispatcherFakeProcess(2001)
+	fakeStarter := &dispatcherFakeStarter{processes: []*dispatcherFakeProcess{proc}}
+	restore := runner.SetProcessStarterForTest(fakeStarter)
+	defer restore()
+	wrapped := &renewInjectStore{
+		Store:     baseStore,
+		renewErrs: []error{errors.New("temporary renew failure"), nil},
+	}
+	wrapped.onRenew = func(call int) {
+		if call == 2 {
+			proc.waitCh <- nil
+		}
+	}
+	result, err := Dispatch(ctx, cfg, wrapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Succeeded != 1 || result.Failed != 0 || result.Claimed != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	if wrapped.renewCalls < 2 {
+		t.Fatalf("renew calls = %d, want retry", wrapped.renewCalls)
+	}
+	select {
+	case <-proc.killCh:
+		t.Fatal("process killed after transient renewal failure")
+	default:
+	}
+	jobs, _ := baseStore.ListJobs(ctx)
+	if jobs[0].Status != model.JobStatusSucceeded {
+		t.Fatalf("job = %#v", jobs[0])
+	}
+}
+
+func TestDispatchLocalLostOwnershipCancelsAndSkipsFinalization(t *testing.T) {
+	ctx := context.Background()
+	baseStore, cfg := setupDispatch(t, "#!/bin/sh\nexit 0\n")
+	defer baseStore.Close()
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 40 * time.Millisecond}
+	cfg.Routes[0].Job.Timeout = config.Duration{Duration: time.Second}
+	proc := newDispatcherFakeProcess(2002)
+	fakeStarter := &dispatcherFakeStarter{processes: []*dispatcherFakeProcess{proc}}
+	restore := runner.SetProcessStarterForTest(fakeStarter)
+	defer restore()
+	wrapped := &renewInjectStore{Store: baseStore, renewErrs: []error{storepkg.ErrLostLease}}
+	result, err := Dispatch(ctx, cfg, wrapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Succeeded != 0 || result.Failed != 0 || result.Claimed != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	select {
+	case <-proc.killCh:
+	case <-time.After(time.Second):
+		t.Fatal("lost ownership did not kill process")
+	}
+	if wrapped.finalizeCalls != 0 {
+		t.Fatalf("finalize calls = %d, want 0", wrapped.finalizeCalls)
+	}
+	if wrapped.artifactCalls != 1 {
+		t.Fatalf("artifact calls = %d, want only initial update", wrapped.artifactCalls)
+	}
+	jobs, _ := baseStore.ListJobs(ctx)
+	if jobs[0].Status != model.JobStatusRunning {
+		t.Fatalf("job status = %s, want running because stale owner did not finalize", jobs[0].Status)
+	}
+}
+
+func TestDispatchLocalLostOwnershipCancelsOnlyAffectedJob(t *testing.T) {
+	ctx := context.Background()
+	baseStore, cfg := setupDispatch(t, "#!/bin/sh\nexit 0\n")
+	defer baseStore.Close()
+	cfg.Queue.MaxGlobalConcurrency = 2
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 40 * time.Millisecond}
+	cfg.Routes[0].Job.Concurrency = 2
+	cfg.Routes[0].Job.Timeout = config.Duration{Duration: time.Second}
+	if _, _, err := baseStore.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "dedupe-2"}); err != nil {
+		t.Fatal(err)
+	}
+	proc1 := newDispatcherFakeProcess(2005)
+	proc2 := newDispatcherFakeProcess(2006)
+	fakeStarter := &dispatcherFakeStarter{processes: []*dispatcherFakeProcess{proc1, proc2}}
+	restore := runner.SetProcessStarterForTest(fakeStarter)
+	defer restore()
+	wrapped := &renewInjectStore{Store: baseStore, renewErrs: []error{storepkg.ErrNotOwner}}
+	wrapped.onRenew = func(call int) {
+		if call == 2 {
+			proc1.waitCh <- nil
+			proc2.waitCh <- nil
+		}
+	}
+	result, err := Dispatch(ctx, cfg, wrapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Claimed != 2 || result.Succeeded != 1 || result.Failed != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	killed := 0
+	for _, proc := range []*dispatcherFakeProcess{proc1, proc2} {
+		select {
+		case <-proc.killCh:
+			killed++
+		default:
+		}
+	}
+	if killed != 1 {
+		t.Fatalf("killed processes = %d, want 1", killed)
+	}
+	jobs, _ := baseStore.ListJobs(ctx)
+	succeeded := 0
+	running := 0
+	for _, job := range jobs {
+		switch job.Status {
+		case model.JobStatusSucceeded:
+			succeeded++
+		case model.JobStatusRunning:
+			running++
+		}
+	}
+	if succeeded != 1 || running != 1 {
+		t.Fatalf("jobs = %#v, want one succeeded and one still running", jobs)
+	}
+}
+
+func TestDispatchLocalOwnershipLossOnReapSkipsStaleWrites(t *testing.T) {
+	ctx := context.Background()
+	baseStore, cfg := setupDispatch(t, "#!/bin/sh\nexit 0\n")
+	defer baseStore.Close()
+	proc := newDispatcherFakeProcess(2003)
+	fakeStarter := &dispatcherFakeStarter{processes: []*dispatcherFakeProcess{proc}}
+	restore := runner.SetProcessStarterForTest(fakeStarter)
+	defer restore()
+	wrapped := &renewInjectStore{Store: baseStore, artifactErrs: []error{nil, storepkg.ErrNotOwner}}
+	go func() { proc.waitCh <- nil }()
+	result, err := Dispatch(ctx, cfg, wrapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Succeeded != 0 || result.Failed != 0 || result.Claimed != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	if wrapped.finalizeCalls != 0 {
+		t.Fatalf("finalize calls = %d, want 0", wrapped.finalizeCalls)
+	}
+	jobs, _ := baseStore.ListJobs(ctx)
+	if jobs[0].Status != model.JobStatusRunning {
+		t.Fatalf("job status = %s, want running because stale owner did not finalize", jobs[0].Status)
+	}
+}
+
+func TestDispatchLocalFinalizeOwnershipLossSkipsResultCounting(t *testing.T) {
+	ctx := context.Background()
+	baseStore, cfg := setupDispatch(t, "#!/bin/sh\nexit 0\n")
+	defer baseStore.Close()
+	proc := newDispatcherFakeProcess(2004)
+	fakeStarter := &dispatcherFakeStarter{processes: []*dispatcherFakeProcess{proc}}
+	restore := runner.SetProcessStarterForTest(fakeStarter)
+	defer restore()
+	wrapped := &renewInjectStore{Store: baseStore, finalizeErrs: []error{storepkg.ErrLostLease}}
+	go func() { proc.waitCh <- nil }()
+	result, err := Dispatch(ctx, cfg, wrapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Succeeded != 0 || result.Failed != 0 || result.Claimed != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	if wrapped.finalizeCalls != 1 {
+		t.Fatalf("finalize calls = %d, want 1", wrapped.finalizeCalls)
+	}
+	jobs, _ := baseStore.ListJobs(ctx)
+	if jobs[0].Status != model.JobStatusRunning {
+		t.Fatalf("job status = %s, want running because stale owner did not finalize", jobs[0].Status)
 	}
 }
 
