@@ -109,3 +109,119 @@ func assertContains(t *testing.T, path, want string) {
 		t.Fatalf("%s = %q, want %q", path, data, want)
 	}
 }
+
+type fakeGitHub struct {
+	issue    model.IssueSnapshot
+	calls    []string
+	comments []string
+}
+
+func (f *fakeGitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]model.IssueSnapshot, error) {
+	return []model.IssueSnapshot{f.issue}, nil
+}
+func (f *fakeGitHub) GetIssue(ctx context.Context, owner, repo string, number int) (model.IssueSnapshot, error) {
+	f.calls = append(f.calls, "get")
+	return f.issue, nil
+}
+func (f *fakeGitHub) AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	f.calls = append(f.calls, "add:"+strings.Join(labels, ","))
+	f.issue.Labels = append(f.issue.Labels, labels...)
+	return nil
+}
+func (f *fakeGitHub) RemoveLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	f.calls = append(f.calls, "remove:"+strings.Join(labels, ","))
+	blocked := map[string]bool{}
+	for _, l := range labels {
+		blocked[l] = true
+	}
+	out := f.issue.Labels[:0]
+	for _, l := range f.issue.Labels {
+		if !blocked[l] {
+			out = append(out, l)
+		}
+	}
+	f.issue.Labels = out
+	return nil
+}
+func (f *fakeGitHub) CreateComment(ctx context.Context, owner, repo string, number int, body string) error {
+	f.calls = append(f.calls, "comment")
+	f.comments = append(f.comments, body)
+	return nil
+}
+
+func TestDispatchWithGitHubStaleJobSkipped(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, "#!/bin/sh\nexit 99\n")
+	defer store.Close()
+	gh := &fakeGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"other"}, State: "open"}}
+	cfg.Routes[0].When = config.PredicateConfig{LabelsInclude: []string{"agent-ready"}}
+	result, err := DispatchWithGitHub(ctx, cfg, store, gh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Skipped != 1 || result.Failed != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	jobs, _ := store.ListJobs(ctx)
+	if jobs[0].Status != model.JobStatusSkipped {
+		t.Fatalf("job = %#v", jobs[0])
+	}
+}
+
+func TestDispatchWithGitHubSuccessActionsAndResult(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, `#!/bin/sh
+cat > "$2" <<'JSON'
+{"comment":"PR #1","labels_add":["agent-review"],"labels_remove":["agent-running"]}
+JSON
+`)
+	defer store.Close()
+	cfg.Routes[0].When = config.PredicateConfig{LabelsInclude: []string{"agent-ready"}}
+	cfg.Routes[0].Job.OnStart = config.ActionConfig{LabelsRemove: []string{"agent-ready"}, LabelsAdd: []string{"agent-running"}}
+	cfg.Routes[0].Job.OnSuccess = config.ActionConfig{LabelsRemove: []string{"agent-running"}, LabelsAdd: []string{"agent-review"}, Comment: "Implementation finished"}
+	gh := &fakeGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
+	result, err := DispatchWithGitHub(ctx, cfg, store, gh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Succeeded != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	callOrder := strings.Join(gh.calls, "|")
+	if !strings.Contains(callOrder, "remove:agent-ready|add:agent-running") {
+		t.Fatalf("on_start order/calls = %s", callOrder)
+	}
+	if len(gh.comments) != 1 || gh.comments[0] != "Implementation finished\n\nPR #1" {
+		t.Fatalf("comments = %#v", gh.comments)
+	}
+	issues, _ := store.ListIssues(ctx)
+	if strings.Join(issues[0].Labels, ",") != "agent-review" {
+		t.Fatalf("local labels = %#v", issues[0].Labels)
+	}
+}
+
+func TestDispatchWithGitHubFailureActionsAndBadResult(t *testing.T) {
+	ctx := context.Background()
+	store, cfg := setupDispatch(t, `#!/bin/sh
+printf '{' > "$2"
+exit 0
+`)
+	defer store.Close()
+	cfg.Routes[0].When = config.PredicateConfig{LabelsInclude: []string{"agent-ready"}}
+	cfg.Routes[0].Job.OnFailure = config.ActionConfig{LabelsRemove: []string{"agent-running"}, LabelsAdd: []string{"agent-failed"}, Comment: "failed"}
+	gh := &fakeGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready", "agent-running"}, State: "open"}}
+	result, err := DispatchWithGitHub(ctx, cfg, store, gh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Failed != 1 {
+		t.Fatalf("result = %#v", result)
+	}
+	jobs, _ := store.ListJobs(ctx)
+	if !strings.Contains(jobs[0].LastError, "parse result JSON") {
+		t.Fatalf("job = %#v", jobs[0])
+	}
+	if len(gh.comments) != 1 || gh.comments[0] != "failed" {
+		t.Fatalf("comments = %#v", gh.comments)
+	}
+}

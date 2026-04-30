@@ -5,8 +5,11 @@ import (
 	"context"
 	"fmt"
 
+	"issueq/internal/actions"
 	"issueq/internal/config"
+	issuegithub "issueq/internal/github"
 	"issueq/internal/model"
+	"issueq/internal/router"
 	"issueq/internal/runner"
 	"issueq/internal/store"
 )
@@ -15,9 +18,14 @@ type Result struct {
 	Claimed   int
 	Succeeded int
 	Failed    int
+	Skipped   int
 }
 
 func Dispatch(ctx context.Context, cfg config.Config, queue store.QueueStore) (Result, error) {
+	return DispatchWithGitHub(ctx, cfg, queue, nil)
+}
+
+func DispatchWithGitHub(ctx context.Context, cfg config.Config, queue store.QueueStore, gh issuegithub.Client) (Result, error) {
 	runnerInfo := model.RunnerInfo{ID: runnerID(cfg), Name: cfg.Runner.Name}
 	limits := perRouteLimits(cfg)
 	maxGlobal := cfg.Queue.MaxGlobalConcurrency
@@ -56,14 +64,63 @@ func Dispatch(ctx context.Context, cfg config.Config, queue store.QueueStore) (R
 			continue
 		}
 
+		if gh != nil {
+			latest, err := gh.GetIssue(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number)
+			if err != nil {
+				return result, err
+			}
+			_ = queue.UpsertIssue(ctx, latest)
+			if !router.Matches(cfg, route, latest) {
+				if err := queue.FinalizeJob(ctx, job.ID, model.JobFinalize{Status: model.JobStatusSkipped, LastError: "stale route predicate"}); err != nil {
+					return result, err
+				}
+				_, _ = queue.InsertJobEvent(ctx, model.JobEvent{JobID: job.ID, IssueKey: job.IssueKey, EventType: "job_skipped", Message: "stale route predicate"})
+				result.Skipped++
+				continue
+			}
+			issue = latest
+			applied, err := actions.Apply(ctx, cfg, gh, queue, issue, route.Job.OnStart)
+			if err != nil {
+				return result, err
+			}
+			issue = applied.UpdatedIssue
+			_, _ = queue.InsertJobEvent(ctx, model.JobEvent{JobID: job.ID, IssueKey: job.IssueKey, EventType: "action_on_start"})
+		}
+
 		runResult := runner.Run(ctx, cfg, route, *job, issue, runnerInfo)
 		_ = queue.UpdateJobArtifacts(ctx, job.ID, runResult.Paths.ContextPath, runResult.Paths.ResultPath, runResult.Paths.StdoutPath, runResult.Paths.StderrPath, runResult.PID)
 		status := model.JobStatusSucceeded
 		lastErr := ""
+		baseAction := route.Job.OnSuccess
 		if runResult.Error != nil || runResult.ExitCode != 0 {
 			status = model.JobStatusFailed
 			lastErr = runResult.ErrorString()
+			baseAction = route.Job.OnFailure
 		}
+
+		finalAction := baseAction
+		if runResult.Paths.ResultPath != "" {
+			resultAction, found, parseErr := actions.ParseResultFile(runResult.Paths.ResultPath)
+			if parseErr != nil {
+				status = model.JobStatusFailed
+				lastErr = parseErr.Error()
+				finalAction = route.Job.OnFailure
+			} else if found {
+				finalAction = actions.Merge(baseAction, resultAction)
+			}
+		}
+
+		if gh != nil {
+			applied, err := actions.Apply(ctx, cfg, gh, queue, issue, finalAction)
+			if err != nil {
+				status = model.JobStatusFailed
+				lastErr = err.Error()
+			} else {
+				issue = applied.UpdatedIssue
+			}
+			_ = issue
+		}
+
 		if err := queue.FinalizeJob(ctx, job.ID, model.JobFinalize{
 			Status:     status,
 			LastError:  lastErr,
