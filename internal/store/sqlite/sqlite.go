@@ -116,6 +116,160 @@ ON CONFLICT(issue_key) DO UPDATE SET node_id = excluded.node_id, updated_at = ex
 	return nil
 }
 
+func (s *Store) GetIssue(ctx context.Context, issueKey string) (model.IssueSnapshot, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT issue_key, node_id, host, owner, repo, number, title, body, labels_json, state, github_updated_at, synced_at
+FROM issues WHERE issue_key = ?`, issueKey)
+	return scanIssue(row)
+}
+
+func (s *Store) ClaimNextJob(ctx context.Context, runnerID string, allowedKinds []string, maxGlobal int, perRouteLimit map[string]int, leaseDuration time.Duration) (*model.Job, error) {
+	if maxGlobal <= 0 {
+		return nil, nil
+	}
+	now := time.Now().UTC()
+	leaseUntil := now.Add(leaseDuration)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin claim transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var running int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM jobs WHERE status = ?`, model.JobStatusRunning).Scan(&running); err != nil {
+		return nil, fmt.Errorf("count running jobs: %w", err)
+	}
+	if running >= maxGlobal {
+		return nil, nil
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, lease_until, pid,
+       context_path, result_path, stdout_path, stderr_path, created_at, updated_at, started_at, finished_at, last_error
+FROM jobs
+WHERE status = ? AND available_at <= ?
+ORDER BY priority DESC, created_at ASC, id ASC`, model.JobStatusPending, formatTime(now))
+	if err != nil {
+		return nil, fmt.Errorf("select pending jobs: %w", err)
+	}
+	defer rows.Close()
+
+	allowed := stringSet(allowedKinds)
+	for rows.Next() {
+		job, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		if len(allowed) > 0 {
+			if _, ok := allowed[job.Kind]; !ok {
+				continue
+			}
+		}
+		limit := perRouteLimit[job.RouteName]
+		if limit <= 0 {
+			limit = perRouteLimit[job.Kind]
+		}
+		if limit > 0 {
+			var routeRunning int
+			if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM jobs WHERE status = ? AND (route_name = ? OR kind = ?)`, model.JobStatusRunning, job.RouteName, job.Kind).Scan(&routeRunning); err != nil {
+				return nil, fmt.Errorf("count route running jobs: %w", err)
+			}
+			if routeRunning >= limit {
+				continue
+			}
+		}
+
+		res, err := tx.ExecContext(ctx, `
+UPDATE jobs
+SET status = ?, locked_by = ?, lease_until = ?, started_at = COALESCE(started_at, ?), updated_at = ?
+WHERE id = ? AND status = ?`, model.JobStatusRunning, runnerID, formatTime(leaseUntil), formatTime(now), formatTime(now), job.ID, model.JobStatusPending)
+		if err != nil {
+			return nil, fmt.Errorf("claim job: %w", err)
+		}
+		affected, err := res.RowsAffected()
+		if err != nil {
+			return nil, fmt.Errorf("claim rows affected: %w", err)
+		}
+		if affected == 0 {
+			continue
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, fmt.Errorf("commit claim: %w", err)
+		}
+		claimed, err := s.jobByID(ctx, job.ID)
+		if err != nil {
+			return nil, err
+		}
+		return &claimed, nil
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pending job rows: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("commit empty claim: %w", err)
+	}
+	return nil, nil
+}
+
+func (s *Store) ReleaseExpiredLeases(ctx context.Context, now time.Time) (int, error) {
+	res, err := s.db.ExecContext(ctx, `
+UPDATE jobs
+SET status = ?, locked_by = NULL, lease_until = NULL, pid = NULL, updated_at = ?, last_error = 'lease expired'
+WHERE status = ? AND lease_until IS NOT NULL AND lease_until < ?`, model.JobStatusPending, formatTime(now.UTC()), model.JobStatusRunning, formatTime(now.UTC()))
+	if err != nil {
+		return 0, fmt.Errorf("release expired leases: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("release rows affected: %w", err)
+	}
+	return int(affected), nil
+}
+
+func (s *Store) UpdateJobArtifacts(ctx context.Context, jobID, contextPath, resultPath, stdoutPath, stderrPath string, pid int) error {
+	_, err := s.db.ExecContext(ctx, `
+UPDATE jobs
+SET context_path = ?, result_path = ?, stdout_path = ?, stderr_path = ?, pid = ?, updated_at = ?
+WHERE id = ?`, contextPath, resultPath, stdoutPath, stderrPath, pid, formatTime(time.Now().UTC()), jobID)
+	if err != nil {
+		return fmt.Errorf("update job artifacts: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) FinalizeJob(ctx context.Context, jobID string, result model.JobFinalize) error {
+	finished := result.FinishedAt
+	if finished.IsZero() {
+		finished = time.Now().UTC()
+	}
+	_, err := s.db.ExecContext(ctx, `
+UPDATE jobs
+SET status = ?, locked_by = NULL, lease_until = NULL, pid = NULL, result_path = COALESCE(NULLIF(?, ''), result_path),
+    stdout_path = COALESCE(NULLIF(?, ''), stdout_path), stderr_path = COALESCE(NULLIF(?, ''), stderr_path),
+    finished_at = ?, updated_at = ?, last_error = ?
+WHERE id = ?`, result.Status, result.ResultPath, result.StdoutPath, result.StderrPath, formatTime(finished), formatTime(finished), nullString(result.LastError), jobID)
+	if err != nil {
+		return fmt.Errorf("finalize job: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) jobByID(ctx context.Context, id string) (model.Job, error) {
+	row := s.db.QueryRowContext(ctx, `
+SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, lease_until, pid,
+       context_path, result_path, stdout_path, stderr_path, created_at, updated_at, started_at, finished_at, last_error
+FROM jobs WHERE id = ?`, id)
+	return scanJob(row)
+}
+
+func stringSet(values []string) map[string]struct{} {
+	set := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		set[value] = struct{}{}
+	}
+	return set
+}
+
 func (s *Store) ListRoutableIssues(ctx context.Context) ([]model.IssueSnapshot, error) {
 	return s.listIssues(ctx, "WHERE state = 'open' ORDER BY number ASC")
 }

@@ -17,18 +17,18 @@ const (
 )
 
 type IssueSnapshot struct {
-	IssueKey        string
-	NodeID          string
-	Host            string
-	Owner           string
-	Repo            string
-	Number          int
-	Title           string
-	Body            string
-	Labels          []string
-	State           string
-	GitHubUpdatedAt time.Time
-	SyncedAt        time.Time
+	IssueKey        string    `json:"key"`
+	NodeID          string    `json:"node_id,omitempty"`
+	Host            string    `json:"host"`
+	Owner           string    `json:"owner"`
+	Repo            string    `json:"repo"`
+	Number          int       `json:"number"`
+	Title           string    `json:"title"`
+	Body            string    `json:"body,omitempty"`
+	Labels          []string  `json:"labels"`
+	State           string    `json:"state"`
+	GitHubUpdatedAt time.Time `json:"github_updated_at,omitempty"`
+	SyncedAt        time.Time `json:"synced_at,omitempty"`
 }
 
 type JobCreate struct {
@@ -72,6 +72,20 @@ type JobEvent struct {
 	Message   string
 	DataJSON  string
 	CreatedAt time.Time
+}
+
+type RunnerInfo struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
+type JobFinalize struct {
+	Status     string
+	LastError  string
+	ResultPath string
+	StdoutPath string
+	StderrPath string
+	FinishedAt time.Time
 }
 
 func IssueKey(host, owner, repo string, number int) string {

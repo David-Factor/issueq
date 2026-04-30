@@ -48,13 +48,13 @@ func TestStubCommandsAcceptConfigFlag(t *testing.T) {
 	buf := new(bytes.Buffer)
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
-	cmd.SetArgs([]string{"--config", "custom.yaml", "dispatch"})
+	cmd.SetArgs([]string{"--config", "custom.yaml", "daemon"})
 
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 
-	want := "dispatch is not implemented yet (config: custom.yaml)"
+	want := "daemon is not implemented yet (config: custom.yaml)"
 	if !strings.Contains(buf.String(), want) {
 		t.Fatalf("output missing %q:\n%s", want, buf.String())
 	}
@@ -193,6 +193,62 @@ func TestRouteCommandSeedsJobFromStoredIssue(t *testing.T) {
 	}
 }
 
+func TestDispatchCommandRunsSeededJob(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "issueq.yaml")
+	dbPath := filepath.Join(dir, "issueq.db")
+	script := filepath.Join(dir, "task.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho cli-dispatch\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writeConfigWithCommand(t, configPath, dbPath, script)
+	ctx := context.Background()
+	store, err := sqlitestore.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issue := model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Seed", Labels: []string{"agent-triage"}, State: "open"}
+	if err := store.UpsertIssue(ctx, issue); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: issue.IssueKey, RouteName: "triage", Kind: "triage", Priority: 1, DedupeKey: "cli-dispatch"}); err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Close()
+
+	cmd := newRootCommand()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--config", configPath, "dispatch"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("dispatch error = %v", err)
+	}
+	if !strings.Contains(buf.String(), "succeeded=1") {
+		t.Fatalf("dispatch output = %q", buf.String())
+	}
+
+	store, err = sqlitestore.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = store.Close()
+	if len(jobs) != 1 || jobs[0].Status != model.JobStatusSucceeded {
+		t.Fatalf("jobs = %#v", jobs)
+	}
+	data, err := os.ReadFile(jobs[0].StdoutPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "cli-dispatch") {
+		t.Fatalf("stdout = %q", data)
+	}
+}
+
 func TestJobsAndIssuesCommandsWorkOnEmptyDB(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "issueq.yaml")
@@ -250,4 +306,36 @@ func runCommand(t *testing.T, args ...string) string {
 		t.Fatalf("issueq %v failed: %v\n%s", args, err, buf.String())
 	}
 	return buf.String()
+}
+
+func writeConfigWithCommand(t *testing.T, path, dbPath, command string) {
+	t.Helper()
+	content := `runner:
+  name: test-runner
+  capabilities: [triage]
+  env:
+    inherit: false
+    pass: [PATH, HOME]
+github:
+  owner: example-org
+  repo: example-repo
+queue:
+  sqlite:
+    path: ` + dbPath + `
+  max_global_concurrency: 1
+  lease_duration: 30m
+workdir:
+  path: ` + filepath.Join(filepath.Dir(path), ".issueq") + `
+routes:
+  - name: triage
+    job:
+      kind: triage
+      command: ["` + command + `"]
+      timeout: 10m
+      concurrency: 1
+      max_attempts: 2
+`
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }

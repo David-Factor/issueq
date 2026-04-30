@@ -227,3 +227,108 @@ func sampleIssue() model.IssueSnapshot {
 		SyncedAt:        time.Date(2026, 1, 1, 0, 1, 0, 0, time.UTC),
 	}
 }
+
+func TestClaimPendingJobSetsLeaseFields(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	_, inserted, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "claim-1"})
+	if err != nil || !inserted {
+		t.Fatalf("enqueue inserted=%v err=%v", inserted, err)
+	}
+	job, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 1, map[string]int{"code": 1}, 30*time.Minute)
+	if err != nil {
+		t.Fatalf("ClaimNextJob error = %v", err)
+	}
+	if job == nil {
+		t.Fatal("job = nil")
+	}
+	if job.Status != model.JobStatusRunning || job.LockedBy != "runner-1" || job.LeaseUntil == nil || job.StartedAt == nil {
+		t.Fatalf("claimed job = %#v", job)
+	}
+}
+
+func TestNonExpiredRunningJobNotClaimedTwice(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	_, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", DedupeKey: "claim-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 2, map[string]int{"code": 2}, 30*time.Minute)
+	if err != nil || first == nil {
+		t.Fatalf("first claim job=%#v err=%v", first, err)
+	}
+	second, err := store.ClaimNextJob(ctx, "runner-2", []string{"code"}, 2, map[string]int{"code": 2}, 30*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != nil {
+		t.Fatalf("second claim = %#v, want nil", second)
+	}
+}
+
+func TestExpiredLeaseCanBeReleased(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	_, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", DedupeKey: "claim-3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 1, map[string]int{"code": 1}, time.Millisecond)
+	if err != nil || job == nil {
+		t.Fatalf("claim job=%#v err=%v", job, err)
+	}
+	time.Sleep(2 * time.Millisecond)
+	released, err := store.ReleaseExpiredLeases(ctx, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released != 1 {
+		t.Fatalf("released = %d, want 1", released)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if jobs[0].Status != model.JobStatusPending || jobs[0].LockedBy != "" || jobs[0].LeaseUntil != nil {
+		t.Fatalf("released job = %#v", jobs[0])
+	}
+}
+
+func TestClaimRespectsGlobalAndRouteConcurrency(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", Priority: 10, DedupeKey: "claim-4"})
+	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-2", RouteName: "code", Kind: "code", Priority: 9, DedupeKey: "claim-5"})
+	first, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 1, map[string]int{"code": 2}, 30*time.Minute)
+	if err != nil || first == nil {
+		t.Fatalf("first claim job=%#v err=%v", first, err)
+	}
+	blockedGlobal, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 1, map[string]int{"code": 2}, 30*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blockedGlobal != nil {
+		t.Fatalf("blockedGlobal = %#v, want nil", blockedGlobal)
+	}
+
+	if err := store.FinalizeJob(ctx, first.ID, model.JobFinalize{Status: model.JobStatusSucceeded}); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 2, map[string]int{"code": 1}, 30*time.Minute)
+	if err != nil || second == nil {
+		t.Fatalf("second claim job=%#v err=%v", second, err)
+	}
+	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-3", RouteName: "code", Kind: "code", Priority: 8, DedupeKey: "claim-6"})
+	blockedRoute, err := store.ClaimNextJob(ctx, "runner-1", []string{"code"}, 2, map[string]int{"code": 1}, 30*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blockedRoute != nil {
+		t.Fatalf("blockedRoute = %#v, want nil", blockedRoute)
+	}
+}

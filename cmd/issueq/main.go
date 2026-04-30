@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"issueq/internal/config"
+	"issueq/internal/dispatcher"
 	issuegithub "issueq/internal/github"
 	"issueq/internal/poller"
 	"issueq/internal/router"
@@ -43,7 +45,7 @@ func newRootCommand() *cobra.Command {
 		stubCommand("once", "Run one poll-route-dispatch reconciliation cycle", &configPath),
 		pollCommand(&configPath),
 		routeCommand(&configPath),
-		stubCommand("dispatch", "Dispatch eligible queued jobs", &configPath),
+		dispatchCommand(&configPath),
 		jobsCommand(&configPath),
 		issuesCommand(&configPath),
 		configCheckCommand("config-check", "Validate issueq configuration", &configPath),
@@ -120,6 +122,29 @@ func routeCommand(configPath *string) *cobra.Command {
 				return err
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "route OK: issues=%d matched=%d created=%d existing=%d\n", result.IssuesEvaluated, result.RoutesMatched, result.JobsCreated, result.JobsExisting)
+			return nil
+		},
+	}
+}
+
+func dispatchCommand(configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "dispatch",
+		Short: "Dispatch eligible queued jobs",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, store, err := openConfiguredStore(cmd.Context(), *configPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			if _, err := store.ReleaseExpiredLeases(cmd.Context(), time.Now().UTC()); err != nil {
+				return err
+			}
+			result, err := dispatcher.Dispatch(cmd.Context(), *cfg, store)
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "dispatch OK: claimed=%d succeeded=%d failed=%d\n", result.Claimed, result.Succeeded, result.Failed)
 			return nil
 		},
 	}
