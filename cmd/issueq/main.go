@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"issueq/internal/config"
+	"issueq/internal/router"
 	sqlitestore "issueq/internal/store/sqlite"
 
 	"github.com/spf13/cobra"
@@ -39,7 +40,7 @@ func newRootCommand() *cobra.Command {
 		stubCommand("daemon", "Run the long-lived issueq daemon", &configPath),
 		stubCommand("once", "Run one poll-route-dispatch reconciliation cycle", &configPath),
 		stubCommand("poll", "Poll GitHub issues into the local store", &configPath),
-		stubCommand("route", "Route locally stored issues into jobs", &configPath),
+		routeCommand(&configPath),
 		stubCommand("dispatch", "Dispatch eligible queued jobs", &configPath),
 		jobsCommand(&configPath),
 		issuesCommand(&configPath),
@@ -70,6 +71,27 @@ func configCheckCommand(use, short string, configPath *string) *cobra.Command {
 				return err
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "config OK: %s\n", *configPath)
+			return nil
+		},
+	}
+}
+
+func routeCommand(configPath *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "route",
+		Short: "Route locally stored issues into jobs",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			cfg, store, err := openConfiguredStore(cmd.Context(), *configPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+
+			result, err := router.Route(cmd.Context(), *cfg, store)
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "route OK: issues=%d matched=%d created=%d existing=%d\n", result.IssuesEvaluated, result.RoutesMatched, result.JobsCreated, result.JobsExisting)
 			return nil
 		},
 	}

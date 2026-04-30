@@ -2,10 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"issueq/internal/model"
+	sqlitestore "issueq/internal/store/sqlite"
 )
 
 func TestRootCommandHelpIncludesPhase0Commands(t *testing.T) {
@@ -106,6 +111,65 @@ routes:
 	}
 }
 
+func TestRouteCommandSeedsJobFromStoredIssue(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "issueq.yaml")
+	dbPath := filepath.Join(dir, "issueq.db")
+	writeConfig(t, configPath, dbPath)
+
+	seed := runCommand(t, "--config", configPath, "config-check")
+	if seed != "config OK: "+configPath+"\n" {
+		t.Fatalf("config-check output = %q", seed)
+	}
+
+	// Seed through the store API to keep Phase 3 free of GitHub/network dependencies.
+	ctx := context.Background()
+	store, err := sqlitestore.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertIssue(ctx, model.IssueSnapshot{
+		IssueKey:        "github.com/example-org/example-repo#1",
+		Host:            "github.com",
+		Owner:           "example-org",
+		Repo:            "example-repo",
+		Number:          1,
+		Title:           "Seed issue",
+		Labels:          []string{"agent-triage"},
+		State:           "open",
+		GitHubUpdatedAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := newRootCommand()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--config", configPath, "route"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("route Execute() error = %v", err)
+	}
+	if !strings.Contains(buf.String(), "created=1") {
+		t.Fatalf("route output = %q", buf.String())
+	}
+
+	cmd = newRootCommand()
+	buf = new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--config", configPath, "jobs"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("jobs Execute() error = %v", err)
+	}
+	if !strings.Contains(buf.String(), "triage") || !strings.Contains(buf.String(), "pending") {
+		t.Fatalf("jobs output = %q", buf.String())
+	}
+}
+
 func TestJobsAndIssuesCommandsWorkOnEmptyDB(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "issueq.yaml")
@@ -150,4 +214,17 @@ routes:
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func runCommand(t *testing.T, args ...string) string {
+	t.Helper()
+	cmd := newRootCommand()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs(args)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("issueq %v failed: %v\n%s", args, err, buf.String())
+	}
+	return buf.String()
 }
