@@ -1,8 +1,8 @@
 # Execution supervisor architecture spec
 
-This document defines the target architecture for simplifying issueq's concurrent job execution while preserving durable local queue semantics and GitHub lifecycle correctness. Because the project is still pre-production, the migration may hard-cut over to cleaner boundaries instead of preserving every intermediate implementation shape.
+This document defines issueq's wrapper-only execution architecture for concurrent job execution while preserving durable local queue semantics and GitHub lifecycle correctness.
 
-It supersedes the implementation shape in `docs/concurrency-supervision-design.md` where the daemon directly owns live Go subprocess handles. That design remains the current baseline; this spec describes the next refactor direction.
+It supersedes the implementation shape in `docs/concurrency-supervision-design.md` where the daemon directly owned live Go subprocess handles. That earlier design is now archived; after H5/H6 the current runtime baseline is SQLite durable running state plus the direct wrapper supervisor.
 
 ## Goals
 
@@ -29,14 +29,14 @@ It supersedes the implementation shape in `docs/concurrency-supervision-design.m
 - Re-enabling `once --no-wait` before durable detached supervision is fully implemented.
 - Perfect portable PID-only supervision without a wrapper or OS supervisor.
 
-## H5 implementation decision
+## Current implementation decision
 
-H5 is a hard cutover, not a compatibility migration. The supported implementations during H5 are:
+H5 was a hard cutover, not a compatibility migration. The supported implementations now are:
 
 - production: direct wrapper supervisor only,
 - test-only aid: fake supervisor.
 
-The pre-H5 attached runner is obsolete. It must not be invoked as a production fallback or mixed execution mode. As each entrypoint is rewired during H5, its production path should move directly to wrapper-only execution. Any remaining attached-runner code at the end of H5 is transitional cleanup debt and should be deleted or bypassed as the wrapper-only path lands.
+The pre-H5 attached runner is obsolete. It must not be invoked as a production fallback or mixed execution mode. Production entrypoints must use wrapper-only execution. After H6 cleanup, no attached runner adapter or direct process execution path should remain in production code; any newly discovered remnants are bugs/cleanup debt.
 
 Future supervisors such as systemd transient units, Docker/container supervisors, or macOS launchd may be added behind the same small `Supervisor` interface later. They are not part of H5 and should not drive a generalized backend registry, compatibility matrix, or runtime negotiation now.
 
@@ -298,7 +298,7 @@ Properties:
 - cancellation should first signal the wrapper/process group, wait a short implementation-defined grace period, then force-kill if needed; repeated cancel is idempotent,
 - if the wrapper is killed before writing `run.json`, the daemon may synthesize a cancelled/timed-out observation only while ownership is held and after it has verified backend termination under the persisted launch token; otherwise inspection reports `unknown`.
 
-This implementation is the only production runtime supported by H5.
+This implementation is the only production runtime currently supported.
 
 ### Future supervisor implementations
 

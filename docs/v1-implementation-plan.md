@@ -429,12 +429,13 @@ Component tests:
 
 ## 11. Phase 8 — Daemon loop and operator UX
 
+> **Status after H5/H6:** implemented through durable wrapper reconciliation. `daemon`, `once`, and `dispatch` use wrapper-only supervision; `once --no-wait` remains unsupported.
+
 ### Scope
 
 - Implement full `daemon` loop.
-- Implement `once` semantics:
-  - waits by default
-  - `--no-wait` returns after spawning
+- Implement `once` as a bounded reconciliation wave that waits by default.
+- Keep `once --no-wait` rejected as unsupported until detached semantics are explicitly designed.
 - Improve `jobs`/`issues` output.
 - Add `--json` to inspect commands.
 - Add structured logging.
@@ -454,7 +455,7 @@ Component tests:
 - daemon loop with fake clock/client processes poll-route-dispatch once or multiple times.
 - graceful shutdown does not corrupt running job state.
 - `once` waits by default.
-- `once --no-wait` starts and returns.
+- `once --no-wait` returns a clear unsupported error.
 
 CLI smoke:
 
@@ -477,7 +478,7 @@ CLI smoke:
 - Verify labels/comments with a harmless local script.
 - Fix edge cases found during manual use.
 - Add packaging/build notes.
-- Optional systemd unit example.
+- Document wrapper-only restart/shutdown/unknown-state operator expectations; systemd remains an optional future supervisor backend.
 
 ### Requirements addressed
 

@@ -34,7 +34,7 @@ V1 must:
 - Route issues to jobs using simple label include/exclude predicates.
 - Store issue snapshots, jobs, leases, attempts, and events in SQLite.
 - Spawn configured subprocesses only when matching work exists and capacity is available.
-- Enforce global and per-route/per-kind concurrency limits.
+- Enforce global and per-route concurrency limits.
 - Track attempts and prevent infinite automation loops.
 - Update GitHub labels/comments on job start, success, failure, and terminal states; record skipped stale jobs locally.
 - Pass issue/job context to subprocesses through files and environment variables.
@@ -183,8 +183,8 @@ Runs one reconciliation cycle:
 
 Final v1 behavior:
 
-- `issueq once` starts eligible jobs and waits for jobs it spawned to finish.
-- `issueq once --no-wait` starts eligible jobs and returns immediately after spawning.
+- `issueq once` runs a bounded poll/route/dispatch reconciliation wave and waits for jobs it spawned to finish.
+- `issueq once --no-wait` is intentionally unsupported until durable detached CLI semantics are explicitly designed.
 
 ### 7.4 Debug commands
 
@@ -512,8 +512,9 @@ On startup and periodically, expired `running` jobs are released.
 
 V1 policy:
 
-- If a `running` job lease expires and its process is not known to be alive, mark it `pending` when attempts remain.
-- If attempts are exhausted, mark it `dead` and apply `on_attempts_exceeded` if safe to do so.
+- Running jobs also carry `runner_instance_id` and, for wrapper-launched work, durable launch metadata such as supervisor kind, launch token, launch state, artifact paths, and timeout.
+- Expired rows without durable launch metadata may be requeued only when the owner heartbeat is stale or missing.
+- Expired rows with durable wrapper metadata are inspected/adopted only after verified stale-owner recovery. If launch identity cannot be verified, the row remains `running` and operator-visible, usually with `launch_state = unknown`; issueq must not blindly requeue, PID-kill, or finalize it.
 
 ## 11. Dispatch specification
 
@@ -521,7 +522,7 @@ There are no idle coding/review workers. The dispatcher is a supervisor that sta
 
 Dispatch flow:
 
-1. compute currently running counts by global and route/kind
+1. compute currently running counts by global and route
 2. select next pending job by priority then creation time
 3. ensure runner capability matches job kind
 4. ensure capacity is available
@@ -532,7 +533,7 @@ Dispatch flow:
 9. if attempts exceed max, apply `on_attempts_exceeded`, mark `dead`, stop
 10. apply `on_start` actions
 11. write context JSON
-12. spawn subprocess
+12. launch the internal `issueq job-wrapper`, which invokes the configured subprocess
 13. capture stdout/stderr to files
 14. enforce timeout
 15. parse optional result JSON
@@ -838,8 +839,8 @@ type QueueStore interface {
     MarkDead(ctx context.Context, jobID string, reason string) error
     RenewLease(ctx context.Context, jobID string, runnerID string, until time.Time) error
     ReleaseExpiredLeases(ctx context.Context) error
-    IncrementAttempts(ctx context.Context, issueKey string, generation int, routeName string) (int, error)
-    IncrementTransitions(ctx context.Context, issueKey string) (int, error)
+    IncrementAttemptsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string, generation int, routeName string) (int, error)
+    IncrementTransitionsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string) (int, error)
 }
 ```
 
@@ -885,7 +886,7 @@ Postgres enables:
 - shared queue for multiple users/runners
 - row-level locking
 - cluster-wide leases
-- global/per-kind concurrency limits
+- global/per-route concurrency limits
 - stronger audit/history
 
 Use `FOR UPDATE SKIP LOCKED` for job claiming.

@@ -1,5 +1,8 @@
 # Concurrency and supervision design
 
+> **Archived/stale after H5/H6.** This document records the pre-wrapper concurrency-supervision design. The current implementation is wrapper-only durable supervision described in [`execution-supervisor-spec.md`](execution-supervisor-spec.md), with migration status in [`execution-supervisor-migration-plan.md`](execution-supervisor-migration-plan.md). Do not use this document as current implementation guidance; sections about `runner.Start` / `runner.Wait`, daemon-owned handles, and compatibility `runner.Run` are obsolete.
+
+
 This note closes the remaining pre-Phase 9 design questions for documented follow-ups #5, #6, #7, and #12 in `docs/code-review-followups.md`.
 
 ## Goals

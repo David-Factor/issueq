@@ -1,5 +1,8 @@
 # Concurrency supervision implementation plan
 
+> **Archived/stale after H5/H6.** This plan describes the pre-wrapper direct-runner concurrency refactor. The current production runtime is the wrapper-only supervisor path. Use [`execution-supervisor-spec.md`](execution-supervisor-spec.md) and [`execution-supervisor-migration-plan.md`](execution-supervisor-migration-plan.md) for current architecture/status. References here to direct runner process APIs are historical.
+
+
 This plan breaks `docs/concurrency-supervision-design.md` into reviewable implementation phases. It addresses the remaining documented follow-ups before Phase 9 manual E2E:
 
 - #5 true configured concurrency,

@@ -317,6 +317,8 @@ Add direct wrapper supervisor backend
 
 ## Phase H5 — hard-cut over workflow and entrypoints to wrapper reconciliation
 
+> **Status: complete.** H5 landed the wrapper-only runtime path: durable wrapper observation/finalization, launch transaction, daemon DB reconciler, bounded `once`/`dispatch` frontier policy, stale-owner adoption, conservative unknown handling, and wrapper-default smoke coverage. Production entrypoints use the direct wrapper supervisor; attached execution is not a fallback.
+
 ### Goals
 
 Move daemon, `once`, and `dispatch` onto workflow primitives plus direct-wrapper supervisor observations. This is the main simplification phase and is a hard cutover: the wrapper supervisor becomes the only production execution path, the fake supervisor remains test-only, and the obsolete attached runner must not be used as a production fallback.
@@ -372,6 +374,8 @@ Rewrite execution around durable wrapper reconciliation
 ```
 
 ## Phase H6 — remove remaining obsolete supervision plumbing
+
+> **Status after H6.3: runtime cleanup complete.** H6 cleanup pruned the obsolete attached supervisor adapter, direct runner process API, and direct process store helpers. Remaining H6.4 scope is documentation cleanup only: remove or mark stale direct-runner/concurrency-supervision docs and ensure README/spec/plan language matches wrapper-only supervision.
 
 ### Goals
 

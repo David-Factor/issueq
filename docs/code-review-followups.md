@@ -30,7 +30,7 @@ The CLI `dispatch` command used to open only the local store and call `dispatche
 
 `IncrementAttempts` returns the current attempt number and dispatcher assigns it to `job.Attempts`, but runner used to write `job.Attempts + 1` to context JSON and env. The first GitHub-aware run therefore reported attempt `2`. The `jobs.attempts` column was also not updated when attempts incremented.
 
-**Fix:** `Job.Attempts` is now treated as the current GitHub-backed attempt once dispatcher increments it. Runner context JSON and `ISSUEQ_ATTEMPT` emit that value directly, clamped to `1` for local fixture jobs that have no GitHub-backed attempt counter. The store interface and SQLite implementation now include `UpdateJobAttempts`, and dispatcher persists attempts immediately after route-attempt increment.
+**Fix:** `Job.Attempts` is now treated as the current GitHub-backed attempt once dispatcher increments it. Runner context JSON and `ISSUEQ_ATTEMPT` emit that value directly, clamped to `1` for local fixture jobs that have no GitHub-backed attempt counter. The durable workflow persists attempts through the owned `IncrementAttemptsForJob` path immediately after route-attempt increment.
 
 **Verification:** runner tests assert attempt `1` in env/context for a first attempt and for zero-attempt local fixture jobs; dispatcher tests assert the job row persists `attempts=1` and result-driven comment sees `ISSUEQ_ATTEMPT=1`.
 
@@ -46,7 +46,7 @@ After a job is claimed, several errors could return from dispatch without finali
 
 ## Priority 1 — important hardening
 
-### 5. Configured concurrency is not realized as parallel execution
+### 5. Configured concurrency is not realized as parallel execution — fixed
 
 **Where:** `internal/dispatcher/dispatcher.go`; `internal/runner/runner.go`
 
@@ -54,9 +54,11 @@ The dispatcher claims one job, runs it synchronously, finalizes it, then claims 
 
 **Risk:** v1 does not deliver promised global/per-route concurrent supervision.
 
-**Suggested fix:** split runner into start/wait/reap primitives. Dispatcher should claim/spawn up to available capacity, track active children, renew leases, and reap completed jobs. `once` can wait by default; `once --no-wait` can return after spawn.
+**Fix:** H5 rewired `dispatch`, `once`, and daemon to wrapper-backed durable running jobs. Bounded waves and the daemon refill loop claim/launch up to DB-derived global/per-route capacity and inspect/finalize running jobs via the supervisor.
 
-### 6. Lease expiry can duplicate still-running work
+**Verification:** wrapper/default smoke and dispatcher/daemon tests cover wrapper-only dispatch, bounded frontier behavior, refill/reap behavior, and absence of attached fallback.
+
+### 6. Lease expiry can duplicate still-running work — fixed
 
 **Where:** `internal/store/sqlite/sqlite.go`, `ReleaseExpiredLeases`; `internal/daemon/daemon.go`
 
@@ -64,9 +66,11 @@ There is no lease renewal while subprocesses run. `ReleaseExpiredLeases` blindly
 
 **Risk:** long jobs can be reclaimed while still executing, creating duplicate automation.
 
-**Suggested fix:** renew leases for active children. On startup/expiry, only requeue jobs whose process is known not alive or whose runner is no longer active. At minimum document that `lease_duration` must exceed job timeout until renewal lands.
+**Fix:** Running jobs are owned by `runner_instance_id`, renewed while owned, and represented by durable wrapper launch metadata. Expired non-durable rows are requeued only after stale/missing heartbeat; durable wrapper rows require verified stale-owner adoption or remain operator-visible unknown.
 
-### 7. Timeout kills only the direct subprocess
+**Verification:** store/workflow/daemon tests cover ownership-guarded renewals, stale lease recovery, stale-owner adoption, and conservative unknown handling.
+
+### 7. Timeout kills only the direct subprocess — fixed
 
 **Where:** `internal/runner/runner.go`
 
@@ -74,7 +78,9 @@ There is no lease renewal while subprocesses run. `ReleaseExpiredLeases` blindly
 
 **Risk:** bounded-job guarantee is incomplete; runaway child process trees can remain.
 
-**Suggested fix:** start jobs in their own process group/session and kill the process group on timeout/cancel. Implement platform-specific handling for Unix first.
+**Fix:** User commands now run under `issueq job-wrapper`, which starts the command in a process group where supported and kills the process group on timeout/cancellation.
+
+**Verification:** job-wrapper/supervisor tests cover timeout, cancellation, and process-tree cleanup behavior.
 
 ### 8. Action application does not refresh after mutations — fixed
 
@@ -118,7 +124,7 @@ The REST client used to use `http.DefaultClient` when no client was provided. Th
 
 **Verification:** GitHub tests assert `NewRESTClient` installs the default timeout.
 
-### 12. `daemon` currently blocks inside full synchronous dispatch cycles
+### 12. `daemon` currently blocks inside full synchronous dispatch cycles — fixed
 
 **Where:** `internal/daemon/daemon.go`
 
@@ -126,7 +132,9 @@ The daemon loop calls `Once`, and `Once` blocks until all dispatch work in the c
 
 **Risk:** polling cadence and shutdown responsiveness depend on subprocess duration.
 
-**Suggested fix:** address together with the concurrency/refactor work: daemon should periodically poll/route, spawn within capacity, renew leases, reap children, and respond promptly to shutdown.
+**Fix:** Daemon is now a long-lived DB reconciler with independent heartbeat, poll/route, and reconcile/refill loops. It no longer runs as repeated blocking `Once` calls.
+
+**Verification:** daemon tests cover poll responsiveness, reap/refill behavior, shutdown cleanup, heartbeat deletion after clean shutdown, and stale durable adoption.
 
 ## Suggested work order
 
@@ -135,7 +143,7 @@ The daemon loop calls `Once`, and `Once` blocks until all dispatch work in the c
 3. ~~Add common post-claim failure handling so jobs do not remain `running` on errors.~~
 4. ~~Fix action post-refresh and real label-change detection.~~
 5. ~~Decide whether to remove/disable `once --no-wait` or implement real nonblocking spawn semantics.~~ Disabled for now.
-6. Document or implement lease renewal/process-tree killing/concurrent supervision.
+6. ~~Document or implement lease renewal/process-tree killing/concurrent supervision.~~ Implemented through wrapper-only H5/H6 supervision.
 7. ~~Add HTTP client timeout.~~
 8. Re-run automated gates, then start Phase 9 manual E2E.
 
