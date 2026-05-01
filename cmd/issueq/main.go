@@ -13,6 +13,7 @@ import (
 	"issueq/internal/daemon"
 	"issueq/internal/dispatcher"
 	issuegithub "issueq/internal/github"
+	"issueq/internal/jobwrapper"
 	"issueq/internal/logging"
 	"issueq/internal/poller"
 	"issueq/internal/router"
@@ -47,6 +48,7 @@ func newRootCommand() *cobra.Command {
 		pollCommand(&configPath),
 		routeCommand(&configPath),
 		dispatchCommand(&configPath),
+		jobWrapperCommand(),
 		jobsCommand(&configPath),
 		issuesCommand(&configPath),
 		configCheckCommand("config-check", "Validate issueq configuration", &configPath),
@@ -169,6 +171,26 @@ func dispatchCommand(configPath *string) *cobra.Command {
 		return nil
 	}}
 	c.Flags().BoolVar(&localNoGitHub, "local-no-github", false, "dispatch without GitHub refresh/actions/attempt enforcement; intended for local fixtures only")
+	return c
+}
+
+func jobWrapperCommand() *cobra.Command {
+	var specPath string
+	c := &cobra.Command{Use: "job-wrapper", Short: "internal durable job execution wrapper", Hidden: true, Args: cobra.NoArgs, RunE: func(cmd *cobra.Command, args []string) error {
+		if specPath == "" {
+			return fmt.Errorf("--spec is required")
+		}
+		spec, err := jobwrapper.LoadSpec(specPath)
+		if err != nil {
+			return err
+		}
+		sigCh := make(chan os.Signal, 2)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		defer signal.Stop(sigCh)
+		_, err = jobwrapper.Run(cmd.Context(), spec, jobwrapper.Options{Cancel: sigCh})
+		return err
+	}}
+	c.Flags().StringVar(&specPath, "spec", "", "path to job wrapper launch spec JSON")
 	return c
 }
 

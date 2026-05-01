@@ -44,6 +44,20 @@ func TestRootCommandHelpIncludesPhase0Commands(t *testing.T) {
 	}
 }
 
+func TestJobWrapperCommandIsHiddenFromHelp(t *testing.T) {
+	cmd := newRootCommand()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--help"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if strings.Contains(buf.String(), "job-wrapper") {
+		t.Fatalf("help unexpectedly includes hidden job-wrapper command:\n%s", buf.String())
+	}
+}
+
 func TestConfigCheckValidConfig(t *testing.T) {
 	cmd := newRootCommand()
 	buf := new(bytes.Buffer)
