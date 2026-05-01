@@ -11,7 +11,7 @@ func TestFakeSupervisorRecordsCallsAndDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Launch error = %v", err)
 	}
-	if record.Kind != KindAttached || record.LaunchToken != "tok" {
+	if record.Kind != KindWrapper || record.LaunchToken != "tok" {
 		t.Fatalf("record = %#v", record)
 	}
 	obs, err := fake.Inspect(context.Background(), record)

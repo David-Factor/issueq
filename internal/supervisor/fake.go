@@ -35,7 +35,7 @@ func (f *Fake) Launch(ctx context.Context, spec LaunchSpec) (LaunchRecord, error
 	}
 	record := f.NextRecord
 	if record.Kind == "" {
-		record.Kind = KindAttached
+		record.Kind = KindWrapper
 	}
 	if record.LaunchToken == "" {
 		record.LaunchToken = spec.LaunchToken
