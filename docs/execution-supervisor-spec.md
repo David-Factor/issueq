@@ -116,24 +116,65 @@ Daemon should not be implemented as `for { Once(); sleep(...) }`, because a boun
 
 The target design should move active execution state into SQLite as much as possible. A running job should carry enough durable launch information for a later daemon process to inspect, cancel, or recover it.
 
-Add or evolve job fields similar to:
+Required per-launch fields should be explicit, not inferred from reused job IDs or artifact paths:
 
 ```text
-supervisor_kind       attached | wrapper | systemd
-supervisor_id         backend-specific ID: unit name, wrapper pid, etc.
-pid                   observed process/wrapper pid, if available
-pgid                  process group id, if available
-run_metadata_path     path to run.json / wrapper metadata
-timeout_at            wall-clock timeout deadline
-context_path          context JSON path
-result_path           command result JSON path
-stdout_path           stdout log path
-stderr_path           stderr log path
+supervisor_kind          attached | wrapper | systemd
+supervisor_id            backend-specific ID: unit name, wrapper pid, handle id, etc.
+launch_token             unique token for this launch attempt
+launch_state             preparing | launching | running | unknown
+run_metadata_path        unique path to this launch's run.json / wrapper metadata
+context_path             context JSON path
+result_path              command result JSON path
+stdout_path              stdout log path
+stderr_path              stderr log path
+timeout_at               wall-clock timeout deadline
 ```
+
+Backend-specific optional fields may include:
+
+```text
+pid                      observed process/wrapper pid, if available
+pgid                     process group id, if available
+process_started_at       OS process start-time/fingerprint, if available
+systemd_unit             transient unit name, if distinct from supervisor_id
+```
+
+`launch_token` is mandatory for wrapper and systemd backends and should be included in the launch spec, launch record, wrapper metadata, and systemd unit name. Metadata paths must be unique per launch token. A daemon must never finalize or cancel a run using stale `run.json`, PID, or unit evidence from a previous launch; inspection must verify job ID plus launch token, and should verify attempt/generation where available.
 
 `status = running` plus durable launch metadata is the daemon's observable active set. Jobs owned by the current `runner_instance_id` may be renewed, inspected, cancelled, and finalized directly. Jobs owned by another runner instance require the adoption policy below before any ownership-guarded mutation.
 
-In-memory state may still exist for an attached migration backend, but daemon policy should increasingly reconcile from DB rows rather than from an active handle map.
+In-memory state may still exist for an attached migration backend, but daemon policy should increasingly reconcile from DB rows rather than from an active handle map. Rows launched by the attached backend may record launch bookkeeping, but that bookkeeping is not durable detached supervision metadata. After daemon crash, attached rows follow the existing stale lease recovery path because no later process can safely inspect their live handles.
+
+### Launch transaction and crash-window invariants
+
+Launching a job crosses a process boundary, so the workflow layer must define crash-safe intermediate states. The exact schema may evolve, but the observable state machine should preserve these invariants:
+
+```text
+pending -> running/preparing -> running/launching -> running/running -> terminal
+                                      \-> running/unknown
+```
+
+Recommended protocol:
+
+1. claim the job with ownership, setting `status = running`, `launch_state = preparing`, and the current `runner_instance_id`,
+2. write `context.json` and reserve unique per-launch artifact paths using a fresh `launch_token`,
+3. persist the launch specification/paths/token with an ownership guard while still in `preparing`,
+4. immediately before any backend side effect, atomically set `launch_state = launching` with an ownership guard,
+5. start the backend using that launch token,
+6. persist the returned launch record and set `launch_state = running` with an ownership guard,
+7. inspect/finalize only observations that match the persisted launch token.
+
+Crash recovery must be deterministic for every boundary:
+
+- claimed/preparing with no launch token/spec: recover by stale lease requeue when the owner heartbeat is stale or missing,
+- preparing with launch token/spec but before `launching`: no backend side effect should have occurred yet, so stale lease requeue is allowed after stale/missing heartbeat,
+- launching with durable launch spec but no verified backend identity: mark or leave `unknown`; do not finalize or PID-kill blindly,
+- spawned backend before launch record persistence: avoided where practical by making the wrapper/systemd identity deterministic from the launch token; otherwise recovery must treat the row as `unknown`, not requeue automatically,
+- launch record persisted before backend is observable: inspect returns `starting` until a short backend-defined startup grace expires, then `unknown`,
+- completed metadata with mismatched launch token: ignore as stale evidence and report `unknown` or continue inspecting other verified evidence.
+
+Launch failures while ownership is still held should finalize through the normal failure path unless the failure was caused by shutdown/cancellation, which finalizes as `cancelled`. If ownership is lost during launch or launch-record persistence, the stale process must drop local mutations and avoid GitHub side effects; later recovery/adoption handles the row.
 
 ## Execution supervisor interface
 
@@ -151,21 +192,23 @@ Suggested data types:
 
 ```go
 type LaunchSpec struct {
-    JobID       string
-    Command     []string
-    Env         []string
-    Workdir     string
-    ContextPath string
-    ResultPath  string
-    StdoutPath  string
-    StderrPath  string
+    JobID        string
+    LaunchToken  string
+    Command      []string
+    Env          []string
+    Workdir      string
+    ContextPath  string
+    ResultPath   string
+    StdoutPath   string
+    StderrPath   string
     MetadataPath string
-    Timeout     time.Duration
+    Timeout      time.Duration
 }
 
 type LaunchRecord struct {
     Kind         string // attached, wrapper, systemd
     ID           string // handle id, wrapper pid, unit name, etc.
+    LaunchToken  string
     PID          int
     PGID         int
     MetadataPath string
@@ -201,12 +244,14 @@ type Observation struct {
 The workflow layer maps `Observation` to issueq job statuses:
 
 ```text
+RunStarting            -> keep running and renew if owned
+RunRunning             -> keep running and renew if owned
 RunExited + exit 0      -> succeeded
 RunExited + nonzero     -> failed
 RunFailed               -> failed
 RunTimedOut             -> failed, timed_out message
 RunCancelled            -> cancelled
-RunUnknown              -> keep running or recover by lease/heartbeat policy
+RunUnknown              -> keep running, mark/audit unknown, require policy or operator action
 ```
 
 Cancelled observations skip GitHub success/failure/result actions and finalize as `cancelled` while ownership is held.
@@ -230,17 +275,18 @@ This backend can preserve existing behavior while the workflow primitives are ex
 
 The wrapper backend launches `issueq job-wrapper` directly as a child process. The wrapper owns the user command execution and writes durable run metadata.
 
-For durable crash recovery, the wrapper must be launched so it can outlive daemon crashes without receiving an accidental parent-death cancellation. The backend should record enough identity to verify the wrapper/process later, e.g. PID plus process start time or PGID plus metadata path. If the platform cannot provide safe identity verification, recovery must treat the launch state as unknown rather than killing/finalizing by PID alone.
+For durable crash recovery, the wrapper must be launched so it can outlive daemon crashes without receiving an accidental parent-death cancellation. Durable wrapper launch must not be tied to the daemon request context in the way `exec.CommandContext` normally kills children. It should use a separate process group/session where appropriate, close inherited resources that would keep daemon pipes/files alive, and persist enough identity to verify the wrapper/process later, e.g. PID plus process start time or PGID plus metadata path. If the platform cannot provide safe identity verification, recovery must treat the launch state as unknown rather than killing/finalizing by PID alone.
 
 Properties:
 
-- daemon records wrapper PID/PGID/metadata path,
+- daemon records wrapper PID/PGID/process fingerprint/metadata path,
 - wrapper starts the user command in its own process group,
 - wrapper redirects stdout/stderr to configured files,
 - wrapper waits on the command and records exit status,
-- wrapper enforces timeout or responds to cancellation,
+- wrapper enforces the issueq timeout and writes timeout metadata,
 - daemon inspects PID/PGID plus metadata file,
-- cancellation should first signal the wrapper/process group, wait a short grace period, then force-kill if needed; if the wrapper is killed before writing `run.json`, inspection should report cancelled/timed-out from durable daemon state where ownership is held.
+- cancellation should first signal the wrapper/process group, wait a short backend-defined grace period, then force-kill if needed; repeated cancel is idempotent,
+- if the wrapper is killed before writing `run.json`, the daemon may synthesize a cancelled/timed-out observation only while ownership is held and after it has verified backend termination under the persisted launch token; otherwise inspection reports `unknown`.
 
 This backend is the preferred portable long-term default if systemd is not required.
 
@@ -249,16 +295,19 @@ This backend is the preferred portable long-term default if systemd is not requi
 The systemd backend launches the same wrapper under a transient systemd unit:
 
 ```text
-systemd-run --unit issueq-job-<jobID> --property=KillMode=control-group --property=RuntimeMaxSec=<timeout> --property=CollectMode=inactive-or-failed ... issueq job-wrapper ...
+systemd-run --unit issueq-job-<jobID>-<launchToken> --property=KillMode=control-group --property=RuntimeMaxSec=<timeout+grace> --property=CollectMode=inactive-or-failed ... issueq job-wrapper ...
 ```
 
-Unit names must be sanitized and collision-resistant, e.g. include the job ID and a short launch token. The backend should request cleanup/collection where supported and should define stop/kill grace behavior consistently with wrapper cancellation.
+Unit names must be sanitized and collision-resistant, e.g. include the job ID and launch token. Timeout ownership should be explicit: the wrapper owns the issueq timeout and writes issueq metadata; systemd `RuntimeMaxSec`, if used, should be a timeout plus grace safety net. The backend should request cleanup/collection where supported and should define stop/kill grace behavior consistently with wrapper cancellation.
 
 Properties:
 
 - systemd owns process lifetime, cgroups, and process-tree killing,
 - daemon records unit name as `supervisor_id`,
 - inspect maps systemd unit state plus wrapper metadata to `Observation`,
+- valid wrapper `run.json` is authoritative for completed issueq semantics,
+- missing unit plus valid metadata may still be finalized from metadata,
+- missing unit plus missing or invalid metadata is `RunUnknown`, not success or failure,
 - cancel stops/kills the unit,
 - still uses wrapper metadata for issueq-specific exit/result semantics.
 
@@ -279,12 +328,34 @@ Responsibilities:
 7. kill process group on timeout/cancellation,
 8. write run metadata atomically.
 
+Suggested launch spec file:
+
+```json
+{
+  "version": 1,
+  "job_id": "job_...",
+  "launch_token": "01...",
+  "command": ["./task.sh"],
+  "env": ["A=B"],
+  "workdir": "/repo",
+  "context_path": ".../context.json",
+  "result_path": ".../result.json",
+  "stdout_path": ".../stdout.log",
+  "stderr_path": ".../stderr.log",
+  "metadata_path": ".../run.json",
+  "timeout_seconds": 1800
+}
+```
+
+Wrapper cancellation should be deterministic. On `SIGTERM` or `SIGINT`, the wrapper should signal the user command process group, wait a short grace period, force-kill if needed, and write cancelled metadata when possible. Timeout takes precedence over later cancellation if the timeout decision happened first. Repeated cancellation signals should be safe.
+
 Suggested metadata file, e.g. `run.json`:
 
 ```json
 {
   "version": 1,
   "job_id": "job_...",
+  "launch_token": "01...",
   "pid": 1234,
   "pgid": 1234,
   "started_at": "2026-01-01T00:00:00Z",
@@ -300,7 +371,7 @@ Suggested metadata file, e.g. `run.json`:
 }
 ```
 
-`context.json` has one authoritative writer: the workflow layer prepares it before launch. The wrapper validates that the path exists and matches the requested job ID, but does not rewrite it. This avoids races between DB launch-record persistence and wrapper startup.
+`context.json` has one authoritative writer: the workflow layer prepares it before launch. The wrapper validates that the path exists and matches the requested job ID and launch token if present, but does not rewrite it. This avoids races between DB launch-record persistence and wrapper startup.
 
 The wrapper must write metadata atomically, e.g. write `run.json.tmp`, fsync/close as practical, then rename to `run.json`.
 
@@ -341,10 +412,12 @@ A daemon may adopt a `running` job owned by another `runner_instance_id` only if
 
 - the job lease is expired,
 - the owner heartbeat is missing or stale,
-- the job has durable supervisor metadata (`supervisor_kind`, `supervisor_id` or metadata path) sufficient for the selected backend to inspect/cancel it,
+- the job has durable supervisor metadata (`supervisor_kind`, `launch_token`, `supervisor_id` or metadata path) sufficient for the selected backend to inspect/cancel it,
 - the backend can verify launch identity using read-only evidence before adoption, e.g. completed metadata exists, the systemd unit is known, or the wrapper/process identity is verified.
 
 Rows without durable launch metadata follow the existing stale lease recovery path: requeue only after expired lease plus stale/missing heartbeat. They must not be PID-killed or finalized based on PID alone.
+
+Rows with durable launch metadata but unverifiable launch identity are different: they must not be automatically requeued, because doing so can duplicate a still-running detached wrapper/systemd job. Report them as unknown and keep them `running`. A daemon that has not adopted the job must not perform normal ownership-guarded mutations; it may either report unknown read-only, or use a dedicated stale-owner-safe store method that only marks `launch_state = unknown` when the lease is expired and the old owner heartbeat is stale/missing, without changing ownership, cancelling, finalizing, or applying GitHub side effects.
 
 ### Adoption operation
 
@@ -381,15 +454,17 @@ On daemon start and periodically:
 
 - heartbeat current runner instance,
 - inspect and renew running jobs already owned by the current runner instance,
-- for stale-owner jobs with durable launch metadata, attempt atomic adoption before inspection/finalization,
+- for stale-owner jobs with durable launch metadata, perform a read-only backend verification/probe and attempt atomic adoption only when identity is verified,
 - after adoption, inspect the backend observation:
-  - completed wrapper/systemd metadata may be finalized,
-  - still-running work may be renewed and left running,
-  - timed-out work may be cancelled and finalized,
-  - unknown launch state should remain running until an explicit operator intervention/stale requeue policy handles it; unknown state may continue to consume configured capacity by design,
-- release/requeue expired jobs only when they are not safely inspectable/adoptable and the owner heartbeat is stale/missing.
+  - completed wrapper/systemd metadata with matching launch token may be finalized,
+  - still-running verified work may be renewed and left running,
+  - timed-out verified work may be cancelled and finalized,
+  - unknown launch state should remain running until an explicit operator intervention/stale-unknown policy handles it; unknown state may continue to consume configured capacity by design,
+- release/requeue expired jobs only when they have no durable launch metadata, are not safely inspectable/adoptable, and the owner heartbeat is stale/missing.
 
-This prevents duplicate execution of still-running wrapper/systemd jobs and gives completed detached jobs a safe path to finalization.
+On restart, reconciliation must dispatch by each row's persisted `supervisor_kind`, not merely by the currently configured default backend for new launches. If support for an existing row's backend is unavailable, inspection should leave the row `unknown` and operator-visible rather than requeueing or finalizing it.
+
+`once` and `dispatch` remain bounded waves. Full stale-owner adoption is a daemon responsibility. Bounded commands may perform a nonblocking recovery pre-pass for jobs in their captured frontier, but must not wait indefinitely on unrelated stale durable jobs or adopt work outside their bounded policy.
 
 ## Shutdown behavior
 
@@ -398,10 +473,24 @@ Daemon shutdown policy:
 1. stop starting new poll/route/claim/launch work,
 2. cancel owned running jobs via `Supervisor.Cancel`,
 3. inspect/finalize cancelled jobs using a bounded cleanup context derived from `context.Background()`,
-4. keep heartbeat until cleanup succeeds or times out,
-5. delete current heartbeat only after owned active jobs are finalized, skipped due ownership loss, or otherwise safely dropped.
+4. keep heartbeat during cleanup,
+5. delete current heartbeat only after owned active jobs are finalized, skipped due ownership loss, or otherwise safely dropped by successful cleanup.
 
-If cleanup fails, heartbeat deletion should be skipped so recovery can distinguish an unclean owner.
+If cleanup fails or times out, heartbeat deletion should be skipped so recovery can distinguish an unclean owner.
+
+## Finalization after restart
+
+After adoption, finalization must reconstruct the same workflow context used by normal dispatch without trusting stale side effects from the dead runner. `FinalizeObservation` should:
+
+1. load the current job, route config, artifact paths, and launch token,
+2. validate matching wrapper metadata and result/context paths,
+3. refresh the issue when GitHub lifecycle actions are enabled,
+4. re-check ownership/renew lease before external side effects,
+5. re-run stale-route, attempt, transition, and result-action policy checks,
+6. drop GitHub side effects and finalization if ownership is lost,
+7. map cancelled observations to `cancelled` without success/failure/result actions.
+
+The persisted `context.json` is subprocess input and audit evidence; it is not sufficient by itself to authorize post-run GitHub actions after restart. Current DB state, route config, and refreshed issue state remain authoritative for side-effect decisions.
 
 ## Restart and recovery
 
@@ -416,6 +505,9 @@ ZeroMQ may be useful later as a live notification or worker IPC layer, but it do
 Each backend should have unit tests for:
 
 - launch record persistence,
+- crash windows around claim/context/launch-record/spawn,
+- stale `run.json` or unit evidence from an older launch token,
+- PID reuse or process start-time mismatch where the platform exposes it,
 - inspect running/done/unknown,
 - cancel behavior,
 - timeout behavior,
@@ -423,7 +515,8 @@ Each backend should have unit tests for:
 - wrapper metadata parsing,
 - ownership-loss drops,
 - shutdown finalization,
-- restart/recovery behavior.
+- restart/recovery behavior,
+- backend mismatch on restart.
 
 Entrypoint tests should verify:
 

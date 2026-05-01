@@ -48,6 +48,31 @@ Docs only; run `git diff --check`.
 Document execution supervisor refactor plan
 ```
 
+## Phase E0a — harden execution supervisor invariants
+
+### Goals
+
+Tighten the target docs before implementation so the migration preserves crash/restart safety.
+
+### Work items
+
+- Define a launch transaction/crash-window protocol.
+- Make per-launch identity (`launch_token`/run ID) mandatory for durable backends.
+- Clarify adoption versus stale requeue versus unknown-state behavior.
+- Specify wrapper/systemd timeout and cancellation precedence.
+- Clarify backend mismatch behavior on restart.
+- Split DB-driven attached reconciliation from true durable adoption work.
+
+### Tests
+
+Docs only; run `git diff --check`.
+
+### Commit message
+
+```text
+Harden execution supervisor migration invariants
+```
+
 ## Phase E1 — extract shared workflow primitives
 
 ### Goals
@@ -123,10 +148,13 @@ Move toward DB-driven running-job reconciliation by storing launch metadata dura
 
 ### Work items
 
-- Add idempotent SQLite migration for fields such as:
+- Add idempotent SQLite migration for required fields such as:
   - `supervisor_kind`,
   - `supervisor_id`,
+  - `launch_token`,
+  - `launch_state`,
   - `pgid`,
+  - `process_started_at`,
   - `run_metadata_path`,
   - `timeout_at`.
 - Extend `model.Job`, scan paths, JSON output, and tests.
@@ -146,33 +174,29 @@ Move toward DB-driven running-job reconciliation by storing launch metadata dura
 Persist durable job launch records
 ```
 
-## Phase E4 — reconcile running jobs from durable state
+## Phase E4a — reconcile attached running jobs from durable state
 
 ### Goals
 
-Make daemon concurrency DB-driven: running DB rows are the active set. In-memory maps are implementation details of a backend, not daemon policy.
+Make daemon capacity and owned-running scans DB-driven while acknowledging that the current attached backend is not durably inspectable after daemon crash.
 
 ### Work items
 
 - Add store helpers:
   - list running jobs owned by runner instance,
-  - list stale-owner running jobs with durable launch metadata,
-  - atomically adopt stale running jobs before inspection/finalization,
   - count running jobs globally/per route,
-  - list launch records needing inspection,
+  - list launch records needing inspection for the current owner,
   - possibly mark unknown launch state.
 - Change daemon reap/refill policy to:
-  - inspect owned running DB rows,
-  - attempt explicit adoption before inspecting stale-owner durable jobs,
+  - inspect owned running DB rows through the attached supervisor when live handles exist,
   - finalize completed observations,
   - launch only when DB-derived capacity exists.
 - Keep `once`/`dispatch` bounded frontier semantics by tracking frontier job IDs, not live handles.
-- Ensure expired lease recovery uses DB active rows and heartbeat policy, not in-memory active IDs except for attached backend compatibility.
-- Document that the attached backend cannot truly inspect/adopt jobs after daemon crash; it falls back to stale lease recovery until wrapper/systemd backends land.
+- Ensure expired lease recovery uses DB active rows and heartbeat policy, while retaining attached-backend compatibility for live active IDs.
+- Document that attached rows cannot truly inspect/adopt jobs after daemon crash; because attached launch records are not durable detached supervision metadata, they fall back to stale lease recovery.
 
 ### Tests
 
-- Daemon restart/recovery and stale-owner adoption tests.
 - Concurrent capacity tests using DB running counts.
 - Existing C6 daemon tests.
 - Standard gates.
@@ -180,7 +204,38 @@ Make daemon concurrency DB-driven: running DB rows are the active set. In-memory
 ### Commit message
 
 ```text
-Reconcile running jobs from durable launch state
+Reconcile attached jobs from durable launch state
+```
+
+## Phase E4b — add durable adoption primitives behind fake backend
+
+### Goals
+
+Implement and test the store-level adoption/unknown-state rules before real wrapper/systemd backends depend on them.
+
+### Work items
+
+- Add store helpers:
+  - list stale-owner running jobs with durable launch metadata,
+  - atomically adopt stale running jobs after read-only backend verification,
+  - mark/report unknown launch state without automatic requeue; any DB mutation for stale-owner unknown rows must use a stale-owner-safe guard and must not imply ownership transfer, cancellation, finalization, or GitHub side effects.
+- Add fake durable supervisor tests for:
+  - verified completed metadata adoption/finalization,
+  - verified still-running adoption/renewal,
+  - durable metadata with unverifiable identity remaining running/unknown,
+  - no durable launch metadata following stale lease requeue semantics.
+- Ensure reconciliation dispatches by persisted `supervisor_kind`, not only configured default backend.
+
+### Tests
+
+- Store adoption and unknown-state tests.
+- Daemon restart/recovery tests using fake durable supervisor.
+- Standard gates.
+
+### Commit message
+
+```text
+Add durable job adoption primitives
 ```
 
 ## Phase E5 — implement job-wrapper command and metadata contract
@@ -192,7 +247,7 @@ Add the stable wrapper contract without making it the default backend yet.
 ### Work items
 
 - Add hidden/internal CLI subcommand, e.g. `issueq job-wrapper`, or an internal helper entrypoint.
-- Define wrapper spec input format.
+- Define wrapper spec input format, including job ID, launch token, command, env, workdir, paths, and timeout.
 - Validate the existing `context.json` written by the workflow layer before launch.
 - Start user command in a process group.
 - Redirect stdout/stderr to configured files.
@@ -224,7 +279,7 @@ Run jobs through `issueq job-wrapper` directly and inspect durable metadata/PID 
 
 - Implement `WrapperSupervisor`.
 - Launch wrapper as child process.
-- Record wrapper PID/PGID and metadata path.
+- Record wrapper PID/PGID/process fingerprint, launch token, and metadata path.
 - Inspect:
   - `run.json` if present,
   - process existence if metadata absent,
