@@ -52,10 +52,12 @@ Cover:
 - heartbeat insert/update/delete/prune,
 - lease renewal ownership guards,
 - launch-record persistence and launch-state transitions,
+- crash-window state transitions around claim/context/launch-record/spawn,
 - stale lease requeue for rows without durable launch metadata,
 - stale-owner adoption guards for durable launch metadata,
 - stale-owner-safe unknown marking/reporting,
-- ownership-guarded finalization and lost-ownership errors.
+- ownership-guarded finalization and lost-ownership errors,
+- indexes/scans for running jobs, owner jobs, route capacity, timeout, and recovery.
 
 ### Supervisor contract tests
 
@@ -66,6 +68,8 @@ Use a shared contract test style where practical for fake, wrapper, and future s
 - launch returns a valid `LaunchRecord`,
 - inspect `starting`, `running`, exited zero, exited nonzero, timed out, cancelled, and unknown,
 - stale launch token or mismatched metadata is rejected/unknown,
+- PID reuse or process start-time mismatch is conservative where the platform exposes enough evidence,
+- elapsed `timeout_at` alone does not authorize blind kill/finalization without verified launch identity,
 - cancellation is idempotent,
 - stdout/stderr/result/metadata paths are respected,
 - backend mismatch or missing backend support is conservative.
@@ -79,11 +83,12 @@ Cover:
 - validates existing `context.json`, job ID, and launch token,
 - does not rewrite context,
 - captures stdout/stderr,
-- records exit code and paths in `run.json`,
+- records exit code, timeout, cancellation, and paths in `run.json`,
 - writes metadata atomically,
 - enforces timeout and kills process group,
 - handles cancellation signals and repeated cancellation,
-- preserves timeout-vs-cancel precedence.
+- preserves timeout-vs-cancel precedence,
+- parses metadata into `Observation` correctly.
 
 ### Workflow tests
 
@@ -94,6 +99,7 @@ Cover:
 - prepare claimed job writes context and launch spec,
 - ownership checks before `on_start` and terminal side effects,
 - success/failure/cancelled/timeout/unknown observation mapping,
+- cancelled observations skip success/failure/result GitHub actions,
 - result JSON merge and malformed result behavior,
 - stale route and transition/attempt policy,
 - lost ownership drops GitHub actions and finalization,
@@ -122,6 +128,7 @@ Keep these few and meaningful, using real SQLite plus wrapper backend:
 - timeout kills process tree,
 - daemon shutdown cancels/finalizes owned jobs,
 - daemon restart finalizes a completed wrapper-backed job,
+- wrapper is the operational default after cutover,
 - `once --no-wait` remains unsupported unless durable detached semantics are explicitly implemented.
 
 ## Completed setup phases

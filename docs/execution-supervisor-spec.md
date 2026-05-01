@@ -500,30 +500,109 @@ Restart behavior is governed by the adoption policy above. The key rule is: insp
 
 ZeroMQ may be useful later as a live notification or worker IPC layer, but it does not replace durable job state, process supervision, or GitHub lifecycle ownership. SQLite remains the authoritative queue. If added later, ZeroMQ should be an optional control plane, not the source of truth.
 
-## Testing requirements
+## Testing strategy
 
-Each backend should have unit tests for:
+Tests should mirror the architecture boundaries. Prefer focused tests at the layer that owns the behavior instead of proving store, GitHub lifecycle, subprocess, and daemon policy indirectly through large daemon tests.
 
-- launch record persistence,
-- crash windows around claim/context/launch-record/spawn,
-- stale `run.json` or unit evidence from an older launch token,
-- PID reuse or process start-time mismatch where the platform exposes it,
-- inspect running/done/unknown,
-- cancel behavior,
-- timeout behavior,
-- stdout/stderr/result paths,
-- wrapper metadata parsing,
-- ownership-loss drops,
-- shutdown finalization,
-- restart/recovery behavior,
-- backend mismatch on restart.
+```text
+store tests          durable state transitions and ownership guards
+supervisor tests     launch/inspect/cancel execution observations
+job-wrapper tests    wrapper process contract and metadata
+workflow tests       queue/GitHub/job lifecycle decisions
+entrypoint tests     once/dispatch/daemon policy and scheduling
+E2E smokes           small real SQLite + wrapper confidence checks
+```
 
-Entrypoint tests should verify:
+### Store tests
+
+Scope: SQLite state transitions only. No GitHub and no subprocesses.
+
+Cover:
+
+- claim capacity and per-route concurrency,
+- heartbeat insert/update/delete/prune,
+- lease renewal ownership guards,
+- launch-record persistence and launch-state transitions,
+- crash-window state transitions around claim/context/launch-record/spawn,
+- stale lease requeue for rows without durable detached launch metadata,
+- stale-owner adoption guards for durable launch metadata,
+- stale-owner-safe unknown marking/reporting,
+- ownership-guarded finalization and lost-ownership errors,
+- indexes/scans for running jobs, owner jobs, route capacity, timeout, and recovery.
+
+### Supervisor contract tests
+
+Scope: `internal/supervisor` behavior. No queue and no GitHub.
+
+Use a shared contract test style where practical for fake, wrapper, and future systemd backends.
+
+Cover:
+
+- launch returns a valid `LaunchRecord`,
+- inspect maps backend state to `starting`, `running`, exited zero, exited nonzero, timed out, cancelled, and unknown,
+- stale `run.json`, stale unit evidence, or mismatched launch token is rejected or reported unknown,
+- PID reuse or process start-time mismatch is conservative where the platform exposes enough evidence,
+- elapsed `timeout_at` alone does not authorize blind kill/finalization without verified launch identity,
+- cancellation is idempotent,
+- stdout/stderr/result/metadata paths are respected,
+- backend mismatch or missing backend support is conservative and operator-visible.
+
+### Job wrapper tests
+
+Scope: `issueq job-wrapper` / `internal/jobwrapper` execution contract.
+
+Cover:
+
+- validates existing `context.json`, job ID, and launch token,
+- does not rewrite context,
+- captures stdout/stderr,
+- records exit code, timeout, cancellation, and paths in `run.json`,
+- writes metadata atomically,
+- enforces timeout and kills process group,
+- handles cancellation signals and repeated cancellation,
+- preserves timeout-vs-cancel precedence,
+- parses metadata into `Observation` correctly.
+
+### Workflow tests
+
+Scope: queue/GitHub/job lifecycle decisions using fake store, fake GitHub, and fake supervisor observations.
+
+Cover:
+
+- prepare claimed job writes context and launch spec,
+- ownership checks before `on_start` and terminal side effects,
+- success/failure/cancelled/timeout/unknown observation mapping,
+- cancelled observations skip success/failure/result GitHub actions,
+- result JSON merge and malformed result behavior,
+- stale route and transition/attempt policy,
+- lost ownership drops GitHub actions and finalization,
+- finalization after restart reloads current job/config/issue state and verifies launch token.
+
+### Entrypoint policy tests
+
+Scope: `once`, `dispatch`, and daemon orchestration. Prefer fake workflow/supervisor/clock.
+
+Cover:
 
 - `once` completes a bounded frontier,
 - `dispatch` completes a bounded frontier,
+- bounded commands do not adopt or wait on unrelated stale durable jobs,
 - daemon polls/routes while jobs run,
 - daemon reaps/refills without waiting for poll interval,
-- daemon shutdown cancels/finalizes running jobs,
+- daemon adopts only verified stale-owner durable jobs,
+- unknown durable jobs remain running/operator-visible and do not auto-requeue,
+- daemon shutdown cancels/finalizes owned jobs,
 - heartbeat deletion happens only after clean shutdown,
 - `once --no-wait` remains unsupported until detached supervision is durable.
+
+### End-to-end smokes
+
+Keep E2E tests few and meaningful, using real SQLite plus the wrapper backend:
+
+- local job succeeds,
+- local job fails,
+- timeout kills process tree,
+- daemon shutdown cancels/finalizes owned jobs,
+- daemon restart finalizes a completed wrapper-backed job,
+- wrapper is the operational default after cutover,
+- `once --no-wait` remains unsupported unless durable detached semantics are explicitly implemented.
