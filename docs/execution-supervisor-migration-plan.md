@@ -1,10 +1,22 @@
-# Execution supervisor migration plan
+# Execution supervisor hard-cutover plan
 
-This plan implements `docs/execution-supervisor-spec.md` incrementally. The current C0-C6 concurrency supervision work is the correctness baseline; this migration should simplify architecture without regressing behavior.
+This plan implements `docs/execution-supervisor-spec.md` with a hard cutover to the target architecture. The project is pre-production, has no data compatibility requirement, and may be temporarily broken during refactoring if each committed phase is coherent and reviewed.
+
+The goal is architectural simplification, not compatibility with the current daemon-owned process-handle design. Optimize for clear boundaries:
+
+```text
+internal/workflow     queue, leases, GitHub lifecycle, job state transitions
+internal/supervisor   launch/inspect/cancel execution observations
+internal/jobwrapper   durable wrapper process contract
+internal/daemon       long-lived reconciliation policy
+internal/dispatcher   bounded once/dispatch policy
+```
+
+The attached runner path is only a temporary bridge or test aid. Do not spend effort making attached supervision a polished durable backend. The preferred target backend is the direct wrapper supervisor; systemd remains optional later.
 
 ## Standard gates
 
-Run after each phase unless explicitly scoped smaller:
+Run after each code phase unless explicitly scoped smaller:
 
 ```bash
 gofmt -w .
@@ -21,246 +33,182 @@ Run CLI smokes when entrypoint behavior changes:
 go run ./cmd/issueq --config examples/issueq.yaml config-check
 go run ./cmd/issueq --config examples/issueq.yaml jobs --json
 go run ./cmd/issueq --config examples/issueq.yaml issues --json
-go run ./cmd/issueq --config examples/issueq.yaml once --no-wait # expected unsupported failure
+go run ./cmd/issueq --config examples/issueq.yaml once --no-wait # expected unsupported failure unless explicitly enabled
 ```
 
 Use review subagents after each implementation phase. Commit each phase separately.
 
-## Phase E0 — planning and boundaries
+## Test strategy by boundary
 
-### Goals
+The refactor should move tests toward the same boundaries as the architecture. Avoid giant daemon tests for behavior that belongs to store, workflow, or supervisor contracts.
 
-Document the target architecture and make the intended direction explicit before code changes.
+### Store tests
 
-### Work items
+Scope: SQLite state transitions only. No GitHub and no subprocesses.
 
-- Add `docs/execution-supervisor-spec.md`.
-- Add this migration plan.
-- Cross-reference from future C7 docs if appropriate.
+Cover:
 
-### Tests
+- claim capacity and per-route concurrency,
+- heartbeat insert/update/delete/prune,
+- lease renewal ownership guards,
+- launch-record persistence and launch-state transitions,
+- stale lease requeue for rows without durable launch metadata,
+- stale-owner adoption guards for durable launch metadata,
+- stale-owner-safe unknown marking/reporting,
+- ownership-guarded finalization and lost-ownership errors.
 
-Docs only; run `git diff --check`.
+### Supervisor contract tests
 
-### Commit message
+Scope: `internal/supervisor` behavior. No queue and no GitHub.
+
+Use a shared contract test style where practical for fake, wrapper, and future systemd backends:
+
+- launch returns a valid `LaunchRecord`,
+- inspect `starting`, `running`, exited zero, exited nonzero, timed out, cancelled, and unknown,
+- stale launch token or mismatched metadata is rejected/unknown,
+- cancellation is idempotent,
+- stdout/stderr/result/metadata paths are respected,
+- backend mismatch or missing backend support is conservative.
+
+### Job wrapper tests
+
+Scope: `issueq job-wrapper` / `internal/jobwrapper` execution contract.
+
+Cover:
+
+- validates existing `context.json`, job ID, and launch token,
+- does not rewrite context,
+- captures stdout/stderr,
+- records exit code and paths in `run.json`,
+- writes metadata atomically,
+- enforces timeout and kills process group,
+- handles cancellation signals and repeated cancellation,
+- preserves timeout-vs-cancel precedence.
+
+### Workflow tests
+
+Scope: queue/GitHub/job lifecycle decisions using fake store, fake GitHub, and fake supervisor observations.
+
+Cover:
+
+- prepare claimed job writes context and launch spec,
+- ownership checks before `on_start` and terminal side effects,
+- success/failure/cancelled/timeout/unknown observation mapping,
+- result JSON merge and malformed result behavior,
+- stale route and transition/attempt policy,
+- lost ownership drops GitHub actions and finalization,
+- finalization after restart reloads current job/config/issue state and verifies launch token.
+
+### Entrypoint policy tests
+
+Scope: `once`, `dispatch`, and daemon orchestration. Prefer fake workflow/supervisor/clock.
+
+Cover:
+
+- `once` and `dispatch` drain only a bounded frontier,
+- daemon polls/routes while jobs run,
+- daemon reaps/refills promptly,
+- daemon shutdown cancels owned jobs and deletes heartbeat only after clean cleanup,
+- daemon adopts only verified stale-owner durable jobs,
+- unknown durable jobs remain running/operator-visible and do not auto-requeue,
+- bounded commands do not adopt or wait on unrelated stale durable jobs.
+
+### End-to-end smokes
+
+Keep these few and meaningful, using real SQLite plus wrapper backend:
+
+- local job succeeds,
+- local job fails,
+- timeout kills process tree,
+- daemon shutdown cancels/finalizes owned jobs,
+- daemon restart finalizes a completed wrapper-backed job,
+- `once --no-wait` remains unsupported unless durable detached semantics are explicitly implemented.
+
+## Completed setup phases
+
+### Phase E0 — planning and boundaries
+
+Added the initial execution supervisor spec and migration plan.
+
+Commit:
 
 ```text
-Document execution supervisor refactor plan
+f856a1d Document execution supervisor refactor plan
 ```
 
-## Phase E0a — harden execution supervisor invariants
+### Phase E0a — harden execution supervisor invariants
 
-### Goals
+Added crash-window, launch-token, adoption/requeue/unknown, wrapper/systemd, and restart-finalization invariants.
 
-Tighten the target docs before implementation so the migration preserves crash/restart safety.
-
-### Work items
-
-- Define a launch transaction/crash-window protocol.
-- Make per-launch identity (`launch_token`/run ID) mandatory for durable backends.
-- Clarify adoption versus stale requeue versus unknown-state behavior.
-- Specify wrapper/systemd timeout and cancellation precedence.
-- Clarify backend mismatch behavior on restart.
-- Split DB-driven attached reconciliation from true durable adoption work.
-
-### Tests
-
-Docs only; run `git diff --check`.
-
-### Commit message
+Commit:
 
 ```text
-Harden execution supervisor migration invariants
+266dc21 Harden execution supervisor migration invariants
 ```
 
-## Phase E1 — extract shared workflow primitives
+## Phase H1 — establish target packages and interfaces
 
 ### Goals
 
-Separate queue/GitHub workflow operations from daemon and dispatch loop policy without changing behavior.
+Create the architectural seams early, without trying to preserve the old attached design as a polished abstraction.
 
 ### Work items
 
-- Extract primitives from `internal/dispatcher/dispatcher.go` and `internal/daemon/daemon.go` for:
-  - heartbeat,
-  - expired lease recovery,
-  - stale heartbeat pruning,
-  - claim one eligible job,
-  - prepare claimed job GitHub lifecycle,
-  - launch claimed job,
-  - reap/finalize observed result,
-  - cancel owned jobs.
-- Keep current attached runner implementation behind these primitives.
-- Preserve `once`, `dispatch`, and daemon observable behavior.
-- Add focused tests for extracted primitives where they are not already covered.
-
-### Tests
-
-- Existing dispatcher and daemon tests.
-- Standard gates.
-- Daemon stress subset.
-
-### Commit message
-
-```text
-Extract shared queue workflow primitives
-```
-
-## Phase E2 — introduce execution supervisor interface
-
-### Goals
-
-Create the backend-neutral supervisor abstraction from the spec and adapt current attached execution to it.
-
-### Work items
-
-- Add package, e.g. `internal/executor` or `internal/supervisor`.
-- Define:
+- Add `internal/supervisor` with:
   - `LaunchSpec`,
   - `LaunchRecord`,
   - `Observation`,
   - `RunState`,
   - `CancelReason`,
   - `Supervisor` interface.
-- Implement `AttachedSupervisor` using current `runner.Start`, `runner.Wait`, and cancellation behavior.
-- Keep any live process-handle map private to `AttachedSupervisor`.
-- Convert dispatcher/daemon workflow code to depend on the interface, not directly on `runner.Handle`.
-- Keep GitHub lifecycle and queue ownership logic outside the supervisor backend.
+- Add `internal/workflow` package skeleton for queue/GitHub lifecycle primitives.
+- Move or wrap current dispatcher/daemon workflow operations behind initial workflow functions:
+  - heartbeat,
+  - recover expired leases,
+  - prune stale heartbeats,
+  - claim one eligible job,
+  - prepare claimed job,
+  - finalize observation,
+  - cancel owned job.
+- Add a minimal attached supervisor adapter only as a bridge so existing commands can compile while wrapper support is built. Keep it small and mark it temporary; do not make it a durable backend.
+- Add a simple fake supervisor for workflow/daemon tests.
+- Keep current command behavior as much as practical, but do not over-invest in attached backend polish.
 
 ### Tests
 
-- Unit tests for `AttachedSupervisor` launch/inspect/cancel behavior.
-- Existing runner tests should remain.
-- Existing dispatcher/daemon tests should remain green.
+- Compile-time package boundary checks through existing tests.
+- Initial workflow tests around observation-to-status mapping and ownership-drop behavior.
 - Standard gates.
 
 ### Commit message
 
 ```text
-Introduce execution supervisor interface
+Establish execution workflow boundaries
 ```
 
-## Phase E3 — persist backend-neutral launch records
+## Phase H2 — implement durable job wrapper contract
 
 ### Goals
 
-Move toward DB-driven running-job reconciliation by storing launch metadata durably.
+Build the target execution primitive early so later daemon simplification is based on the real durable backend, not the old in-memory handle model.
 
 ### Work items
 
-- Add idempotent SQLite migration for required fields such as:
-  - `supervisor_kind`,
-  - `supervisor_id`,
-  - `launch_token`,
-  - `launch_state`,
-  - `pgid`,
-  - `process_started_at`,
-  - `run_metadata_path`,
-  - `timeout_at`.
-- Extend `model.Job`, scan paths, JSON output, and tests.
-- Add ownership-guarded store method to persist launch records.
-- Update current attached backend path to populate as much launch data as possible.
-- Keep backward compatibility for rows without launch metadata.
-
-### Tests
-
-- SQLite migration and scan/list tests.
-- Ownership guard tests for launch-record persistence.
-- Standard gates.
-
-### Commit message
-
-```text
-Persist durable job launch records
-```
-
-## Phase E4a — reconcile attached running jobs from durable state
-
-### Goals
-
-Make daemon capacity and owned-running scans DB-driven while acknowledging that the current attached backend is not durably inspectable after daemon crash.
-
-### Work items
-
-- Add store helpers:
-  - list running jobs owned by runner instance,
-  - count running jobs globally/per route,
-  - list launch records needing inspection for the current owner,
-  - possibly mark unknown launch state.
-- Change daemon reap/refill policy to:
-  - inspect owned running DB rows through the attached supervisor when live handles exist,
-  - finalize completed observations,
-  - launch only when DB-derived capacity exists.
-- Keep `once`/`dispatch` bounded frontier semantics by tracking frontier job IDs, not live handles.
-- Ensure expired lease recovery uses DB active rows and heartbeat policy, while retaining attached-backend compatibility for live active IDs.
-- Document that attached rows cannot truly inspect/adopt jobs after daemon crash; because attached launch records are not durable detached supervision metadata, they fall back to stale lease recovery.
-
-### Tests
-
-- Concurrent capacity tests using DB running counts.
-- Existing C6 daemon tests.
-- Standard gates.
-
-### Commit message
-
-```text
-Reconcile attached jobs from durable launch state
-```
-
-## Phase E4b — add durable adoption primitives behind fake backend
-
-### Goals
-
-Implement and test the store-level adoption/unknown-state rules before real wrapper/systemd backends depend on them.
-
-### Work items
-
-- Add store helpers:
-  - list stale-owner running jobs with durable launch metadata,
-  - atomically adopt stale running jobs after read-only backend verification,
-  - mark/report unknown launch state without automatic requeue; any DB mutation for stale-owner unknown rows must use a stale-owner-safe guard and must not imply ownership transfer, cancellation, finalization, or GitHub side effects.
-- Add fake durable supervisor tests for:
-  - verified completed metadata adoption/finalization,
-  - verified still-running adoption/renewal,
-  - durable metadata with unverifiable identity remaining running/unknown,
-  - no durable launch metadata following stale lease requeue semantics.
-- Ensure reconciliation dispatches by persisted `supervisor_kind`, not only configured default backend.
-
-### Tests
-
-- Store adoption and unknown-state tests.
-- Daemon restart/recovery tests using fake durable supervisor.
-- Standard gates.
-
-### Commit message
-
-```text
-Add durable job adoption primitives
-```
-
-## Phase E5 — implement job-wrapper command and metadata contract
-
-### Goals
-
-Add the stable wrapper contract without making it the default backend yet.
-
-### Work items
-
-- Add hidden/internal CLI subcommand, e.g. `issueq job-wrapper`, or an internal helper entrypoint.
-- Define wrapper spec input format, including job ID, launch token, command, env, workdir, paths, and timeout.
-- Validate the existing `context.json` written by the workflow layer before launch.
-- Start user command in a process group.
+- Add hidden/internal CLI subcommand, e.g. `issueq job-wrapper`.
+- Add `internal/jobwrapper` with launch-spec parsing and metadata writing.
+- Define wrapper spec input format with job ID, launch token, command, env, workdir, paths, and timeout.
+- Validate existing `context.json` before launch.
+- Start the user command in a process group.
 - Redirect stdout/stderr to configured files.
-- Enforce timeout.
-- Kill process group on timeout/cancellation.
+- Enforce timeout and kill process group.
+- Handle cancellation signals deterministically.
 - Write `run.json` atomically.
-- Add metadata parser and mapper to `Observation`.
+- Add metadata parser and mapper to `supervisor.Observation`.
 
 ### Tests
 
-- Wrapper success, failure, timeout, cancellation.
-- Metadata atomic write/parse tests.
-- Process-tree killing tests where practical.
+- Job wrapper tests for success, failure, timeout, cancellation, metadata validation, metadata atomic write/parse, and process-tree killing where practical.
+- Supervisor metadata mapping tests.
 - Standard gates.
 
 ### Commit message
@@ -269,31 +217,81 @@ Add the stable wrapper contract without making it the default backend yet.
 Add durable job wrapper execution contract
 ```
 
-## Phase E6 — add direct wrapper supervisor backend
+## Phase H3 — add durable launch schema and store primitives
 
 ### Goals
 
-Run jobs through `issueq job-wrapper` directly and inspect durable metadata/PID state.
+Make SQLite able to represent the target running set and launch crash-window protocol. Since there is no production data, prioritize a clean schema over elaborate compatibility.
 
 ### Work items
 
-- Implement `WrapperSupervisor`.
-- Launch wrapper as child process.
-- Record wrapper PID/PGID/process fingerprint, launch token, and metadata path.
-- Inspect:
-  - `run.json` if present,
-  - process existence if metadata absent,
-  - timeout deadline,
-  - unknown state conservatively.
-- Cancel wrapper/user process group.
-- Add config to select backend, initially defaulting to attached unless intentionally changed.
+- Add or reset idempotent schema support for required launch fields:
+  - `supervisor_kind`,
+  - `supervisor_id`,
+  - `launch_token`,
+  - `launch_state`,
+  - `pid`,
+  - `pgid`,
+  - `process_started_at`,
+  - `run_metadata_path`,
+  - `launch_spec_path` or equivalent durable launch-spec storage,
+  - `context_path`,
+  - `result_path`,
+  - `stdout_path`,
+  - `stderr_path`,
+  - `timeout_at`.
+- Extend `model.Job`, scan paths, list/JSON output, and tests.
+- Add store helpers for:
+  - ownership-guarded launch spec persistence, either as a spec file path stored in SQLite or as equivalent durable fields sufficient to reconstruct/verify launch identity,
+  - ownership-guarded transition to `launching`,
+  - ownership-guarded launch record persistence and transition to `running`,
+  - listing owned running jobs,
+  - counting running jobs globally/per route,
+  - listing stale-owner durable jobs,
+  - atomic adoption after read-only verification,
+  - stale-owner-safe unknown marking/reporting,
+  - stale lease requeue only for rows without durable detached launch metadata.
+- Add indexes for running scans, owner scans, route capacity, timeout scans, and stale recovery.
 
 ### Tests
 
+- Store tests for schema, launch-state transitions, adoption guards, unknown marking, capacity counts, stale lease requeue, and ownership failures.
+- Standard gates.
+
+### Commit message
+
+```text
+Add durable launch store primitives
+```
+
+## Phase H4 — implement direct wrapper supervisor backend
+
+### Goals
+
+Launch jobs through `issueq job-wrapper` directly and expose durable observations from metadata/PID state.
+
+### Work items
+
+- Implement `supervisor.WrapperSupervisor`.
+- Launch wrapper without daemon-context parent-death cancellation.
+- Record wrapper PID/PGID/process fingerprint, launch token, and metadata path.
+- Inspect:
+  - valid matching `run.json`,
+  - process existence/fingerprint if metadata is absent,
+  - timeout deadline,
+  - startup grace,
+  - unknown state conservatively.
+- Cancel wrapper/user process group with graceful-then-force behavior.
+- Add config selection for execution supervisor, but keep the operational default on the existing attached path until H5 rewrites entrypoints around durable reconciliation. H4 may expose wrapper through tests or an explicit experimental config only.
+- Keep attached runner only as temporary compatibility/test code if still needed.
+
+### Tests
+
+- Supervisor contract tests against wrapper backend.
 - Backend launch/inspect/cancel tests.
-- Daemon running multiple wrapper-backed jobs.
-- Daemon restart/recovery with wrapper metadata.
-- Standard gates and smokes.
+- Stale launch token and stale metadata tests.
+- Test that elapsed `timeout_at` alone does not authorize blind kill/finalization when launch identity or process termination cannot be verified; such rows remain unknown/operator-visible.
+- Standard gates and CLI smokes.
 
 ### Commit message
 
@@ -301,18 +299,91 @@ Run jobs through `issueq job-wrapper` directly and inspect durable metadata/PID 
 Add direct wrapper supervisor backend
 ```
 
-## Phase E7 — add systemd supervisor backend
+## Phase H5 — rewrite workflow and entrypoints around durable reconciliation
 
 ### Goals
 
-Provide optional systemd transient unit supervision using the same wrapper contract.
+Move daemon, `once`, and `dispatch` onto workflow primitives plus supervisor observations. This is the main simplification phase.
+
+### Work items
+
+- Implement workflow primitives for:
+  - heartbeat/recovery/pruning,
+  - claim and prepare job,
+  - launch transaction protocol,
+  - inspect/finalize owned running jobs,
+  - stale-owner verification/adoption,
+  - per-row backend dispatch using persisted `supervisor_kind`, including unavailable-backend handling as unknown/operator-visible,
+  - timeout/cancel handling,
+  - GitHub lifecycle side effects with ownership checks.
+- Rewrite daemon as a DB reconciler:
+  - heartbeat,
+  - poll/route cadence,
+  - inspect owned running rows,
+  - adopt verified stale-owner durable rows,
+  - finalize completed observations,
+  - mark/report unknown durable rows conservatively,
+  - recover stale non-durable rows,
+  - claim/launch by DB-derived capacity,
+  - shutdown cleanup with heartbeat deletion only after success.
+- Rewrite `once` and `dispatch` as bounded frontier policies using the same workflow primitives.
+- Switch new launches and default config to the wrapper supervisor after durable reconciliation paths are in place.
+- Keep `once --no-wait` unsupported unless durable detached semantics are explicitly completed.
+- Remove or bypass daemon-owned active process map logic.
+
+### Tests
+
+- Workflow tests with fake store/GitHub/supervisor for success, failure, timeout, cancelled, unknown, result JSON, stale route, transition/attempt limits, lost ownership, and restart finalization.
+- Entrypoint policy tests for bounded frontier, daemon poll responsiveness, reap/refill, adoption, unknown, and shutdown cleanup.
+- E2E smokes with real SQLite plus wrapper backend, including verification that wrapper is the operational default for new launches.
+- Standard gates.
+
+### Commit message
+
+```text
+Rewrite execution around durable reconciliation
+```
+
+## Phase H6 — delete obsolete attached-handle architecture
+
+### Goals
+
+Remove old complexity after wrapper-backed reconciliation is working.
+
+### Work items
+
+- Delete obsolete daemon active-map/process-handle plumbing.
+- Delete or reduce attached supervisor/runner compatibility code not needed for tests.
+- Simplify dispatcher/daemon tests that only existed for old internals.
+- Tighten package boundaries so workflow does not depend on process handles and supervisor does not depend on GitHub/queue policy.
+- Run race tests for daemon/workflow/supervisor packages if practical.
+
+### Tests
+
+- Full standard gates.
+- Daemon/workflow/supervisor targeted tests.
+- Manual local smoke with wrapper backend.
+- `go test -race` for targeted packages if practical.
+
+### Commit message
+
+```text
+Remove attached process supervision plumbing
+```
+
+## Phase H7 — optional systemd backend
+
+### Goals
+
+Provide optional transient unit supervision using the same wrapper contract. This is not required for the core simplification.
 
 ### Work items
 
 - Implement `SystemdSupervisor`.
-- Launch wrapper via `systemd-run` transient units.
+- Launch wrapper via `systemd-run` transient units named with job ID plus launch token.
 - Record unit name as `supervisor_id`.
-- Inspect unit state via documented systemd CLI/DBus path; map to `Observation` plus wrapper metadata.
+- Inspect unit state via documented systemd CLI/DBus path and wrapper metadata.
+- Treat missing unit plus missing/invalid metadata as `RunUnknown`.
 - Cancel via `systemctl stop/kill`.
 - Add config selection, e.g. `execution.supervisor: systemd`.
 - Ensure absence of systemd yields clear validation/runtime error.
@@ -329,47 +400,17 @@ Provide optional systemd transient unit supervision using the same wrapper contr
 Add systemd execution supervisor backend
 ```
 
-## Phase E8 — simplify daemon and dispatch internals
+## Phase H8 — docs and final E2E readiness
 
 ### Goals
 
-Remove obsolete attached active-map complexity from daemon/workflow once durable supervisor backends cover required behavior.
-
-### Work items
-
-- Make daemon a clear reconciler over DB rows and supervisor observations.
-- Keep `AttachedSupervisor` only as a compatibility/test backend or remove it if no longer needed.
-- Delete obsolete helpers that mix GitHub lifecycle and process handles.
-- Tighten docs around backend selection and operational tradeoffs.
-
-### Tests
-
-- Full standard gates.
-- Daemon stress tests.
-- Manual smoke with selected default backend.
-- If practical, race tests for daemon/supervisor packages.
-
-### Commit message
-
-```text
-Simplify daemon around durable execution supervision
-```
-
-## Phase E9 — final docs and E2E readiness
-
-### Goals
-
-Prepare the refactored architecture for final manual E2E.
+Document the simplified architecture and prepare for final manual E2E.
 
 ### Work items
 
 - Update README and `docs/v1-spec.md` where user-visible behavior/config changed.
 - Update `docs/v1-implementation-plan.md` Phase 9 status notes.
-- Document backend tradeoffs:
-  - attached,
-  - wrapper,
-  - systemd.
-- Document restart/shutdown recovery behavior.
+- Document wrapper backend behavior, restart recovery, shutdown cleanup, unknown-state operator expectations, and optional systemd tradeoffs.
 - Document why `once --no-wait` remains unsupported or define precise criteria for enabling it.
 
 ### Tests
@@ -381,5 +422,5 @@ Prepare the refactored architecture for final manual E2E.
 ### Commit message
 
 ```text
-Document execution supervisor backend behavior
+Document durable execution supervisor behavior
 ```

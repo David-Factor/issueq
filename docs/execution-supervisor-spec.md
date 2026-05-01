@@ -1,6 +1,6 @@
 # Execution supervisor architecture spec
 
-This document defines the target architecture for simplifying issueq's concurrent job execution while preserving durable local queue semantics and GitHub lifecycle correctness.
+This document defines the target architecture for simplifying issueq's concurrent job execution while preserving durable local queue semantics and GitHub lifecycle correctness. Because the project is still pre-production, the migration may hard-cut over to cleaner boundaries instead of preserving every intermediate implementation shape.
 
 It supersedes the implementation shape in `docs/concurrency-supervision-design.md` where the daemon directly owns live Go subprocess handles. That design remains the current baseline; this spec describes the next refactor direction.
 
@@ -12,9 +12,9 @@ It supersedes the implementation shape in `docs/concurrency-supervision-design.m
 - Move child-process supervision behind a small execution-supervisor abstraction.
 - Support a stable `issueq job-wrapper` execution contract.
 - Allow multiple launch backends:
-  - current attached Go process supervision during migration,
-  - direct wrapper process supervision,
-  - systemd transient units running the wrapper.
+  - direct wrapper process supervision as the preferred default,
+  - systemd transient units running the wrapper as an optional backend,
+  - current attached Go process supervision only as a temporary migration/test bridge.
 - Keep daemon logic as a reconciler over durable state, not an owner of complex in-memory process maps.
 - Preserve existing GitHub lifecycle safeguards: ownership checks before side effects, stale route checks, attempt/transition limits, result action handling, and stale owner drops.
 - Preserve graceful shutdown behavior: stop claiming new work, cancel owned running jobs, finalize while ownership is held, and delete heartbeat only after cleanup succeeds.
@@ -260,7 +260,7 @@ Cancelled observations skip GitHub success/failure/result actions and finalize a
 
 ### Attached supervisor backend
 
-The attached backend wraps the current Go `runner.Start` / `runner.Wait` behavior. It is primarily a migration bridge.
+The attached backend wraps the current Go `runner.Start` / `runner.Wait` behavior. It is a temporary migration bridge and test aid, not the preferred long-term architecture.
 
 Properties:
 
@@ -269,7 +269,7 @@ Properties:
 - supports current tests and behavior,
 - should not leak live handles into daemon/workflow code.
 
-This backend can preserve existing behavior while the workflow primitives are extracted.
+This backend can preserve existing behavior during early refactor phases, but should be removed or minimized once wrapper-backed reconciliation works.
 
 ### Wrapper supervisor backend
 
