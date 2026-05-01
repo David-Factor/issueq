@@ -115,7 +115,7 @@ func TestFinalizeOwnedObservationSkipsNonWrapperOrIncompleteRows(t *testing.T) {
 		name string
 		edit func(*model.Job)
 	}{
-		{name: "attached", edit: func(j *model.Job) { j.SupervisorKind = supervisor.KindAttached }},
+		{name: "attached", edit: func(j *model.Job) { j.SupervisorKind = "attached" }},
 		{name: "missing launch token", edit: func(j *model.Job) { j.LaunchToken = "" }},
 		{name: "missing durable evidence", edit: func(j *model.Job) { j.SupervisorID = ""; j.PID = 0; j.RunMetadataPath = "" }},
 		{name: "non running", edit: func(j *model.Job) { j.Status = model.JobStatusPending }},

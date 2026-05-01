@@ -68,7 +68,7 @@ func TestDurableLaunchRecordRejectsUnsupportedOrIncompleteRows(t *testing.T) {
 	}{
 		{name: "non running", edit: func(j *model.Job) { j.Status = model.JobStatusPending }},
 		{name: "blank supervisor kind", edit: func(j *model.Job) { j.SupervisorKind = "" }},
-		{name: "attached", edit: func(j *model.Job) { j.SupervisorKind = supervisor.KindAttached }},
+		{name: "attached", edit: func(j *model.Job) { j.SupervisorKind = "attached" }},
 		{name: "systemd", edit: func(j *model.Job) { j.SupervisorKind = supervisor.KindSystemd }},
 		{name: "missing launch token", edit: func(j *model.Job) { j.LaunchToken = "" }},
 		{name: "preparing", edit: func(j *model.Job) { j.LaunchState = model.LaunchStatePreparing }},
@@ -94,7 +94,7 @@ func TestDurableLaunchRecordRejectsUnsupportedOrIncompleteRows(t *testing.T) {
 
 func TestInspectDurableJobReturnsUnknownWithoutBackendForUnsupportedRows(t *testing.T) {
 	job := durableWrapperJob("job-1")
-	job.SupervisorKind = supervisor.KindAttached
+	job.SupervisorKind = "attached"
 	fake := &supervisor.Fake{NextObservation: supervisor.Observation{State: supervisor.RunRunning}}
 
 	obs, err := InspectDurableJob(context.Background(), fake, job)
@@ -142,7 +142,7 @@ func TestInspectDurableJobCallsBackendForWrapperRows(t *testing.T) {
 func TestObserveOwnedRunningJobsListsAndObservesInOrder(t *testing.T) {
 	valid := durableWrapperJob("job-1")
 	unsupported := durableWrapperJob("job-2")
-	unsupported.SupervisorKind = supervisor.KindAttached
+	unsupported.SupervisorKind = "attached"
 	fake := &supervisor.Fake{NextObservation: supervisor.Observation{State: supervisor.RunRunning}}
 	lister := &fakeOwnedRunningLister{jobs: []model.Job{valid, unsupported}}
 

@@ -7,9 +7,8 @@ import (
 )
 
 const (
-	KindAttached = "attached"
-	KindWrapper  = "wrapper"
-	KindSystemd  = "systemd"
+	KindWrapper = "wrapper"
+	KindSystemd = "systemd"
 )
 
 type LaunchSpec struct {
