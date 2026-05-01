@@ -50,6 +50,7 @@ func (s *Supervisor) LaunchJob(ctx context.Context, spec JobLaunchSpec) (supervi
 	return supervisor.LaunchRecord{
 		Kind:        supervisor.KindAttached,
 		ID:          id,
+		JobID:       spec.Job.ID,
 		LaunchToken: spec.LaunchToken,
 		PID:         handle.PID,
 		StartedAt:   handle.StartedAt,

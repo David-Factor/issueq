@@ -24,17 +24,20 @@ type LaunchSpec struct {
 	StderrPath   string
 	MetadataPath string
 	Timeout      time.Duration
+	SpecPath     string
 }
 
 type LaunchRecord struct {
-	Kind         string
-	ID           string
-	LaunchToken  string
-	PID          int
-	PGID         int
-	MetadataPath string
-	StartedAt    time.Time
-	TimeoutAt    time.Time
+	Kind             string
+	ID               string
+	JobID            string
+	LaunchToken      string
+	PID              int
+	PGID             int
+	ProcessStartedAt time.Time
+	MetadataPath     string
+	StartedAt        time.Time
+	TimeoutAt        time.Time
 }
 
 type RunState string

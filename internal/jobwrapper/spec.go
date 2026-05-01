@@ -160,7 +160,10 @@ func LoadMetadata(path string) (Metadata, error) {
 }
 
 func ObservationFromMetadata(metadata Metadata, expectedJobID, expectedLaunchToken string) supervisor.Observation {
-	if metadata.JobID != expectedJobID || metadata.LaunchToken != expectedLaunchToken {
+	if expectedJobID != "" && metadata.JobID != expectedJobID {
+		return supervisor.Observation{State: supervisor.RunUnknown, Error: "metadata launch identity mismatch"}
+	}
+	if metadata.LaunchToken != expectedLaunchToken {
 		return supervisor.Observation{State: supervisor.RunUnknown, Error: "metadata launch identity mismatch"}
 	}
 	obs := supervisor.Observation{
