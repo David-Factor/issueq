@@ -1,0 +1,436 @@
+# Execution supervisor architecture spec
+
+This document defines the target architecture for simplifying issueq's concurrent job execution while preserving durable local queue semantics and GitHub lifecycle correctness.
+
+It supersedes the implementation shape in `docs/concurrency-supervision-design.md` where the daemon directly owns live Go subprocess handles. That design remains the current baseline; this spec describes the next refactor direction.
+
+## Goals
+
+- Keep configured concurrency: more than one job may run at a time.
+- Make SQLite the durable source of truth for queued and running work.
+- Share workflow primitives between `once`, `dispatch`, and `daemon`.
+- Move child-process supervision behind a small execution-supervisor abstraction.
+- Support a stable `issueq job-wrapper` execution contract.
+- Allow multiple launch backends:
+  - current attached Go process supervision during migration,
+  - direct wrapper process supervision,
+  - systemd transient units running the wrapper.
+- Keep daemon logic as a reconciler over durable state, not an owner of complex in-memory process maps.
+- Preserve existing GitHub lifecycle safeguards: ownership checks before side effects, stale route checks, attempt/transition limits, result action handling, and stale owner drops.
+- Preserve graceful shutdown behavior: stop claiming new work, cancel owned running jobs, finalize while ownership is held, and delete heartbeat only after cleanup succeeds.
+
+## Non-goals
+
+- Removing SQLite.
+- Replacing SQLite with ZeroMQ or another messaging layer.
+- Requiring systemd for all installations.
+- Supporting cross-host distributed execution beyond the SQLite ownership/heartbeat model.
+- Re-enabling `once --no-wait` before durable detached supervision is fully implemented.
+- Perfect portable PID-only supervision without a wrapper or OS supervisor.
+
+## Core idea
+
+Separate issueq into three layers:
+
+```text
+workflow/queue layer
+  poll GitHub
+  route issues
+  claim jobs
+  apply lifecycle actions
+  finalize jobs
+
+execution supervisor layer
+  launch job execution
+  inspect launched work
+  cancel launched work
+  expose durable run observations
+
+entrypoint/policy layer
+  once
+  dispatch
+  daemon
+```
+
+The workflow layer decides *what should happen* to jobs. The execution layer decides *how a command is launched, observed, and cancelled*. Entrypoints compose shared primitives with different loop policies.
+
+## Shared workflow primitives
+
+The following operations should become explicit package-level primitives. Names are illustrative.
+
+```go
+PollIssues(ctx, cfg, gh, queue) (poller.Result, error)
+RouteIssues(ctx, cfg, queue) (router.Result, error)
+HeartbeatRunner(ctx, queue, identity) error
+RecoverExpiredLeases(ctx, queue, identity, activeIDs) (int, error)
+PruneStaleHeartbeats(ctx, queue, before) (int, error)
+ClaimOne(ctx, cfg, queue, identity, limits) (*model.Job, error)
+PrepareClaimedJob(ctx, cfg, queue, gh, identity, job) (PreparedJob, ClaimOutcome, error)
+LaunchPreparedJob(ctx, supervisor, prepared) (LaunchRecord, error)
+InspectOwnedRunning(ctx, supervisor, job) (Observation, error)
+FinalizeObservation(ctx, cfg, queue, gh, identity, job, obs) error
+CancelOwnedJob(ctx, supervisor, job, cause) error
+DeleteHeartbeatAfterCleanShutdown(ctx, queue, identity) error
+```
+
+The current dispatcher code contains many of these concerns already, but they are coupled to attached child handles and daemon loop behavior. The refactor should make them separately testable.
+
+## Entry point policies
+
+### `issueq once`
+
+`once` remains a bounded reconciliation wave:
+
+1. heartbeat runner,
+2. recover safely reclaimable expired work,
+3. poll GitHub,
+4. route issues,
+5. capture the initial eligible frontier,
+6. claim and launch jobs from that frontier up to capacity,
+7. inspect/reap/release/renew until the frontier is drained and jobs launched by this wave are finalized,
+8. return.
+
+`once` should not wait forever for future jobs created after the wave frontier is captured.
+
+### `issueq dispatch`
+
+`dispatch` is the same bounded wave without poll/route. It should share the same claim/launch/inspect/finalize primitives as `once` and daemon.
+
+### `issueq daemon`
+
+Daemon is a long-lived reconciler:
+
+1. maintain runner heartbeat,
+2. poll/route on cadence,
+3. inspect running jobs owned by the current runner frequently,
+4. adopt safely recoverable stale-owner jobs when durable launch metadata allows it,
+5. finalize completed jobs,
+6. cancel timed-out jobs,
+7. recover safely reclaimable expired leases,
+8. claim and launch new work when capacity is available,
+9. shut down by cancelling owned running jobs and finalizing them with a bounded cleanup context.
+
+Daemon should not be implemented as `for { Once(); sleep(...) }`, because a bounded wave can block poll/route/heartbeat/renew behind long-running work. Daemon and `once` should share primitives, not call each other as black boxes.
+
+## Durable running state
+
+The target design should move active execution state into SQLite as much as possible. A running job should carry enough durable launch information for a later daemon process to inspect, cancel, or recover it.
+
+Add or evolve job fields similar to:
+
+```text
+supervisor_kind       attached | wrapper | systemd
+supervisor_id         backend-specific ID: unit name, wrapper pid, etc.
+pid                   observed process/wrapper pid, if available
+pgid                  process group id, if available
+run_metadata_path     path to run.json / wrapper metadata
+timeout_at            wall-clock timeout deadline
+context_path          context JSON path
+result_path           command result JSON path
+stdout_path           stdout log path
+stderr_path           stderr log path
+```
+
+`status = running` plus durable launch metadata is the daemon's observable active set. Jobs owned by the current `runner_instance_id` may be renewed, inspected, cancelled, and finalized directly. Jobs owned by another runner instance require the adoption policy below before any ownership-guarded mutation.
+
+In-memory state may still exist for an attached migration backend, but daemon policy should increasingly reconcile from DB rows rather than from an active handle map.
+
+## Execution supervisor interface
+
+The workflow layer talks to a backend-neutral interface:
+
+```go
+type Supervisor interface {
+    Launch(context.Context, LaunchSpec) (LaunchRecord, error)
+    Inspect(context.Context, LaunchRecord) (Observation, error)
+    Cancel(context.Context, LaunchRecord, CancelReason) error
+}
+```
+
+Suggested data types:
+
+```go
+type LaunchSpec struct {
+    JobID       string
+    Command     []string
+    Env         []string
+    Workdir     string
+    ContextPath string
+    ResultPath  string
+    StdoutPath  string
+    StderrPath  string
+    MetadataPath string
+    Timeout     time.Duration
+}
+
+type LaunchRecord struct {
+    Kind         string // attached, wrapper, systemd
+    ID           string // handle id, wrapper pid, unit name, etc.
+    PID          int
+    PGID         int
+    MetadataPath string
+    StartedAt    time.Time
+    TimeoutAt    time.Time
+}
+
+type RunState string
+
+const (
+    RunStarting  RunState = "starting"
+    RunRunning   RunState = "running"
+    RunExited    RunState = "exited"
+    RunFailed    RunState = "failed"
+    RunTimedOut  RunState = "timed_out"
+    RunCancelled RunState = "cancelled"
+    RunUnknown   RunState = "unknown"
+)
+
+type Observation struct {
+    State       RunState
+    ExitCode    int
+    HasExitCode bool
+    Error       string
+    StartedAt   time.Time
+    FinishedAt  time.Time
+    ResultPath   string
+    StdoutPath   string
+    StderrPath   string
+}
+```
+
+The workflow layer maps `Observation` to issueq job statuses:
+
+```text
+RunExited + exit 0      -> succeeded
+RunExited + nonzero     -> failed
+RunFailed               -> failed
+RunTimedOut             -> failed, timed_out message
+RunCancelled            -> cancelled
+RunUnknown              -> keep running or recover by lease/heartbeat policy
+```
+
+Cancelled observations skip GitHub success/failure/result actions and finalize as `cancelled` while ownership is held.
+
+## Backends
+
+### Attached supervisor backend
+
+The attached backend wraps the current Go `runner.Start` / `runner.Wait` behavior. It is primarily a migration bridge.
+
+Properties:
+
+- launches user command from the daemon/once process,
+- stores process handles in backend-private memory,
+- supports current tests and behavior,
+- should not leak live handles into daemon/workflow code.
+
+This backend can preserve existing behavior while the workflow primitives are extracted.
+
+### Wrapper supervisor backend
+
+The wrapper backend launches `issueq job-wrapper` directly as a child process. The wrapper owns the user command execution and writes durable run metadata.
+
+For durable crash recovery, the wrapper must be launched so it can outlive daemon crashes without receiving an accidental parent-death cancellation. The backend should record enough identity to verify the wrapper/process later, e.g. PID plus process start time or PGID plus metadata path. If the platform cannot provide safe identity verification, recovery must treat the launch state as unknown rather than killing/finalizing by PID alone.
+
+Properties:
+
+- daemon records wrapper PID/PGID/metadata path,
+- wrapper starts the user command in its own process group,
+- wrapper redirects stdout/stderr to configured files,
+- wrapper waits on the command and records exit status,
+- wrapper enforces timeout or responds to cancellation,
+- daemon inspects PID/PGID plus metadata file,
+- cancellation should first signal the wrapper/process group, wait a short grace period, then force-kill if needed; if the wrapper is killed before writing `run.json`, inspection should report cancelled/timed-out from durable daemon state where ownership is held.
+
+This backend is the preferred portable long-term default if systemd is not required.
+
+### Systemd supervisor backend
+
+The systemd backend launches the same wrapper under a transient systemd unit:
+
+```text
+systemd-run --unit issueq-job-<jobID> --property=KillMode=control-group --property=RuntimeMaxSec=<timeout> --property=CollectMode=inactive-or-failed ... issueq job-wrapper ...
+```
+
+Unit names must be sanitized and collision-resistant, e.g. include the job ID and a short launch token. The backend should request cleanup/collection where supported and should define stop/kill grace behavior consistently with wrapper cancellation.
+
+Properties:
+
+- systemd owns process lifetime, cgroups, and process-tree killing,
+- daemon records unit name as `supervisor_id`,
+- inspect maps systemd unit state plus wrapper metadata to `Observation`,
+- cancel stops/kills the unit,
+- still uses wrapper metadata for issueq-specific exit/result semantics.
+
+Systemd is a backend, not the core architecture. Core workflow should depend only on the `Supervisor` interface and issueq observation states.
+
+## Job wrapper contract
+
+`issueq job-wrapper` is the stable execution contract for wrapper and systemd backends.
+
+Responsibilities:
+
+1. receive a launch spec via args or a spec file,
+2. validate an existing `context.json` written by the workflow layer before launch,
+3. open stdout/stderr log files,
+4. start the user command in its own process group,
+5. wait for completion,
+6. enforce timeout or handle cancellation signal,
+7. kill process group on timeout/cancellation,
+8. write run metadata atomically.
+
+Suggested metadata file, e.g. `run.json`:
+
+```json
+{
+  "version": 1,
+  "job_id": "job_...",
+  "pid": 1234,
+  "pgid": 1234,
+  "started_at": "2026-01-01T00:00:00Z",
+  "finished_at": "2026-01-01T00:01:00Z",
+  "exit_code": 0,
+  "timed_out": false,
+  "cancelled": false,
+  "error": "",
+  "context_path": ".../context.json",
+  "result_path": ".../result.json",
+  "stdout_path": ".../stdout.log",
+  "stderr_path": ".../stderr.log"
+}
+```
+
+`context.json` has one authoritative writer: the workflow layer prepares it before launch. The wrapper validates that the path exists and matches the requested job ID, but does not rewrite it. This avoids races between DB launch-record persistence and wrapper startup.
+
+The wrapper must write metadata atomically, e.g. write `run.json.tmp`, fsync/close as practical, then rename to `run.json`.
+
+## Concurrency model
+
+Concurrency is determined by durable running jobs:
+
+```text
+capacity = queue.max_global_concurrency - count(status = running)
+route capacity = route.job.concurrency - count(status = running and route_name = route)
+```
+
+A daemon may launch jobs while capacity remains. Each launched job is represented by a running DB row with supervisor launch data.
+
+The daemon may keep small in-flight launch state to avoid double-starting a just-claimed row, but long-lived active execution should be represented durably.
+
+## Ownership and side effects
+
+The ownership rules from `docs/concurrency-supervision-design.md` remain authoritative:
+
+- post-claim mutations are guarded by `runner_instance_id`,
+- lease renewal matches job ID and owner instance,
+- GitHub side effects are preceded by ownership checks/renewals,
+- stale owner writes are dropped rather than converted into command failures,
+- ownership loss prevents stale finalization and GitHub side effects.
+
+The supervisor abstraction must not bypass ownership. Launch record persistence and finalization must be ownership-guarded.
+
+## Adoption, restart, and recovery
+
+Durable wrapper/systemd supervision creates a new case: a job can keep running after the issueq daemon that claimed it has exited. A later daemon must not blindly requeue that job, and it also must not mutate/finalize it while it is still owned by the dead runner instance.
+
+Recovery therefore uses explicit adoption.
+
+### Adoption preconditions
+
+A daemon may adopt a `running` job owned by another `runner_instance_id` only if all are true:
+
+- the job lease is expired,
+- the owner heartbeat is missing or stale,
+- the job has durable supervisor metadata (`supervisor_kind`, `supervisor_id` or metadata path) sufficient for the selected backend to inspect/cancel it,
+- the backend can verify launch identity using read-only evidence before adoption, e.g. completed metadata exists, the systemd unit is known, or the wrapper/process identity is verified.
+
+Rows without durable launch metadata follow the existing stale lease recovery path: requeue only after expired lease plus stale/missing heartbeat. They must not be PID-killed or finalized based on PID alone.
+
+### Adoption operation
+
+Adoption must be an atomic ownership transfer, not a stale-owner write. Add a store method similar to:
+
+```go
+AdoptStaleRunningJob(ctx, jobID string, oldRunnerInstanceID string, newIdentity model.RunnerIdentity, leaseDuration time.Duration) (*model.Job, error)
+```
+
+The update must match:
+
+```text
+id = jobID
+status = running
+runner_instance_id = oldRunnerInstanceID
+lease_until < now
+old heartbeat missing or stale
+```
+
+On success it sets:
+
+```text
+runner_instance_id = newIdentity.InstanceID
+locked_by = newIdentity.RunnerID
+lease_until = now + leaseDuration
+updated_at = now
+```
+
+After adoption, the new daemon may inspect, cancel, renew, or finalize the job through normal ownership-guarded paths.
+
+### Recovery flow
+
+On daemon start and periodically:
+
+- heartbeat current runner instance,
+- inspect and renew running jobs already owned by the current runner instance,
+- for stale-owner jobs with durable launch metadata, attempt atomic adoption before inspection/finalization,
+- after adoption, inspect the backend observation:
+  - completed wrapper/systemd metadata may be finalized,
+  - still-running work may be renewed and left running,
+  - timed-out work may be cancelled and finalized,
+  - unknown launch state should remain running until an explicit operator intervention/stale requeue policy handles it; unknown state may continue to consume configured capacity by design,
+- release/requeue expired jobs only when they are not safely inspectable/adoptable and the owner heartbeat is stale/missing.
+
+This prevents duplicate execution of still-running wrapper/systemd jobs and gives completed detached jobs a safe path to finalization.
+
+## Shutdown behavior
+
+Daemon shutdown policy:
+
+1. stop starting new poll/route/claim/launch work,
+2. cancel owned running jobs via `Supervisor.Cancel`,
+3. inspect/finalize cancelled jobs using a bounded cleanup context derived from `context.Background()`,
+4. keep heartbeat until cleanup succeeds or times out,
+5. delete current heartbeat only after owned active jobs are finalized, skipped due ownership loss, or otherwise safely dropped.
+
+If cleanup fails, heartbeat deletion should be skipped so recovery can distinguish an unclean owner.
+
+## Restart and recovery
+
+Restart behavior is governed by the adoption policy above. The key rule is: inspect/finalize/cancel another runner's `running` job only after atomic adoption. Jobs without durable launch metadata are not inspectable after daemon crash and can only be recovered through stale-lease requeue semantics.
+
+## Why not ZeroMQ as the queue
+
+ZeroMQ may be useful later as a live notification or worker IPC layer, but it does not replace durable job state, process supervision, or GitHub lifecycle ownership. SQLite remains the authoritative queue. If added later, ZeroMQ should be an optional control plane, not the source of truth.
+
+## Testing requirements
+
+Each backend should have unit tests for:
+
+- launch record persistence,
+- inspect running/done/unknown,
+- cancel behavior,
+- timeout behavior,
+- stdout/stderr/result paths,
+- wrapper metadata parsing,
+- ownership-loss drops,
+- shutdown finalization,
+- restart/recovery behavior.
+
+Entrypoint tests should verify:
+
+- `once` completes a bounded frontier,
+- `dispatch` completes a bounded frontier,
+- daemon polls/routes while jobs run,
+- daemon reaps/refills without waiting for poll interval,
+- daemon shutdown cancels/finalizes running jobs,
+- heartbeat deletion happens only after clean shutdown,
+- `once --no-wait` remains unsupported until detached supervision is durable.
