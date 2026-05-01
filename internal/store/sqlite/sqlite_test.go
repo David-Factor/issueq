@@ -322,7 +322,7 @@ func TestClaimRespectsGlobalAndRouteConcurrency(t *testing.T) {
 		t.Fatalf("blockedGlobal = %#v, want nil", blockedGlobal)
 	}
 
-	if err := store.FinalizeJob(ctx, first.ID, model.JobFinalize{Status: model.JobStatusSucceeded}); err != nil {
+	if err := store.FinalizeJobOwned(ctx, first.ID, identity("runner-1").InstanceID, model.JobFinalize{Status: model.JobStatusSucceeded}); err != nil {
 		t.Fatal(err)
 	}
 	second, err := store.ClaimNextJob(ctx, identity("runner-1"), []string{"code"}, 2, map[string]int{"code": 1}, 30*time.Minute)
@@ -336,46 +336,6 @@ func TestClaimRespectsGlobalAndRouteConcurrency(t *testing.T) {
 	}
 	if blockedRoute != nil {
 		t.Fatalf("blockedRoute = %#v, want nil", blockedRoute)
-	}
-}
-
-func TestAttemptsScopedByIssueGenerationRouteAndIncrement(t *testing.T) {
-	ctx := context.Background()
-	store := openTempStore(t, ctx)
-	defer store.Close()
-	first, err := store.IncrementAttempts(ctx, "issue-1", 0, "code")
-	if err != nil || first != 1 {
-		t.Fatalf("first attempts=%d err=%v", first, err)
-	}
-	second, err := store.IncrementAttempts(ctx, "issue-1", 0, "code")
-	if err != nil || second != 2 {
-		t.Fatalf("second attempts=%d err=%v", second, err)
-	}
-	otherGen, err := store.IncrementAttempts(ctx, "issue-1", 1, "code")
-	if err != nil || otherGen != 1 {
-		t.Fatalf("otherGen attempts=%d err=%v", otherGen, err)
-	}
-	otherRoute, err := store.IncrementAttempts(ctx, "issue-1", 0, "review")
-	if err != nil || otherRoute != 1 {
-		t.Fatalf("otherRoute attempts=%d err=%v", otherRoute, err)
-	}
-}
-
-func TestTransitionCountIncrements(t *testing.T) {
-	ctx := context.Background()
-	store := openTempStore(t, ctx)
-	defer store.Close()
-	issue := sampleIssue()
-	if err := store.UpsertIssue(ctx, issue); err != nil {
-		t.Fatal(err)
-	}
-	count, err := store.IncrementTransitions(ctx, issue.IssueKey)
-	if err != nil || count != 1 {
-		t.Fatalf("count=%d err=%v", count, err)
-	}
-	count, err = store.IncrementTransitions(ctx, issue.IssueKey)
-	if err != nil || count != 2 {
-		t.Fatalf("count=%d err=%v", count, err)
 	}
 }
 
@@ -459,18 +419,6 @@ func TestOwnedJobMutationsRequireRunnerInstance(t *testing.T) {
 	if err := store.RenewJobLease(ctx, job.ID, owner.InstanceID, time.Minute); err != nil {
 		t.Fatalf("RenewJobLease owner error = %v", err)
 	}
-	if err := store.UpdateJobArtifactsOwned(ctx, job.ID, "other-instance", "ctx", "res", "out", "err", 1); !errors.Is(err, storepkg.ErrNotOwner) {
-		t.Fatalf("UpdateJobArtifactsOwned wrong error = %v, want ErrNotOwner", err)
-	}
-	if err := store.UpdateJobArtifactsOwned(ctx, job.ID, owner.InstanceID, "ctx", "res", "out", "err", 123); err != nil {
-		t.Fatalf("UpdateJobArtifactsOwned owner error = %v", err)
-	}
-	if err := store.UpdateJobAttemptsOwned(ctx, job.ID, "other-instance", 2); !errors.Is(err, storepkg.ErrNotOwner) {
-		t.Fatalf("UpdateJobAttemptsOwned wrong error = %v, want ErrNotOwner", err)
-	}
-	if err := store.UpdateJobAttemptsOwned(ctx, job.ID, owner.InstanceID, 2); err != nil {
-		t.Fatalf("UpdateJobAttemptsOwned owner error = %v", err)
-	}
 	if err := store.FinalizeJobOwned(ctx, job.ID, "other-instance", model.JobFinalize{Status: model.JobStatusSucceeded}); !errors.Is(err, storepkg.ErrNotOwner) {
 		t.Fatalf("FinalizeJobOwned wrong error = %v, want ErrNotOwner", err)
 	}
@@ -493,8 +441,8 @@ func TestOwnedJobMutationFailsAfterLeaseExpiry(t *testing.T) {
 		t.Fatalf("claim job=%#v err=%v", job, err)
 	}
 	time.Sleep(2 * time.Millisecond)
-	if err := store.UpdateJobArtifactsOwned(ctx, job.ID, owner.InstanceID, "ctx", "res", "out", "err", 1); !errors.Is(err, storepkg.ErrLostLease) {
-		t.Fatalf("UpdateJobArtifactsOwned expired error = %v, want ErrLostLease", err)
+	if err := store.AssertJobOwned(ctx, job.ID, owner.InstanceID); !errors.Is(err, storepkg.ErrLostLease) {
+		t.Fatalf("AssertJobOwned expired error = %v, want ErrLostLease", err)
 	}
 	if err := store.RenewJobLease(ctx, job.ID, owner.InstanceID, time.Minute); !errors.Is(err, storepkg.ErrLostLease) {
 		t.Fatalf("RenewJobLease expired error = %v, want ErrLostLease", err)
@@ -572,7 +520,6 @@ func TestHeartbeatAwareExpiredLeaseRecovery(t *testing.T) {
 	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", DedupeKey: "recover-stale"})
 	stale := identity("stale")
 	staleJob, _ := store.ClaimNextJob(ctx, stale, []string{"code"}, 10, map[string]int{"code": 10}, time.Minute)
-	_ = store.UpdateJobArtifactsOwned(ctx, staleJob.ID, stale.InstanceID, "ctx", "res", "out", "err", 111)
 	_, _ = store.db.ExecContext(ctx, `UPDATE jobs SET lease_until = ? WHERE id = ?`, formatTime(now.Add(-time.Millisecond)), staleJob.ID)
 	_ = store.HeartbeatRunner(ctx, stale, 111, now.Add(-time.Hour))
 
@@ -609,7 +556,7 @@ func TestHeartbeatAwareExpiredLeaseRecovery(t *testing.T) {
 	for _, job := range jobs {
 		byID[job.ID] = job
 	}
-	if got := byID[staleJob.ID]; got.Status != model.JobStatusPending || got.LockedBy != "" || got.RunnerInstanceID != "" || got.LeaseUntil != nil || got.PID != 0 || got.ContextPath != "ctx" || got.Attempts != 0 {
+	if got := byID[staleJob.ID]; got.Status != model.JobStatusPending || got.LockedBy != "" || got.RunnerInstanceID != "" || got.LeaseUntil != nil || got.PID != 0 || got.Attempts != 0 {
 		t.Fatalf("stale recovered job = %#v", got)
 	}
 	if got := byID[legacyJob.ID]; got.Status != model.JobStatusPending || got.RunnerInstanceID != "" {

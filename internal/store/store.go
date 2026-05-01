@@ -22,10 +22,7 @@ type QueueStore interface {
 	ClaimNextJob(ctx context.Context, identity model.RunnerIdentity, allowedKinds []string, maxGlobal int, perRouteLimit map[string]int, leaseDuration time.Duration) (*model.Job, error)
 	ClaimNextJobInFrontier(ctx context.Context, identity model.RunnerIdentity, allowedKinds []string, maxGlobal int, perRouteLimit map[string]int, leaseDuration time.Duration, frontierJobIDs []string) (*model.Job, error)
 	ReleaseExpiredLeases(ctx context.Context, now time.Time, staleHeartbeatBefore time.Time, currentRunnerInstanceID string, activeJobIDs []string) (int, error)
-	FinalizeJob(ctx context.Context, jobID string, result model.JobFinalize) error
 	FinalizeJobOwned(ctx context.Context, jobID string, runnerInstanceID string, result model.JobFinalize) error
-	UpdateJobArtifacts(ctx context.Context, jobID, contextPath, resultPath, stdoutPath, stderrPath string, pid int) error
-	UpdateJobArtifactsOwned(ctx context.Context, jobID, runnerInstanceID, contextPath, resultPath, stdoutPath, stderrPath string, pid int) error
 	PersistLaunchSpecOwned(ctx context.Context, jobID, runnerInstanceID string, record model.LaunchSpecRecord) error
 	MarkJobLaunchingOwned(ctx context.Context, jobID, runnerInstanceID, launchToken string) error
 	PersistLaunchRecordOwned(ctx context.Context, jobID, runnerInstanceID string, record model.LaunchRecord) error
@@ -35,13 +32,9 @@ type QueueStore interface {
 	ListStaleDurableRunningJobs(ctx context.Context, now, staleHeartbeatBefore time.Time) ([]model.Job, error)
 	AdoptStaleRunningJob(ctx context.Context, jobID, oldRunnerInstanceID string, newIdentity model.RunnerIdentity, leaseDuration time.Duration, now, staleHeartbeatBefore time.Time) (*model.Job, error)
 	MarkStaleRunningJobUnknown(ctx context.Context, jobID, oldRunnerInstanceID string, now, staleHeartbeatBefore time.Time) error
-	UpdateJobAttempts(ctx context.Context, jobID string, attempts int) error
-	UpdateJobAttemptsOwned(ctx context.Context, jobID, runnerInstanceID string, attempts int) error
-	IncrementAttempts(ctx context.Context, issueKey string, generation int, routeName string) (int, error)
 	IncrementAttemptsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string, generation int, routeName string) (int, error)
 	IncrementTransitionsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string) (int, error)
 	GetIssueState(ctx context.Context, issueKey string) (generation int, transitions int, err error)
-	IncrementTransitions(ctx context.Context, issueKey string) (int, error)
 	HeartbeatRunner(ctx context.Context, identity model.RunnerIdentity, pid int, now time.Time) error
 	DeleteRunnerHeartbeat(ctx context.Context, runnerInstanceID string) error
 	PruneStaleRunnerHeartbeats(ctx context.Context, before time.Time) (int, error)

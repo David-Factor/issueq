@@ -395,25 +395,6 @@ WHERE id = ? AND status = ?`, model.JobStatusPending, formatTime(now), id, model
 	return updated, nil
 }
 
-func (s *Store) UpdateJobArtifacts(ctx context.Context, jobID, contextPath, resultPath, stdoutPath, stderrPath string, pid int) error {
-	_, err := s.db.ExecContext(ctx, `
-UPDATE jobs
-SET context_path = ?, result_path = ?, stdout_path = ?, stderr_path = ?, pid = ?, updated_at = ?
-WHERE id = ?`, contextPath, resultPath, stdoutPath, stderrPath, pid, formatTime(time.Now().UTC()), jobID)
-	if err != nil {
-		return fmt.Errorf("update job artifacts: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) UpdateJobArtifactsOwned(ctx context.Context, jobID, runnerInstanceID, contextPath, resultPath, stdoutPath, stderrPath string, pid int) error {
-	now := time.Now().UTC()
-	return s.execOwned(ctx, jobID, runnerInstanceID, `
-UPDATE jobs
-SET context_path = ?, result_path = ?, stdout_path = ?, stderr_path = ?, pid = ?, updated_at = ?
-WHERE id = ? AND runner_instance_id = ? AND status = ? AND (lease_until IS NULL OR lease_until >= ?)`, contextPath, resultPath, stdoutPath, stderrPath, pid, formatTime(now), jobID, runnerInstanceID, model.JobStatusRunning, formatTime(now))
-}
-
 func validateLaunchSpecRecord(record model.LaunchSpecRecord) error {
 	if record.SupervisorKind == "" {
 		return errors.New("supervisor kind is required")
@@ -509,45 +490,6 @@ func (s *Store) CountRunningJobsByRoute(ctx context.Context, routeName string) (
 	return count, nil
 }
 
-func (s *Store) UpdateJobAttempts(ctx context.Context, jobID string, attempts int) error {
-	_, err := s.db.ExecContext(ctx, `
-UPDATE jobs
-SET attempts = ?, updated_at = ?
-WHERE id = ?`, attempts, formatTime(time.Now().UTC()), jobID)
-	if err != nil {
-		return fmt.Errorf("update job attempts: %w", err)
-	}
-	return nil
-}
-
-func (s *Store) UpdateJobAttemptsOwned(ctx context.Context, jobID, runnerInstanceID string, attempts int) error {
-	now := time.Now().UTC()
-	return s.execOwned(ctx, jobID, runnerInstanceID, `
-UPDATE jobs
-SET attempts = ?, updated_at = ?
-WHERE id = ? AND runner_instance_id = ? AND status = ? AND (lease_until IS NULL OR lease_until >= ?)`, attempts, formatTime(now), jobID, runnerInstanceID, model.JobStatusRunning, formatTime(now))
-}
-
-func (s *Store) FinalizeJob(ctx context.Context, jobID string, result model.JobFinalize) error {
-	finished := result.FinishedAt
-	if finished.IsZero() {
-		finished = time.Now().UTC()
-	}
-	_, err := s.db.ExecContext(ctx, `
-UPDATE jobs
-SET status = ?, locked_by = NULL, runner_instance_id = NULL, lease_until = NULL, pid = NULL, pgid = NULL,
-    supervisor_kind = NULL, supervisor_id = NULL, launch_token = NULL, launch_state = NULL, process_started_at = NULL,
-    run_metadata_path = NULL, launch_spec_path = NULL, timeout_at = NULL,
-    result_path = COALESCE(NULLIF(?, ''), result_path),
-    stdout_path = COALESCE(NULLIF(?, ''), stdout_path), stderr_path = COALESCE(NULLIF(?, ''), stderr_path),
-    finished_at = ?, updated_at = ?, last_error = ?
-WHERE id = ?`, result.Status, result.ResultPath, result.StdoutPath, result.StderrPath, formatTime(finished), formatTime(finished), nullString(result.LastError), jobID)
-	if err != nil {
-		return fmt.Errorf("finalize job: %w", err)
-	}
-	return nil
-}
-
 func (s *Store) FinalizeJobOwned(ctx context.Context, jobID string, runnerInstanceID string, result model.JobFinalize) error {
 	finished := result.FinishedAt
 	if finished.IsZero() {
@@ -562,22 +504,6 @@ SET status = ?, locked_by = NULL, runner_instance_id = NULL, lease_until = NULL,
     stdout_path = COALESCE(NULLIF(?, ''), stdout_path), stderr_path = COALESCE(NULLIF(?, ''), stderr_path),
     finished_at = ?, updated_at = ?, last_error = ?
 WHERE id = ? AND runner_instance_id = ? AND status = ? AND (lease_until IS NULL OR lease_until >= ?)`, result.Status, result.ResultPath, result.StdoutPath, result.StderrPath, formatTime(finished), formatTime(finished), nullString(result.LastError), jobID, runnerInstanceID, model.JobStatusRunning, formatTime(time.Now().UTC()))
-}
-
-func (s *Store) IncrementAttempts(ctx context.Context, issueKey string, generation int, routeName string) (int, error) {
-	tx, err := s.beginImmediate(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("begin increment attempts: %w", err)
-	}
-	defer tx.Rollback()
-	attempts, err := incrementAttemptsTx(ctx, tx, issueKey, generation, routeName)
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, fmt.Errorf("commit increment attempts: %w", err)
-	}
-	return attempts, nil
 }
 
 func (s *Store) IncrementAttemptsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string, generation int, routeName string) (int, error) {
@@ -665,16 +591,6 @@ func (s *Store) GetIssueState(ctx context.Context, issueKey string) (generation 
 		return 0, 0, fmt.Errorf("get issue state: %w", err)
 	}
 	return generation, transitions, nil
-}
-
-func (s *Store) IncrementTransitions(ctx context.Context, issueKey string) (int, error) {
-	now := formatTime(time.Now().UTC())
-	_, err := s.db.ExecContext(ctx, `UPDATE issue_state SET transition_count = transition_count + 1, updated_at = ? WHERE issue_key = ?`, now, issueKey)
-	if err != nil {
-		return 0, fmt.Errorf("increment transitions: %w", err)
-	}
-	_, transitions, err := s.GetIssueState(ctx, issueKey)
-	return transitions, err
 }
 
 func (s *Store) beginImmediate(ctx context.Context) (*immediateTx, error) {
