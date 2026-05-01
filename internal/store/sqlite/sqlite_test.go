@@ -801,6 +801,12 @@ func TestDurableLaunchOwnershipGuardsAndStaleRecovery(t *testing.T) {
 		t.Fatalf("durable after unknown = %#v", got)
 	}
 	newOwner := identity("new-owner")
+	if _, err := store.AdoptStaleRunningJob(ctx, durable.ID, owner.InstanceID, newOwner, time.Minute, now, now.Add(-time.Minute)); !errors.Is(err, storepkg.ErrNotOwner) {
+		t.Fatalf("AdoptStaleRunningJob unknown err = %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE jobs SET launch_state = ? WHERE id = ?`, model.LaunchStateRunning, durable.ID); err != nil {
+		t.Fatal(err)
+	}
 	adopted, err := store.AdoptStaleRunningJob(ctx, durable.ID, owner.InstanceID, newOwner, time.Minute, now, now.Add(-time.Minute))
 	if err != nil {
 		t.Fatalf("AdoptStaleRunningJob error = %v", err)
@@ -845,5 +851,39 @@ func TestClaimFrontierRestrictsEligibleJobs(t *testing.T) {
 	job, err := store.ClaimNextJobInFrontier(ctx, identity("runner-frontier"), []string{"code"}, 1, map[string]int{"code": 1}, time.Minute, []string{first.ID})
 	if err != nil || job == nil || job.ID != first.ID {
 		t.Fatalf("frontier claim job=%#v err=%v", job, err)
+	}
+}
+
+func TestStaleDurableUnknownRowsAreNotRelistedOrAdopted(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	now := time.Now().UTC()
+	owner := identity("unknown-durable")
+	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", DedupeKey: "unknown-durable"})
+	job, _ := store.ClaimNextJob(ctx, owner, []string{"code"}, 10, map[string]int{"code": 10}, time.Minute)
+	if err := store.PersistLaunchSpecOwned(ctx, job.ID, owner.InstanceID, model.LaunchSpecRecord{SupervisorKind: "wrapper", LaunchToken: "tok", LaunchSpecPath: "spec", RunMetadataPath: "run", TimeoutAt: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkJobLaunchingOwned(ctx, job.ID, owner.InstanceID, "tok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistLaunchRecordOwned(ctx, job.ID, owner.InstanceID, model.LaunchRecord{SupervisorKind: "wrapper", SupervisorID: "sid", LaunchToken: "tok", PID: 1, RunMetadataPath: "run", TimeoutAt: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = store.db.ExecContext(ctx, `UPDATE jobs SET lease_until = ?, launch_state = ? WHERE id = ?`, formatTime(now.Add(-time.Minute)), model.LaunchStateUnknown, job.ID)
+	_ = store.HeartbeatRunner(ctx, owner, 1, now.Add(-time.Hour))
+	stale, err := store.ListStaleDurableRunningJobs(ctx, now, now.Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stale) != 0 {
+		t.Fatalf("stale = %#v, want none", stale)
+	}
+	if _, err := store.AdoptStaleRunningJob(ctx, job.ID, owner.InstanceID, identity("new"), time.Minute, now, now.Add(-time.Minute)); !errors.Is(err, storepkg.ErrNotOwner) {
+		t.Fatalf("AdoptStaleRunningJob err = %v", err)
+	}
+	if err := store.MarkStaleRunningJobUnknown(ctx, job.ID, owner.InstanceID, now, now.Add(-time.Minute)); !errors.Is(err, storepkg.ErrNotOwner) {
+		t.Fatalf("MarkStaleRunningJobUnknown err = %v", err)
 	}
 }

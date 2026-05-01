@@ -457,6 +457,184 @@ func TestRunPrunesStaleHeartbeats(t *testing.T) {
 	}
 }
 
+func TestRunAdoptsStaleDurableRunningWrapperAndRenews(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, cfg := setupOnce(t)
+	defer store.Close()
+	cfg.Polling.Interval = config.Duration{Duration: time.Hour}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
+	job := seedStaleDurableJob(t, ctx, store, cfg, "adopt-running")
+	backend := newFakeDaemonSupervisor()
+	backend.setObservation(job.ID, supervisor.Observation{State: supervisor.RunRunning, StartedAt: time.Now().UTC()})
+	done := make(chan error, 1)
+	go func() { done <- runWithSupervisor(ctx, cfg, store, nil, nil, backend) }()
+	waitFor(t, time.Second, func() bool {
+		jobs, _ := store.ListJobs(context.Background())
+		for _, got := range jobs {
+			if got.ID == job.ID && got.RunnerInstanceID != job.RunnerInstanceID && got.Status == model.JobStatusRunning && got.LeaseUntil != nil && got.LeaseUntil.After(time.Now()) {
+				return true
+			}
+		}
+		return false
+	})
+	if backend.launchCount() != 0 {
+		t.Fatalf("launch count = %d, want 0", backend.launchCount())
+	}
+	cancel()
+	if err := <-done; err != context.Canceled {
+		t.Fatalf("Run error = %v", err)
+	}
+}
+
+func TestRunAdoptsStaleCompletedWrapperAndFinalizes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, cfg := setupOnce(t)
+	defer store.Close()
+	cfg.Polling.Interval = config.Duration{Duration: time.Hour}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
+	job := seedStaleDurableJob(t, ctx, store, cfg, "adopt-complete")
+	backend := newFakeDaemonSupervisor()
+	backend.setObservation(job.ID, supervisor.Observation{State: supervisor.RunExited, HasExitCode: true, ExitCode: 0, FinishedAt: time.Now().UTC(), ResultPath: job.ResultPath, StdoutPath: job.StdoutPath, StderrPath: job.StderrPath})
+	done := make(chan error, 1)
+	go func() { done <- runWithSupervisor(ctx, cfg, store, nil, nil, backend) }()
+	waitFor(t, time.Second, func() bool {
+		jobs, _ := store.ListJobs(context.Background())
+		for _, got := range jobs {
+			if got.ID == job.ID && got.Status == model.JobStatusSucceeded && got.RunnerInstanceID == "" {
+				return true
+			}
+		}
+		return false
+	})
+	cancel()
+	if err := <-done; err != context.Canceled {
+		t.Fatalf("Run error = %v", err)
+	}
+}
+
+func TestRunMarksStaleDurableUnknownWithoutRequeueOrLaunch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, cfg := setupOnce(t)
+	defer store.Close()
+	cfg.Polling.Interval = config.Duration{Duration: time.Hour}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
+	job := seedStaleDurableJob(t, ctx, store, cfg, "unknown")
+	backend := newFakeDaemonSupervisor()
+	backend.setObservation(job.ID, supervisor.Observation{State: supervisor.RunUnknown, Error: "missing"})
+	done := make(chan error, 1)
+	go func() { done <- runWithSupervisor(ctx, cfg, store, nil, nil, backend) }()
+	waitFor(t, time.Second, func() bool {
+		jobs, _ := store.ListJobs(context.Background())
+		for _, got := range jobs {
+			if got.ID == job.ID && got.Status == model.JobStatusRunning && got.RunnerInstanceID == job.RunnerInstanceID && got.LaunchState == model.LaunchStateUnknown {
+				return true
+			}
+		}
+		return false
+	})
+	if backend.launchCount() != 0 {
+		t.Fatalf("launch count = %d, want 0", backend.launchCount())
+	}
+	cancel()
+	if err := <-done; err != context.Canceled {
+		t.Fatalf("Run error = %v", err)
+	}
+}
+
+func TestRunMarksUnsupportedStaleDurableUnknownWithoutInspect(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, cfg := setupOnce(t)
+	defer store.Close()
+	cfg.Polling.Interval = config.Duration{Duration: time.Hour}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
+	job := seedStaleDurableJob(t, ctx, store, cfg, "unsupported")
+	if _, err := openTestDB(t, cfg).ExecContext(ctx, `UPDATE jobs SET supervisor_kind = ? WHERE id = ?`, supervisor.KindSystemd, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	backend := newFakeDaemonSupervisor()
+	done := make(chan error, 1)
+	go func() { done <- runWithSupervisor(ctx, cfg, store, nil, nil, backend) }()
+	waitFor(t, time.Second, func() bool {
+		jobs, _ := store.ListJobs(context.Background())
+		for _, got := range jobs {
+			if got.ID == job.ID && got.Status == model.JobStatusRunning && got.RunnerInstanceID == job.RunnerInstanceID && got.LaunchState == model.LaunchStateUnknown {
+				return true
+			}
+		}
+		return false
+	})
+	if backend.inspectCount() != 0 || backend.launchCount() != 0 {
+		t.Fatalf("inspects=%d launches=%d, want 0", backend.inspectCount(), backend.launchCount())
+	}
+	cancel()
+	if err := <-done; err != context.Canceled {
+		t.Fatalf("Run error = %v", err)
+	}
+}
+
+func seedStaleDurableJob(t *testing.T, ctx context.Context, store *sqlitestore.Store, cfg config.Config, dedupe string) model.Job {
+	t.Helper()
+	old := model.RunnerIdentity{RunnerID: "old", InstanceID: "old-" + dedupe}
+	if err := store.HeartbeatRunner(ctx, old, 99, time.Now().Add(-time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: dedupe}); err != nil {
+		t.Fatal(err)
+	}
+	job, err := store.ClaimNextJob(ctx, old, []string{"code"}, 10, map[string]int{"code": 10}, 50*time.Millisecond)
+	if err != nil || job == nil {
+		t.Fatalf("claim stale durable=%#v err=%v", job, err)
+	}
+	pathsDir := filepath.Join(cfg.Workdir.Path, "jobs", job.ID)
+	if err := os.MkdirAll(pathsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	timeoutAt := now.Add(time.Minute)
+	spec := model.LaunchSpecRecord{SupervisorKind: supervisor.KindWrapper, LaunchToken: "tok-" + dedupe, LaunchSpecPath: filepath.Join(pathsDir, "spec.json"), ContextPath: filepath.Join(pathsDir, "context.json"), ResultPath: filepath.Join(pathsDir, "result.json"), StdoutPath: filepath.Join(pathsDir, "stdout.log"), StderrPath: filepath.Join(pathsDir, "stderr.log"), RunMetadataPath: filepath.Join(pathsDir, "run.json"), TimeoutAt: timeoutAt}
+	if err := store.PersistLaunchSpecOwned(ctx, job.ID, old.InstanceID, spec); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkJobLaunchingOwned(ctx, job.ID, old.InstanceID, spec.LaunchToken); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistLaunchRecordOwned(ctx, job.ID, old.InstanceID, model.LaunchRecord{SupervisorKind: supervisor.KindWrapper, SupervisorID: "sid-" + dedupe, LaunchToken: spec.LaunchToken, PID: 123, RunMetadataPath: spec.RunMetadataPath, LaunchSpecPath: spec.LaunchSpecPath, ContextPath: spec.ContextPath, ResultPath: spec.ResultPath, StdoutPath: spec.StdoutPath, StderrPath: spec.StderrPath, TimeoutAt: timeoutAt}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := openTestDB(t, cfg).ExecContext(ctx, `UPDATE jobs SET lease_until = ? WHERE id = ?`, formatTestTime(now.Add(-time.Second)), job.ID); err != nil {
+		t.Fatal(err)
+	}
+	jobs, _ := store.ListJobs(ctx)
+	for _, got := range jobs {
+		if got.ID == job.ID {
+			return got
+		}
+	}
+	t.Fatalf("job %s not found", job.ID)
+	return model.Job{}
+}
+
+func formatTestTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format("2006-01-02T15:04:05.000000000Z07:00")
+}
+
+func openTestDB(t *testing.T, cfg config.Config) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("sqlite", cfg.Queue.SQLite.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
 func setupOnce(t *testing.T) (*sqlitestore.Store, config.Config) {
 	t.Helper()
 	ctx := context.Background()
@@ -599,6 +777,7 @@ type fakeDaemonSupervisor struct {
 	launches       []supervisor.LaunchSpec
 	observations   map[string]supervisor.Observation
 	cancellations  []supervisor.FakeCancellation
+	inspections    int
 	defaultRunning bool
 }
 
@@ -627,6 +806,7 @@ func (f *fakeDaemonSupervisor) Inspect(ctx context.Context, record supervisor.La
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	obs, ok := f.observations[record.JobID]
+	f.inspections++
 	if !ok {
 		return supervisor.Observation{State: supervisor.RunUnknown, Error: "missing fake observation"}, nil
 	}
@@ -654,6 +834,11 @@ func (f *fakeDaemonSupervisor) cancelCount() int {
 	defer f.mu.Unlock()
 	return len(f.cancellations)
 }
+func (f *fakeDaemonSupervisor) inspectCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.inspections
+}
 func (f *fakeDaemonSupervisor) firstJobID() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -678,6 +863,12 @@ func (f *fakeDaemonSupervisor) holdRunning(jobID string) {
 	obs.FinishedAt = time.Time{}
 	obs.HasExitCode = false
 	obs.ExitCode = 0
+	f.observations[jobID] = obs
+}
+
+func (f *fakeDaemonSupervisor) setObservation(jobID string, obs supervisor.Observation) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.observations[jobID] = obs
 }
 

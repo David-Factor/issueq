@@ -232,6 +232,32 @@ func (l *loop) reconcile(ctx context.Context) error {
 		}
 	}
 	now = time.Now().UTC()
+	adopted, summary, err := workflow.RecoverStaleDurableRunningJobs(ctx, l.queue, l.backend, l.identity, l.lease, now)
+	if err != nil {
+		return err
+	}
+	if summary.Scanned > 0 {
+		l.logger.Info("stale durable recovery complete", "scanned", summary.Scanned, "adopted", summary.Adopted, "marked_unknown", summary.MarkedUnknown, "ownership_lost", summary.OwnershipLost)
+	}
+	for _, item := range adopted {
+		activeIDs = append(activeIDs, item.Job.ID)
+		switch workflow.ObservationToDecision(item.Observation) {
+		case workflow.DecisionKeepRunning:
+			if err := l.queue.RenewJobLease(ctx, item.Job.ID, l.identity.InstanceID, l.lease); err != nil {
+				if workflow.IsOwnershipLoss(err) {
+					continue
+				}
+				return err
+			}
+		case workflow.DecisionSucceeded, workflow.DecisionFailed, workflow.DecisionCancelled:
+			if err := l.finalizeObservation(ctx, item.Job, item.Observation, now); err != nil {
+				return err
+			}
+		case workflow.DecisionUnknown:
+			l.logger.Warn("adopted durable job is unknown", "job_id", item.Job.ID, "error", item.Observation.Error)
+		}
+	}
+	now = time.Now().UTC()
 	if _, err := workflow.RecoverExpiredLeases(ctx, l.queue, now, l.lease, l.identity.InstanceID, activeIDs); err != nil {
 		return err
 	}

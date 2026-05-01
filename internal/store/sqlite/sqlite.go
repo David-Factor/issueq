@@ -897,10 +897,10 @@ SELECT j.id, j.issue_key, j.route_name, j.kind, j.status, j.priority, j.attempts
        j.context_path, j.result_path, j.stdout_path, j.stderr_path, j.timeout_at, j.created_at, j.updated_at, j.started_at, j.finished_at, j.last_error
 FROM jobs j
 LEFT JOIN runner_heartbeats h ON h.runner_instance_id = j.runner_instance_id
-WHERE j.status = ? AND j.lease_until IS NOT NULL AND j.lease_until < ? AND j.launch_state != ? AND j.supervisor_kind IS NOT NULL AND j.supervisor_kind != '' AND j.launch_token IS NOT NULL AND j.launch_token != ''
+WHERE j.status = ? AND j.lease_until IS NOT NULL AND j.lease_until < ? AND j.launch_state != ? AND j.launch_state != ? AND j.supervisor_kind IS NOT NULL AND j.supervisor_kind != '' AND j.launch_token IS NOT NULL AND j.launch_token != ''
   AND (j.supervisor_id IS NOT NULL AND j.supervisor_id != '' OR j.run_metadata_path IS NOT NULL AND j.run_metadata_path != '')
   AND (j.runner_instance_id IS NULL OR j.runner_instance_id = '' OR h.runner_instance_id IS NULL OR h.heartbeat_at < ?)
-ORDER BY j.lease_until ASC, j.id ASC`, model.JobStatusRunning, formatTime(now.UTC()), model.LaunchStatePreparing, formatTime(staleHeartbeatBefore.UTC()))
+ORDER BY j.lease_until ASC, j.id ASC`, model.JobStatusRunning, formatTime(now.UTC()), model.LaunchStatePreparing, model.LaunchStateUnknown, formatTime(staleHeartbeatBefore.UTC()))
 	if err != nil {
 		return nil, fmt.Errorf("list stale durable running jobs: %w", err)
 	}
@@ -923,9 +923,9 @@ func (s *Store) AdoptStaleRunningJob(ctx context.Context, jobID, oldRunnerInstan
 UPDATE jobs
 SET locked_by = ?, runner_instance_id = ?, lease_until = ?, updated_at = ?
 WHERE id = ? AND status = ? AND runner_instance_id = ? AND lease_until IS NOT NULL AND lease_until < ?
-  AND launch_state != ? AND supervisor_kind IS NOT NULL AND supervisor_kind != '' AND launch_token IS NOT NULL AND launch_token != ''
+  AND launch_state != ? AND launch_state != ? AND supervisor_kind IS NOT NULL AND supervisor_kind != '' AND launch_token IS NOT NULL AND launch_token != ''
   AND (supervisor_id IS NOT NULL AND supervisor_id != '' OR run_metadata_path IS NOT NULL AND run_metadata_path != '')
-  AND NOT EXISTS (SELECT 1 FROM runner_heartbeats h WHERE h.runner_instance_id = ? AND h.heartbeat_at >= ?)`, newIdentity.RunnerID, newIdentity.InstanceID, formatTime(leaseUntil), formatTime(now.UTC()), jobID, model.JobStatusRunning, oldRunnerInstanceID, formatTime(now.UTC()), model.LaunchStatePreparing, oldRunnerInstanceID, formatTime(staleHeartbeatBefore.UTC()))
+  AND NOT EXISTS (SELECT 1 FROM runner_heartbeats h WHERE h.runner_instance_id = ? AND h.heartbeat_at >= ?)`, newIdentity.RunnerID, newIdentity.InstanceID, formatTime(leaseUntil), formatTime(now.UTC()), jobID, model.JobStatusRunning, oldRunnerInstanceID, formatTime(now.UTC()), model.LaunchStatePreparing, model.LaunchStateUnknown, oldRunnerInstanceID, formatTime(staleHeartbeatBefore.UTC()))
 	if err != nil {
 		return nil, fmt.Errorf("adopt stale running job: %w", err)
 	}
@@ -948,9 +948,9 @@ func (s *Store) MarkStaleRunningJobUnknown(ctx context.Context, jobID, oldRunner
 UPDATE jobs
 SET launch_state = ?, updated_at = ?
 WHERE id = ? AND status = ? AND runner_instance_id = ? AND lease_until IS NOT NULL AND lease_until < ?
-  AND launch_state != ? AND supervisor_kind IS NOT NULL AND supervisor_kind != '' AND launch_token IS NOT NULL AND launch_token != ''
+  AND launch_state != ? AND launch_state != ? AND supervisor_kind IS NOT NULL AND supervisor_kind != '' AND launch_token IS NOT NULL AND launch_token != ''
   AND (supervisor_id IS NOT NULL AND supervisor_id != '' OR run_metadata_path IS NOT NULL AND run_metadata_path != '')
-  AND NOT EXISTS (SELECT 1 FROM runner_heartbeats h WHERE h.runner_instance_id = ? AND h.heartbeat_at >= ?)`, model.LaunchStateUnknown, formatTime(now.UTC()), jobID, model.JobStatusRunning, oldRunnerInstanceID, formatTime(now.UTC()), model.LaunchStatePreparing, oldRunnerInstanceID, formatTime(staleHeartbeatBefore.UTC()))
+  AND NOT EXISTS (SELECT 1 FROM runner_heartbeats h WHERE h.runner_instance_id = ? AND h.heartbeat_at >= ?)`, model.LaunchStateUnknown, formatTime(now.UTC()), jobID, model.JobStatusRunning, oldRunnerInstanceID, formatTime(now.UTC()), model.LaunchStatePreparing, model.LaunchStateUnknown, oldRunnerInstanceID, formatTime(staleHeartbeatBefore.UTC()))
 	if err != nil {
 		return fmt.Errorf("mark stale running job unknown: %w", err)
 	}
