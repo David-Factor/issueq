@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -133,6 +134,135 @@ func TestRunReapsCompletedObservationAndRefills(t *testing.T) {
 	}
 }
 
+func TestRunAppliesGitHubLifecycleAroundWrapperJob(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, cfg := setupOnce(t)
+	defer store.Close()
+	cfg.Polling.Interval = config.Duration{Duration: time.Hour}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
+	cfg.Routes[0].Job.OnStart = config.ActionConfig{LabelsRemove: []string{"agent-ready"}, LabelsAdd: []string{"agent-running"}}
+	cfg.Routes[0].Job.OnSuccess = config.ActionConfig{LabelsRemove: []string{"agent-running"}, LabelsAdd: []string{"agent-done"}, Comment: "done"}
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "lifecycle"}); err != nil {
+		t.Fatal(err)
+	}
+	gh := &fakeDaemonGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
+	backend := newFakeDaemonSupervisor()
+	done := make(chan error, 1)
+	go func() { done <- runWithSupervisor(ctx, cfg, store, gh, nil, backend) }()
+	waitFor(t, time.Second, func() bool { return backend.launchCount() == 1 })
+	if got := strings.Join(gh.calls, "|"); !strings.Contains(got, "remove:agent-ready") || !strings.Contains(got, "add:agent-running") {
+		t.Fatalf("pre-launch calls = %v", gh.calls)
+	}
+	var jobID string
+	waitFor(t, time.Second, func() bool {
+		jobID = backend.lastJobID()
+		return jobID != ""
+	})
+	backend.complete(jobID, supervisor.RunExited)
+	waitFor(t, 2*time.Second, func() bool {
+		jobs, _ := store.ListJobs(context.Background())
+		for _, job := range jobs {
+			if job.ID == jobID && job.Status == model.JobStatusSucceeded {
+				return true
+			}
+		}
+		return false
+	})
+	calls := strings.Join(gh.calls, "|")
+	if !strings.Contains(calls, "remove:agent-running") || !strings.Contains(calls, "add:agent-done") || !strings.Contains(calls, "comment") {
+		t.Fatalf("calls = %v", gh.calls)
+	}
+	events, err := store.ListJobEvents(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasEvent(events, "action_on_start") || !hasEvent(events, "job_succeeded") {
+		t.Fatalf("events = %#v", events)
+	}
+	cancel()
+	if err := <-done; err != context.Canceled {
+		t.Fatalf("Run error = %v", err)
+	}
+}
+
+func TestRunSkipsStaleGitHubRouteBeforeWrapperLaunch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, cfg := setupOnce(t)
+	defer store.Close()
+	cfg.Polling.Interval = config.Duration{Duration: time.Hour}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "stale"}); err != nil {
+		t.Fatal(err)
+	}
+	gh := &fakeDaemonGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"other"}, State: "open"}}
+	backend := newFakeDaemonSupervisor()
+	done := make(chan error, 1)
+	go func() { done <- runWithSupervisor(ctx, cfg, store, gh, nil, backend) }()
+	waitFor(t, time.Second, func() bool {
+		jobs, _ := store.ListJobs(context.Background())
+		return len(jobs) == 1 && jobs[0].Status == model.JobStatusSkipped
+	})
+	if backend.launchCount() != 0 {
+		t.Fatalf("launch count = %d, want 0", backend.launchCount())
+	}
+	cancel()
+	if err := <-done; err != context.Canceled {
+		t.Fatalf("Run error = %v", err)
+	}
+}
+
+func TestRunAppliesResultJSONActionsOnWrapperCompletion(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, cfg := setupOnce(t)
+	defer store.Close()
+	cfg.Polling.Interval = config.Duration{Duration: time.Hour}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
+	cfg.Routes[0].Job.OnSuccess = config.ActionConfig{LabelsAdd: []string{"base"}}
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "result-actions"}); err != nil {
+		t.Fatal(err)
+	}
+	gh := &fakeDaemonGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
+	backend := newFakeDaemonSupervisor()
+	done := make(chan error, 1)
+	go func() { done <- runWithSupervisor(ctx, cfg, store, gh, nil, backend) }()
+	waitFor(t, time.Second, func() bool { return backend.launchCount() == 1 })
+	jobID := backend.lastJobID()
+	var resultPath string
+	waitFor(t, time.Second, func() bool {
+		jobs, _ := store.ListJobs(context.Background())
+		for _, job := range jobs {
+			if job.ID == jobID && job.ResultPath != "" {
+				resultPath = job.ResultPath
+				return true
+			}
+		}
+		return false
+	})
+	if err := os.WriteFile(resultPath, []byte(`{"labels_add":["from-result"],"comment":"result comment"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	backend.complete(jobID, supervisor.RunExited)
+	waitFor(t, 2*time.Second, func() bool {
+		jobs, _ := store.ListJobs(context.Background())
+		for _, job := range jobs {
+			if job.ID == jobID && job.Status == model.JobStatusSucceeded {
+				return true
+			}
+		}
+		return false
+	})
+	calls := strings.Join(gh.calls, "|")
+	if !strings.Contains(calls, "add:base,from-result") || !strings.Contains(calls, "comment") {
+		t.Fatalf("calls = %v", gh.calls)
+	}
+	cancel()
+	if err := <-done; err != context.Canceled {
+		t.Fatalf("Run error = %v", err)
+	}
+}
 func TestRunRenewsRunningWrapperRows(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -404,6 +534,58 @@ func countHeartbeats(t *testing.T, cfg config.Config) int {
 		t.Fatal(err)
 	}
 	return count
+}
+
+func hasEvent(events []model.JobEvent, eventType string) bool {
+	for _, event := range events {
+		if event.EventType == eventType {
+			return true
+		}
+	}
+	return false
+}
+
+type fakeDaemonGitHub struct {
+	issue    model.IssueSnapshot
+	calls    []string
+	comments []string
+}
+
+func (f *fakeDaemonGitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]model.IssueSnapshot, error) {
+	return []model.IssueSnapshot{f.issue}, nil
+}
+
+func (f *fakeDaemonGitHub) GetIssue(ctx context.Context, owner, repo string, number int) (model.IssueSnapshot, error) {
+	f.calls = append(f.calls, "get")
+	return f.issue, nil
+}
+
+func (f *fakeDaemonGitHub) AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	f.calls = append(f.calls, "add:"+strings.Join(labels, ","))
+	f.issue.Labels = append(f.issue.Labels, labels...)
+	return nil
+}
+
+func (f *fakeDaemonGitHub) RemoveLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	f.calls = append(f.calls, "remove:"+strings.Join(labels, ","))
+	blocked := map[string]bool{}
+	for _, label := range labels {
+		blocked[label] = true
+	}
+	out := f.issue.Labels[:0]
+	for _, label := range f.issue.Labels {
+		if !blocked[label] {
+			out = append(out, label)
+		}
+	}
+	f.issue.Labels = out
+	return nil
+}
+
+func (f *fakeDaemonGitHub) CreateComment(ctx context.Context, owner, repo string, number int, body string) error {
+	f.calls = append(f.calls, "comment")
+	f.comments = append(f.comments, body)
+	return nil
 }
 
 type fakeDaemonSupervisor struct {
