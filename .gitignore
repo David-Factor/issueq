@@ -1,0 +1,33 @@
+# Local configuration and secrets
+.env
+.env.*
+*.pem
+*.key
+*.token
+
+# issueq runtime state
+/issueq.yaml
+/issueq.db
+/issueq.db-*
+/*.sqlite
+/*.sqlite-*
+/.issueq/
+
+# Build and test outputs
+/bin/
+/dist/
+/build/
+*.test
+*.prof
+coverage.out
+coverage.html
+
+# Logs and temporary files
+*.log
+/tmp/
+*.tmp
+
+# Editor/OS noise
+.DS_Store
+.idea/
+.vscode/
