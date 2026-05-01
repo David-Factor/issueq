@@ -20,7 +20,7 @@ func TestOnceWaitsAndProcessesLocalRouteDispatch(t *testing.T) {
 	ctx := context.Background()
 	store, cfg := setupOnce(t)
 	defer store.Close()
-	result, err := Once(ctx, cfg, store, nil)
+	result, err := onceWithSupervisor(ctx, cfg, store, nil, newFakeDaemonSupervisor())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,6 +56,7 @@ func TestRunLaunchesPendingJobThroughWrapperSupervisor(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend := newFakeDaemonSupervisor()
+	backend.defaultRunning = true
 	done := make(chan error, 1)
 	go func() { done <- runWithSupervisor(ctx, cfg, store, nil, nil, backend) }()
 	waitFor(t, time.Second, func() bool { return backend.launchCount() == 1 })
@@ -89,6 +90,7 @@ func TestRunReapsCompletedObservationAndRefills(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend := newFakeDaemonSupervisor()
+	backend.defaultRunning = true
 	done := make(chan error, 1)
 	go func() { done <- runWithSupervisor(ctx, cfg, store, nil, nil, backend) }()
 	waitFor(t, time.Second, func() bool { return backend.launchCount() == 1 })
@@ -148,6 +150,7 @@ func TestRunAppliesGitHubLifecycleAroundWrapperJob(t *testing.T) {
 	}
 	gh := &fakeDaemonGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
 	backend := newFakeDaemonSupervisor()
+	backend.defaultRunning = true
 	done := make(chan error, 1)
 	go func() { done <- runWithSupervisor(ctx, cfg, store, gh, nil, backend) }()
 	waitFor(t, time.Second, func() bool { return backend.launchCount() == 1 })
@@ -226,6 +229,7 @@ func TestRunAppliesResultJSONActionsOnWrapperCompletion(t *testing.T) {
 	}
 	gh := &fakeDaemonGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
 	backend := newFakeDaemonSupervisor()
+	backend.defaultRunning = true
 	done := make(chan error, 1)
 	go func() { done <- runWithSupervisor(ctx, cfg, store, gh, nil, backend) }()
 	waitFor(t, time.Second, func() bool { return backend.launchCount() == 1 })
@@ -274,6 +278,7 @@ func TestRunRenewsRunningWrapperRows(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend := newFakeDaemonSupervisor()
+	backend.defaultRunning = true
 	done := make(chan error, 1)
 	go func() { done <- runWithSupervisor(ctx, cfg, store, nil, nil, backend) }()
 	waitFor(t, time.Second, func() bool { return backend.launchCount() == 1 })
@@ -307,6 +312,7 @@ func TestRunShutdownCancelsWrapperJobFinalizesCancelledAndDeletesHeartbeat(t *te
 		t.Fatal(err)
 	}
 	backend := newFakeDaemonSupervisor()
+	backend.defaultRunning = true
 	done := make(chan error, 1)
 	go func() { done <- runWithSupervisor(ctx, cfg, store, nil, nil, backend) }()
 	waitFor(t, time.Second, func() bool {
@@ -589,10 +595,11 @@ func (f *fakeDaemonGitHub) CreateComment(ctx context.Context, owner, repo string
 }
 
 type fakeDaemonSupervisor struct {
-	mu            sync.Mutex
-	launches      []supervisor.LaunchSpec
-	observations  map[string]supervisor.Observation
-	cancellations []supervisor.FakeCancellation
+	mu             sync.Mutex
+	launches       []supervisor.LaunchSpec
+	observations   map[string]supervisor.Observation
+	cancellations  []supervisor.FakeCancellation
+	defaultRunning bool
 }
 
 func newFakeDaemonSupervisor() *fakeDaemonSupervisor {
@@ -604,7 +611,15 @@ func (f *fakeDaemonSupervisor) Launch(ctx context.Context, spec supervisor.Launc
 	defer f.mu.Unlock()
 	f.launches = append(f.launches, spec)
 	record := supervisor.LaunchRecord{Kind: supervisor.KindWrapper, ID: spec.JobID + "-wrapper", JobID: spec.JobID, LaunchToken: spec.LaunchToken, PID: 1000 + len(f.launches), MetadataPath: spec.MetadataPath, StartedAt: time.Now().UTC(), TimeoutAt: time.Now().UTC().Add(spec.Timeout)}
-	f.observations[spec.JobID] = supervisor.Observation{State: supervisor.RunRunning, StartedAt: record.StartedAt, ResultPath: spec.ResultPath, StdoutPath: spec.StdoutPath, StderrPath: spec.StderrPath}
+	state := supervisor.RunExited
+	finishedAt := record.StartedAt
+	hasExitCode := true
+	if f.defaultRunning {
+		state = supervisor.RunRunning
+		finishedAt = time.Time{}
+		hasExitCode = false
+	}
+	f.observations[spec.JobID] = supervisor.Observation{State: state, StartedAt: record.StartedAt, FinishedAt: finishedAt, HasExitCode: hasExitCode, ExitCode: 0, ResultPath: spec.ResultPath, StdoutPath: spec.StdoutPath, StderrPath: spec.StderrPath}
 	return record, nil
 }
 
@@ -655,6 +670,17 @@ func (f *fakeDaemonSupervisor) lastJobID() string {
 	}
 	return f.launches[len(f.launches)-1].JobID
 }
+func (f *fakeDaemonSupervisor) holdRunning(jobID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	obs := f.observations[jobID]
+	obs.State = supervisor.RunRunning
+	obs.FinishedAt = time.Time{}
+	obs.HasExitCode = false
+	obs.ExitCode = 0
+	f.observations[jobID] = obs
+}
+
 func (f *fakeDaemonSupervisor) complete(jobID string, state supervisor.RunState) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

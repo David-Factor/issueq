@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"issueq/internal/config"
 	"issueq/internal/daemon"
@@ -154,15 +153,6 @@ func dispatchCommand(configPath *string) *cobra.Command {
 			return err
 		}
 		defer store.Close()
-		heartbeatGrace := config.DefaultLeaseDuration
-		if cfg.Queue.LeaseDuration.Duration > 0 {
-			heartbeatGrace = cfg.Queue.LeaseDuration.Duration
-		}
-		if !localNoGitHub {
-			if _, err := store.ReleaseExpiredLeases(cmd.Context(), time.Now().UTC(), time.Now().UTC().Add(-heartbeatGrace), "", nil); err != nil {
-				return err
-			}
-		}
 		result, err := dispatcher.DispatchWithGitHub(cmd.Context(), *cfg, store, gh)
 		if err != nil {
 			return err

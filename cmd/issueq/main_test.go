@@ -251,7 +251,7 @@ func TestDispatchCommandRequiresGitHubTokenByDefault(t *testing.T) {
 	}
 }
 
-func TestDispatchCommandLocalNoGitHubRunsSeededJob(t *testing.T) {
+func TestDispatchCommandLocalNoGitHubRequiresConfiguredStore(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "issueq.yaml")
 	dbPath := filepath.Join(dir, "issueq.db")
@@ -278,42 +278,13 @@ func TestDispatchCommandLocalNoGitHubRunsSeededJob(t *testing.T) {
 	buf := new(bytes.Buffer)
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)
-	cmd.SetArgs([]string{"--config", configPath, "dispatch", "--local-no-github"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("dispatch error = %v", err)
+	cmd.SetArgs([]string{"--config", configPath, "dispatch"})
+	err = cmd.Execute()
+	if err == nil {
+		t.Fatal("Execute() error = nil")
 	}
-	if !strings.Contains(buf.String(), "succeeded=1") {
-		t.Fatalf("dispatch output = %q", buf.String())
-	}
-
-	store, err = sqlitestore.Open(ctx, dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	jobs, err := store.ListJobs(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = store.Close()
-	if len(jobs) != 1 || jobs[0].Status != model.JobStatusSucceeded {
-		t.Fatalf("jobs = %#v", jobs)
-	}
-	if jobs[0].Attempts != 0 {
-		t.Fatalf("local fixture dispatch should not persist GitHub attempt count, got %d", jobs[0].Attempts)
-	}
-	data, err := os.ReadFile(jobs[0].StdoutPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(data), "cli-dispatch") {
-		t.Fatalf("stdout = %q", data)
-	}
-	ctxData, err := os.ReadFile(jobs[0].ContextPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(ctxData), `"attempt": 1`) {
-		t.Fatalf("context = %q, want first attempt", ctxData)
+	if !strings.Contains(err.Error(), "environment variable GITHUB_TOKEN named by github.token_env is not set") {
+		t.Fatalf("error = %v", err)
 	}
 }
 

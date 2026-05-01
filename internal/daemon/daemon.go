@@ -9,7 +9,6 @@ import (
 	"os"
 	"time"
 
-	"issueq/internal/actions"
 	"issueq/internal/config"
 	"issueq/internal/dispatcher"
 	issuegithub "issueq/internal/github"
@@ -29,7 +28,15 @@ type Result struct {
 }
 
 func Once(ctx context.Context, cfg config.Config, queue store.QueueStore, gh issuegithub.Client) (Result, error) {
+	return onceWithSupervisor(ctx, cfg, queue, gh, wrapper.New(""))
+}
+
+func onceWithSupervisor(ctx context.Context, cfg config.Config, queue store.QueueStore, gh issuegithub.Client, backend supervisor.Supervisor) (Result, error) {
 	var result Result
+	wave := dispatcher.NewWave(cfg, queue, gh, backend)
+	if err := wave.Preflight(ctx); err != nil {
+		return result, err
+	}
 	if gh != nil {
 		pollResult, err := poller.Poll(ctx, cfg, gh, queue)
 		if err != nil {
@@ -42,14 +49,7 @@ func Once(ctx context.Context, cfg config.Config, queue store.QueueStore, gh iss
 		return result, err
 	}
 	result.Route = routeResult
-	heartbeatGrace := cfg.Queue.LeaseDuration.Duration
-	if heartbeatGrace <= 0 {
-		heartbeatGrace = config.DefaultLeaseDuration
-	}
-	if _, err := queue.ReleaseExpiredLeases(ctx, time.Now().UTC(), time.Now().UTC().Add(-heartbeatGrace), "", nil); err != nil {
-		return result, err
-	}
-	dispatchResult, err := dispatcher.DispatchWithGitHub(ctx, cfg, queue, gh)
+	dispatchResult, err := wave.RunFrontier(ctx)
 	if err != nil {
 		return result, err
 	}
@@ -281,227 +281,21 @@ func (l *loop) refill(ctx context.Context) error {
 }
 
 func (l *loop) prepareClaimed(ctx context.Context, job *model.Job, route config.RouteConfig) (model.IssueSnapshot, bool, error) {
-	issue, err := l.queue.GetIssue(ctx, job.IssueKey)
+	prepared, err := workflow.PrepareClaimedWrapperLaunch(ctx, workflow.PrepareClaimedWrapperInput{Config: l.cfg, Queue: l.queue, GitHub: l.gh, Identity: l.identity, Job: job, Route: route, Lease: l.lease})
 	if err != nil {
-		if err := finalizeClaimed(ctx, l.queue, *job, l.identity.InstanceID, model.JobStatusFailed, fmt.Sprintf("load issue: %v", err)); err != nil {
-			return model.IssueSnapshot{}, false, err
-		}
-		return model.IssueSnapshot{}, false, nil
+		return model.IssueSnapshot{}, false, err
 	}
-	if l.gh == nil {
-		return issue, true, nil
-	}
-	if err := l.queue.RenewJobLease(ctx, job.ID, l.identity.InstanceID, l.lease); err != nil {
-		return model.IssueSnapshot{}, false, dropOwnership(err)
-	}
-	latest, err := l.gh.GetIssue(ctx, l.cfg.GitHub.Owner, l.cfg.GitHub.Repo, issue.Number)
-	if err != nil {
-		if err := finalizeClaimed(ctx, l.queue, *job, l.identity.InstanceID, model.JobStatusFailed, fmt.Sprintf("refresh issue: %v", err)); err != nil {
-			return model.IssueSnapshot{}, false, err
-		}
-		return model.IssueSnapshot{}, false, nil
-	}
-	if err := l.queue.RenewJobLease(ctx, job.ID, l.identity.InstanceID, l.lease); err != nil {
-		return model.IssueSnapshot{}, false, dropOwnership(err)
-	}
-	if err := l.queue.UpsertIssue(ctx, latest); err != nil {
-		if err := finalizeClaimed(ctx, l.queue, *job, l.identity.InstanceID, model.JobStatusFailed, fmt.Sprintf("store refreshed issue: %v", err)); err != nil {
-			return model.IssueSnapshot{}, false, err
-		}
-		return model.IssueSnapshot{}, false, nil
-	}
-	if !workflow.RouteStillMatches(l.cfg, route, latest) {
-		if err := finalizeClaimed(ctx, l.queue, *job, l.identity.InstanceID, model.JobStatusSkipped, "stale route predicate"); err != nil {
-			return model.IssueSnapshot{}, false, err
-		}
-		return model.IssueSnapshot{}, false, nil
-	}
-	issue = latest
-	generation, _, err := l.queue.GetIssueState(ctx, issue.IssueKey)
-	if err != nil {
-		if err := finalizeClaimed(ctx, l.queue, *job, l.identity.InstanceID, model.JobStatusFailed, fmt.Sprintf("load issue state: %v", err)); err != nil {
-			return model.IssueSnapshot{}, false, err
-		}
-		return model.IssueSnapshot{}, false, nil
-	}
-	attempts, err := l.queue.IncrementAttemptsForJob(ctx, job.ID, l.identity.InstanceID, issue.IssueKey, generation, route.Name)
-	if err != nil {
-		if workflow.IsOwnershipLoss(err) {
-			return model.IssueSnapshot{}, false, nil
-		}
-		if err := finalizeClaimed(ctx, l.queue, *job, l.identity.InstanceID, model.JobStatusFailed, fmt.Sprintf("increment attempts: %v", err)); err != nil {
-			return model.IssueSnapshot{}, false, err
-		}
-		return model.IssueSnapshot{}, false, nil
-	}
-	job.Attempts = attempts
-	if attempts > route.Job.MaxAttempts {
-		if err := l.queue.RenewJobLease(ctx, job.ID, l.identity.InstanceID, l.lease); err != nil {
-			return model.IssueSnapshot{}, false, dropOwnership(err)
-		}
-		if _, err := workflow.ApplyOwned(ctx, l.cfg, l.queue, l.gh, l.identity, job, l.lease, issue, route.Job.OnAttemptsExceeded); err != nil {
-			if workflow.IsOwnershipLoss(err) {
-				return model.IssueSnapshot{}, false, nil
-			}
-			if err := finalizeClaimed(ctx, l.queue, *job, l.identity.InstanceID, model.JobStatusFailed, fmt.Sprintf("apply attempts-exceeded actions: %v", err)); err != nil {
-				return model.IssueSnapshot{}, false, err
-			}
-			return model.IssueSnapshot{}, false, nil
-		}
-		if err := finalizeClaimed(ctx, l.queue, *job, l.identity.InstanceID, model.JobStatusDead, "max attempts exceeded"); err != nil {
-			return model.IssueSnapshot{}, false, err
-		}
-		return model.IssueSnapshot{}, false, nil
-	}
-	if err := l.queue.RenewJobLease(ctx, job.ID, l.identity.InstanceID, l.lease); err != nil {
-		return model.IssueSnapshot{}, false, dropOwnership(err)
-	}
-	applied, err := workflow.ApplyOwned(ctx, l.cfg, l.queue, l.gh, l.identity, job, l.lease, issue, route.Job.OnStart)
-	if err != nil {
-		if workflow.IsOwnershipLoss(err) {
-			return model.IssueSnapshot{}, false, nil
-		}
-		if err := finalizeClaimed(ctx, l.queue, *job, l.identity.InstanceID, model.JobStatusFailed, fmt.Sprintf("apply on_start actions: %v", err)); err != nil {
-			return model.IssueSnapshot{}, false, err
-		}
-		return model.IssueSnapshot{}, false, nil
-	}
-	issue = applied.UpdatedIssue
-	if applied.Changed {
-		dead, err := l.checkTransitionLimit(ctx, job, issue)
-		if err != nil {
-			if workflow.IsOwnershipLoss(err) {
-				return model.IssueSnapshot{}, false, nil
-			}
-			if err := finalizeClaimed(ctx, l.queue, *job, l.identity.InstanceID, model.JobStatusFailed, fmt.Sprintf("check transition limit: %v", err)); err != nil {
-				return model.IssueSnapshot{}, false, err
-			}
-			return model.IssueSnapshot{}, false, nil
-		}
-		if dead {
-			if err := finalizeClaimed(ctx, l.queue, *job, l.identity.InstanceID, model.JobStatusDead, "max transitions exceeded"); err != nil {
-				return model.IssueSnapshot{}, false, err
-			}
-			return model.IssueSnapshot{}, false, nil
-		}
-	}
-	_, _ = l.queue.InsertJobEvent(ctx, model.JobEvent{JobID: job.ID, IssueKey: job.IssueKey, EventType: "action_on_start"})
-	return issue, true, nil
+	return prepared.Issue, prepared.Outcome == workflow.PrepareLaunch, nil
 }
 
 func (l *loop) finalizeObservation(ctx context.Context, job model.Job, obs supervisor.Observation, now time.Time) error {
-	status, terminal := workflow.StatusForObservation(obs)
-	if !terminal {
-		return nil
-	}
-	lastErr := workflow.LastErrorForObservation(obs)
-	if l.gh != nil && status != model.JobStatusCancelled {
-		route, ok := workflow.RouteByName(l.cfg, job.RouteName)
-		if !ok {
-			return l.finalizeObservedTerminal(ctx, job, status, lastErr, obs, now)
-		}
-		issue, err := l.queue.GetIssue(ctx, job.IssueKey)
-		if err != nil {
-			return l.finalizeObservedTerminal(ctx, job, model.JobStatusFailed, fmt.Sprintf("load issue: %v", err), obs, now)
-		}
-		finalAction := route.Job.OnSuccess
-		if status != model.JobStatusSucceeded {
-			finalAction = route.Job.OnFailure
-		}
-		if status != model.JobStatusCancelled && obs.ResultPath != "" {
-			resultAction, found, parseErr := actions.ParseResultFile(obs.ResultPath)
-			if parseErr != nil {
-				status = model.JobStatusFailed
-				lastErr = parseErr.Error()
-				finalAction = route.Job.OnFailure
-			} else if found {
-				finalAction = actions.Merge(finalAction, resultAction)
-			}
-		}
-		if err := l.queue.RenewJobLease(ctx, job.ID, l.identity.InstanceID, l.lease); err != nil {
-			return dropOwnership(err)
-		}
-		applied, err := workflow.ApplyOwned(ctx, l.cfg, l.queue, l.gh, l.identity, &job, l.lease, issue, finalAction)
-		if err != nil {
-			if workflow.IsOwnershipLoss(err) {
-				return nil
-			}
-			status = model.JobStatusFailed
-			lastErr = err.Error()
-		} else if applied.Changed {
-			dead, err := l.checkTransitionLimit(ctx, &job, applied.UpdatedIssue)
-			if err != nil {
-				if workflow.IsOwnershipLoss(err) {
-					return nil
-				}
-				return l.finalizeObservedTerminal(ctx, job, model.JobStatusFailed, fmt.Sprintf("check transition limit: %v", err), obs, now)
-			}
-			if dead {
-				status = model.JobStatusDead
-				lastErr = "max transitions exceeded"
-			}
-		}
-	}
-	return l.finalizeObservedTerminal(ctx, job, status, lastErr, obs, now)
-}
-
-func (l *loop) finalizeObservedTerminal(ctx context.Context, job model.Job, status, lastErr string, obs supervisor.Observation, now time.Time) error {
-	finishedAt := obs.FinishedAt
-	if finishedAt.IsZero() {
-		finishedAt = now.UTC()
-	}
-	dropped, err := workflow.DropOnOwnershipLoss(l.queue.FinalizeJobOwned(ctx, job.ID, l.identity.InstanceID, model.JobFinalize{Status: status, LastError: lastErr, ResultPath: obs.ResultPath, StdoutPath: obs.StdoutPath, StderrPath: obs.StderrPath, FinishedAt: finishedAt}))
-	if err != nil || dropped {
-		return err
-	}
-	_, _ = l.queue.InsertJobEvent(ctx, model.JobEvent{JobID: job.ID, IssueKey: job.IssueKey, EventType: "job_" + status, Message: lastErr})
-	return nil
-}
-
-func (l *loop) checkTransitionLimit(ctx context.Context, job *model.Job, issue model.IssueSnapshot) (bool, error) {
-	if err := l.queue.RenewJobLease(ctx, job.ID, l.identity.InstanceID, l.lease); err != nil {
-		return false, err
-	}
-	count, err := l.queue.IncrementTransitionsForJob(ctx, job.ID, l.identity.InstanceID, issue.IssueKey)
-	if err != nil {
-		return false, err
-	}
-	limit := l.cfg.Workflow.MaxTransitionsPerIssue
-	if limit == 0 {
-		limit = 10
-	}
-	if limit >= 0 && count <= limit {
-		return false, nil
-	}
-	if l.gh != nil {
-		if err := l.queue.RenewJobLease(ctx, job.ID, l.identity.InstanceID, l.lease); err != nil {
-			return false, err
-		}
-		if _, err := workflow.ApplyOwned(ctx, l.cfg, l.queue, l.gh, l.identity, job, l.lease, issue, l.cfg.Workflow.OnTransitionsExceeded); err != nil {
-			if workflow.IsOwnershipLoss(err) {
-				return false, err
-			}
-			_, _ = l.queue.InsertJobEvent(ctx, model.JobEvent{JobID: job.ID, IssueKey: issue.IssueKey, EventType: "terminal_action_failed", Message: err.Error()})
-			return false, fmt.Errorf("apply transitions-exceeded actions: %w", err)
-		}
-	}
-	return true, nil
-}
-
-func dropOwnership(err error) error {
-	if workflow.IsOwnershipLoss(err) {
-		return nil
-	}
+	_, err := workflow.FinalizeOwnedObservationWithLifecycle(ctx, workflow.FinalizeObservationLifecycleInput{Config: l.cfg, Queue: l.queue, GitHub: l.gh, Identity: l.identity, Job: job, Obs: obs, Lease: l.lease, Now: now})
 	return err
 }
 
 func finalizeClaimed(ctx context.Context, queue store.QueueStore, job model.Job, runnerInstanceID, status, message string) error {
-	dropped, err := workflow.DropOnOwnershipLoss(queue.FinalizeJobOwned(ctx, job.ID, runnerInstanceID, model.JobFinalize{Status: status, LastError: message, FinishedAt: time.Now().UTC()}))
-	if err != nil || dropped {
-		return err
-	}
-	_, _ = queue.InsertJobEvent(ctx, model.JobEvent{JobID: job.ID, IssueKey: job.IssueKey, EventType: "job_" + status, Message: message})
-	return nil
+	_, err := workflow.FinalizeClaimedJobOwned(ctx, queue, job, runnerInstanceID, status, message)
+	return err
 }
 
 func (l *loop) stop(ctx context.Context) error {
