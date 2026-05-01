@@ -9,7 +9,8 @@ import (
 )
 
 func TestValidSampleConfigLoads(t *testing.T) {
-	cfg, err := LoadFile(filepath.Join("..", "..", "testdata", "valid-config.yaml"))
+	configPath := filepath.Join("..", "..", "testdata", "valid-config.yaml")
+	cfg, err := LoadFile(configPath)
 	if err != nil {
 		t.Fatalf("LoadFile() error = %v", err)
 	}
@@ -20,8 +21,92 @@ func TestValidSampleConfigLoads(t *testing.T) {
 	if len(cfg.Routes) != 3 {
 		t.Fatalf("routes len = %d, want 3", len(cfg.Routes))
 	}
-	if cfg.Routes[1].Job.Command[0] != "./tasks/code.sh" {
-		t.Fatalf("code command = %#v", cfg.Routes[1].Job.Command)
+	absConfigPath, err := filepath.Abs(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantCommand := filepath.Join(filepath.Dir(absConfigPath), "tasks", "code.sh")
+	if cfg.Routes[1].Job.Command[0] != wantCommand {
+		t.Fatalf("code command = %#v, want %q", cfg.Routes[1].Job.Command, wantCommand)
+	}
+}
+
+func TestLoadFileResolvesRelativePathsFromConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "issueq.yaml")
+	configText := `github:
+  owner: example-org
+  repo: example-repo
+queue:
+  sqlite:
+    path: ./queue/issueq.db
+workdir:
+  path: ./.issueq
+routes:
+  - name: explicit-current
+    job:
+      kind: code
+      command: ["./tasks/code.sh", "./unchanged-arg"]
+      timeout: 10m
+      concurrency: 1
+      max_attempts: 2
+  - name: explicit-parent
+    job:
+      kind: code
+      command: ["../bin/code.sh"]
+      timeout: 10m
+      concurrency: 1
+      max_attempts: 2
+  - name: bare-command
+    job:
+      kind: code
+      command: ["bash", "-lc", "./tasks/code.sh"]
+      timeout: 10m
+      concurrency: 1
+      max_attempts: 2
+`
+	if err := os.WriteFile(configPath, []byte(configText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+
+	if cfg.Queue.SQLite.Path != filepath.Join(dir, "queue", "issueq.db") {
+		t.Fatalf("sqlite path = %q", cfg.Queue.SQLite.Path)
+	}
+	if cfg.Workdir.Path != filepath.Join(dir, ".issueq") {
+		t.Fatalf("workdir path = %q", cfg.Workdir.Path)
+	}
+	if cfg.Routes[0].Job.Command[0] != filepath.Join(dir, "tasks", "code.sh") {
+		t.Fatalf("current command = %#v", cfg.Routes[0].Job.Command)
+	}
+	if cfg.Routes[0].Job.Command[1] != "./unchanged-arg" {
+		t.Fatalf("command arg resolved unexpectedly: %#v", cfg.Routes[0].Job.Command)
+	}
+	if cfg.Routes[1].Job.Command[0] != filepath.Clean(filepath.Join(dir, "..", "bin", "code.sh")) {
+		t.Fatalf("parent command = %#v", cfg.Routes[1].Job.Command)
+	}
+	if got := cfg.Routes[2].Job.Command; got[0] != "bash" || got[2] != "./tasks/code.sh" {
+		t.Fatalf("bare command changed = %#v", got)
+	}
+}
+
+func TestLoadFileLeavesMemorySQLitePath(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "issueq.yaml")
+	configText := strings.Replace(minimalConfig(), "    path: ./issueq.db", "    path: ':memory:'", 1)
+	if err := os.WriteFile(configPath, []byte(configText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadFile(configPath)
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if cfg.Queue.SQLite.Path != ":memory:" {
+		t.Fatalf("sqlite path = %q, want :memory:", cfg.Queue.SQLite.Path)
 	}
 }
 

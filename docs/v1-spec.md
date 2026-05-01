@@ -148,6 +148,8 @@ agent-ready
 
 All commands accept `--config <path>`. Default config path may be `./issueq.yaml`.
 
+When config is loaded from a file, relative `queue.sqlite.path` and `workdir.path` values are resolved relative to the directory containing that config file. Explicit relative subprocess executables in `job.command[0]` (`./...` or `../...`) are also resolved relative to the config file directory. Bare commands such as `bash`, `python3`, or `code-agent` are left unchanged and resolved through `PATH`; command arguments are not rewritten.
+
 ### 7.1 Required v1 commands
 
 ```bash
@@ -588,13 +590,13 @@ Configured command:
 command: ["./tasks/code.sh"]
 ```
 
-Actual invocation:
+Actual invocation, when the config file lives beside `tasks/`:
 
 ```bash
-./tasks/code.sh /path/to/context.json /path/to/result.json
+/path/to/config-dir/tasks/code.sh /path/to/context.json /path/to/result.json
 ```
 
-Commands are argv arrays, not shell strings.
+Commands are argv arrays, not shell strings. Only an explicit relative executable in `command[0]` is resolved relative to the config file directory; relative arguments are passed through unchanged.
 
 ### 13.2 Environment
 

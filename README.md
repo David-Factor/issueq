@@ -29,3 +29,4 @@ make check
 ```
 
 Default config path for all commands is `./issueq.yaml`; override with `--config <path>`.
+When config is loaded from a file, relative `queue.sqlite.path`, `workdir.path`, and explicit relative job executables (`job.command[0]` beginning with `./` or `../`) are resolved relative to the config file's directory. Bare commands such as `bash` or `python3` are still resolved via `PATH`.

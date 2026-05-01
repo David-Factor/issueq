@@ -39,7 +39,7 @@ routes:
       labels_exclude: [agent-running, agent-done, agent-failed, agent-needs-human, manual-only]
     job:
       kind: code
-      command: ["./examples/tasks/success.sh"]
+      command: ["./tasks/success.sh"]
       timeout: 5m
       concurrency: 1
       max_attempts: 2

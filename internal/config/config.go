@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -174,7 +175,37 @@ func LoadFileWithOptions(path string, opts ValidateOptions) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("load config %s: %w", path, err)
 	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve config path %s: %w", path, err)
+	}
+	cfg.ResolveRelativePaths(filepath.Dir(absPath))
 	return cfg, nil
+}
+
+func (c *Config) ResolveRelativePaths(baseDir string) {
+	if baseDir == "" {
+		return
+	}
+	c.Queue.SQLite.Path = resolveConfigPath(baseDir, c.Queue.SQLite.Path)
+	c.Workdir.Path = resolveConfigPath(baseDir, c.Workdir.Path)
+	for i := range c.Routes {
+		command := c.Routes[i].Job.Command
+		if len(command) > 0 && isExplicitRelativePath(command[0]) {
+			c.Routes[i].Job.Command[0] = resolveConfigPath(baseDir, command[0])
+		}
+	}
+}
+
+func resolveConfigPath(baseDir, path string) string {
+	if path == "" || path == ":memory:" || filepath.IsAbs(path) {
+		return path
+	}
+	return filepath.Clean(filepath.Join(baseDir, path))
+}
+
+func isExplicitRelativePath(path string) bool {
+	return strings.HasPrefix(path, "./") || strings.HasPrefix(path, "../")
 }
 
 // LoadBytes decodes, defaults, and validates YAML config bytes.

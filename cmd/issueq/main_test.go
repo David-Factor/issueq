@@ -109,6 +109,53 @@ routes:
 	}
 }
 
+func TestCLIResolvesRelativeDBPathFromConfigDir(t *testing.T) {
+	dir := t.TempDir()
+	cwd := t.TempDir()
+	configPath := filepath.Join(dir, "issueq.yaml")
+	content := `github:
+  owner: example-org
+  repo: example-repo
+queue:
+  sqlite:
+    path: ./issueq.db
+routes:
+  - name: triage
+    job:
+      kind: triage
+      command: ["./tasks/triage.sh"]
+      timeout: 10m
+      concurrency: 1
+      max_attempts: 2
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldwd) })
+
+	cmd := newRootCommand()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--config", configPath, "jobs"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("jobs Execute() error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "issueq.db")); err != nil {
+		t.Fatalf("config-relative DB missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(cwd, "issueq.db")); !os.IsNotExist(err) {
+		t.Fatalf("cwd DB existence err = %v, want not exist", err)
+	}
+}
+
 func TestPollCommandMissingTokenEnvFails(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "issueq.yaml")
