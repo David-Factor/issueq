@@ -11,10 +11,9 @@ It supersedes the implementation shape in `docs/concurrency-supervision-design.m
 - Share workflow primitives between `once`, `dispatch`, and `daemon`.
 - Move child-process supervision behind a small execution-supervisor abstraction.
 - Support a stable `issueq job-wrapper` execution contract.
-- Allow multiple launch backends:
-  - direct wrapper process supervision as the preferred default,
-  - systemd transient units running the wrapper as an optional backend,
-  - current attached Go process supervision only as a temporary migration/test bridge.
+- Hard-cut over H5 to a single production runtime implementation: the direct wrapper supervisor.
+- Keep a fake supervisor for tests only.
+- Preserve the small supervisor seam for future systemd, Docker, or launchd implementations without adding a backend registry, runtime negotiation, or mixed-backend compatibility during H5.
 - Keep daemon logic as a reconciler over durable state, not an owner of complex in-memory process maps.
 - Preserve existing GitHub lifecycle safeguards: ownership checks before side effects, stale route checks, attempt/transition limits, result action handling, and stale owner drops.
 - Preserve graceful shutdown behavior: stop claiming new work, cancel owned running jobs, finalize while ownership is held, and delete heartbeat only after cleanup succeeds.
@@ -23,10 +22,23 @@ It supersedes the implementation shape in `docs/concurrency-supervision-design.m
 
 - Removing SQLite.
 - Replacing SQLite with ZeroMQ or another messaging layer.
-- Requiring systemd for all installations.
+- Requiring systemd, Docker, or launchd for H5.
+- Supporting runtime selection among multiple production supervisor implementations during H5.
+- Preserving the attached runner as a supported fallback or compatibility mode.
 - Supporting cross-host distributed execution beyond the SQLite ownership/heartbeat model.
 - Re-enabling `once --no-wait` before durable detached supervision is fully implemented.
 - Perfect portable PID-only supervision without a wrapper or OS supervisor.
+
+## H5 implementation decision
+
+H5 is a hard cutover, not a compatibility migration. The supported implementations during H5 are:
+
+- production: direct wrapper supervisor only,
+- test-only aid: fake supervisor.
+
+The pre-H5 attached runner is obsolete. It must not be invoked as a production fallback or mixed execution mode. As each entrypoint is rewired during H5, its production path should move directly to wrapper-only execution. Any remaining attached-runner code at the end of H5 is transitional cleanup debt and should be deleted or bypassed as the wrapper-only path lands.
+
+Future supervisors such as systemd transient units, Docker/container supervisors, or macOS launchd may be added behind the same small `Supervisor` interface later. They are not part of H5 and should not drive a generalized backend registry, compatibility matrix, or runtime negotiation now.
 
 ## Core idea
 
@@ -119,8 +131,8 @@ The target design should move active execution state into SQLite as much as poss
 Required per-launch fields should be explicit, not inferred from reused job IDs or artifact paths:
 
 ```text
-supervisor_kind          attached | wrapper | systemd
-supervisor_id            backend-specific ID: unit name, wrapper pid, handle id, etc.
+supervisor_kind          wrapper in H5; reserved for future systemd/docker/launchd implementations
+supervisor_id            wrapper supervisor identity, currently wrapper pid/fingerprint material
 launch_token             unique token for this launch attempt
 launch_state             preparing | launching | running | unknown
 run_metadata_path        unique path to this launch's run.json / wrapper metadata
@@ -137,14 +149,14 @@ Backend-specific optional fields may include:
 pid                      observed process/wrapper pid, if available
 pgid                     process group id, if available
 process_started_at       OS process start-time/fingerprint, if available
-systemd_unit             transient unit name, if distinct from supervisor_id
+future_unit              future supervisor unit/container/agent name, if distinct from supervisor_id
 ```
 
-`launch_token` is mandatory for wrapper and systemd backends and should be included in the launch spec, launch record, wrapper metadata, and systemd unit name. Metadata paths must be unique per launch token. A daemon must never finalize or cancel a run using stale `run.json`, PID, or unit evidence from a previous launch; inspection must verify job ID plus launch token, and should verify attempt/generation where available.
+`launch_token` is mandatory for the wrapper implementation and any future durable supervisor. It is included in the launch spec, launch record, and wrapper metadata. Metadata paths must be unique per launch token. A daemon must never finalize or cancel a run using stale `run.json`, PID, or future supervisor evidence from a previous launch; inspection must verify job ID plus launch token, and should verify attempt/generation where available.
 
 `status = running` plus durable launch metadata is the daemon's observable active set. Jobs owned by the current `runner_instance_id` may be renewed, inspected, cancelled, and finalized directly. Jobs owned by another runner instance require the adoption policy below before any ownership-guarded mutation.
 
-In-memory state may still exist for an attached migration backend, but daemon policy should increasingly reconcile from DB rows rather than from an active handle map. Rows launched by the attached backend may record launch bookkeeping, but that bookkeeping is not durable detached supervision metadata. After daemon crash, attached rows follow the existing stale lease recovery path because no later process can safely inspect their live handles.
+H5 must not create attached rows. If an obsolete attached row is encountered during development, it is not durable detached work and should fail closed or follow explicit cleanup code, not production fallback execution. The daemon policy reconciles from DB rows and wrapper observations, never from an active handle map.
 
 ### Launch transaction and crash-window invariants
 
@@ -160,25 +172,25 @@ Recommended protocol:
 1. claim the job with ownership, setting `status = running`, `launch_state = preparing`, and the current `runner_instance_id`,
 2. write `context.json` and reserve unique per-launch artifact paths using a fresh `launch_token`,
 3. persist the launch specification/paths/token with an ownership guard while still in `preparing`,
-4. immediately before any backend side effect, atomically set `launch_state = launching` with an ownership guard,
-5. start the backend using that launch token,
+4. immediately before any wrapper side effect, atomically set `launch_state = launching` with an ownership guard,
+5. start the wrapper using that launch token,
 6. persist the returned launch record and set `launch_state = running` with an ownership guard,
 7. inspect/finalize only observations that match the persisted launch token.
 
 Crash recovery must be deterministic for every boundary:
 
 - claimed/preparing with no launch token/spec: recover by stale lease requeue when the owner heartbeat is stale or missing,
-- preparing with launch token/spec but before `launching`: no backend side effect should have occurred yet, so stale lease requeue is allowed after stale/missing heartbeat,
-- launching with durable launch spec but no verified backend identity: mark or leave `unknown`; do not finalize or PID-kill blindly,
-- spawned backend before launch record persistence: avoided where practical by making the wrapper/systemd identity deterministic from the launch token; otherwise recovery must treat the row as `unknown`, not requeue automatically,
-- launch record persisted before backend is observable: inspect returns `starting` until a short backend-defined startup grace expires, then `unknown`,
+- preparing with launch token/spec but before `launching`: no wrapper side effect should have occurred yet, so stale lease requeue is allowed after stale/missing heartbeat,
+- launching with durable launch spec but no verified wrapper identity: mark or leave `unknown`; do not finalize or PID-kill blindly,
+- spawned wrapper before launch record persistence: avoided where practical by making wrapper identity reconstructable from the launch token and persisted paths; otherwise recovery must treat the row as `unknown`, not requeue automatically,
+- launch record persisted before wrapper is observable: inspect returns `starting` until a short wrapper startup grace expires, then `unknown`,
 - completed metadata with mismatched launch token: ignore as stale evidence and report `unknown` or continue inspecting other verified evidence.
 
 Launch failures while ownership is still held should finalize through the normal failure path unless the failure was caused by shutdown/cancellation, which finalizes as `cancelled`. If ownership is lost during launch or launch-record persistence, the stale process must drop local mutations and avoid GitHub side effects; later recovery/adoption handles the row.
 
 ## Execution supervisor interface
 
-The workflow layer talks to a backend-neutral interface:
+The workflow layer talks to an implementation-neutral interface:
 
 ```go
 type Supervisor interface {
@@ -206,8 +218,8 @@ type LaunchSpec struct {
 }
 
 type LaunchRecord struct {
-    Kind         string // attached, wrapper, systemd
-    ID           string // handle id, wrapper pid, unit name, etc.
+    Kind         string // wrapper in H5; future implementations may use systemd/docker/launchd/etc.
+    ID           string // wrapper pid/fingerprint material or future implementation identity
     LaunchToken  string
     PID          int
     PGID         int
@@ -256,24 +268,22 @@ RunUnknown              -> keep running, mark/audit unknown, require policy or o
 
 Cancelled observations skip GitHub success/failure/result actions and finalize as `cancelled` while ownership is held.
 
-## Backends
+## Supervisor implementations
 
-### Attached supervisor backend
+### Obsolete attached runner
 
-The attached backend wraps the current Go `runner.Start` / `runner.Wait` behavior. It is a temporary migration bridge and test aid, not the preferred long-term architecture.
+The pre-H5 attached runner wraps the old Go `runner.Start` / `runner.Wait` behavior. It is obsolete for production execution.
 
-Properties:
+H5 requirements:
 
-- launches user command from the daemon/once process,
-- stores process handles in backend-private memory,
-- supports current tests and behavior,
-- should not leak live handles into daemon/workflow code.
+- do not invoke attached execution from daemon, `once`, or `dispatch`,
+- do not silently fall back to attached execution if wrapper launch fails,
+- do not document attached execution as a supported mode,
+- delete attached adapters when practical; any temporary remnants are cleanup debt only.
 
-This backend can preserve existing behavior during early refactor phases, but should be removed or minimized once wrapper-backed reconciliation works.
+### Direct wrapper supervisor implementation
 
-### Wrapper supervisor backend
-
-The wrapper backend launches `issueq job-wrapper` directly as a child process. The wrapper owns the user command execution and writes durable run metadata.
+The direct wrapper implementation launches `issueq job-wrapper` directly as a child process. The wrapper owns the user command execution and writes durable run metadata.
 
 For durable crash recovery, the wrapper must be launched so it can outlive daemon crashes without receiving an accidental parent-death cancellation. Durable wrapper launch must not be tied to the daemon request context in the way `exec.CommandContext` normally kills children. It should use a separate process group/session where appropriate, close inherited resources that would keep daemon pipes/files alive, and persist enough identity to verify the wrapper/process later, e.g. PID plus process start time or PGID plus metadata path. If the platform cannot provide safe identity verification, recovery must treat the launch state as unknown rather than killing/finalizing by PID alone.
 
@@ -285,37 +295,20 @@ Properties:
 - wrapper waits on the command and records exit status,
 - wrapper enforces the issueq timeout and writes timeout metadata,
 - daemon inspects PID/PGID plus metadata file,
-- cancellation should first signal the wrapper/process group, wait a short backend-defined grace period, then force-kill if needed; repeated cancel is idempotent,
+- cancellation should first signal the wrapper/process group, wait a short implementation-defined grace period, then force-kill if needed; repeated cancel is idempotent,
 - if the wrapper is killed before writing `run.json`, the daemon may synthesize a cancelled/timed-out observation only while ownership is held and after it has verified backend termination under the persisted launch token; otherwise inspection reports `unknown`.
 
-This backend is the preferred portable long-term default if systemd is not required.
+This implementation is the only production runtime supported by H5.
 
-### Systemd supervisor backend
+### Future supervisor implementations
 
-The systemd backend launches the same wrapper under a transient systemd unit:
+Systemd, Docker/container, or macOS launchd supervisors may be added later behind the same wrapper contract and `Supervisor` interface. They are not part of H5 and should not introduce a backend registry or mixed-backend compatibility into the wrapper-only cutover.
 
-```text
-systemd-run --unit issueq-job-<jobID>-<launchToken> --property=KillMode=control-group --property=RuntimeMaxSec=<timeout+grace> --property=CollectMode=inactive-or-failed ... issueq job-wrapper ...
-```
-
-Unit names must be sanitized and collision-resistant, e.g. include the job ID and launch token. Timeout ownership should be explicit: the wrapper owns the issueq timeout and writes issueq metadata; systemd `RuntimeMaxSec`, if used, should be a timeout plus grace safety net. The backend should request cleanup/collection where supported and should define stop/kill grace behavior consistently with wrapper cancellation.
-
-Properties:
-
-- systemd owns process lifetime, cgroups, and process-tree killing,
-- daemon records unit name as `supervisor_id`,
-- inspect maps systemd unit state plus wrapper metadata to `Observation`,
-- valid wrapper `run.json` is authoritative for completed issueq semantics,
-- missing unit plus valid metadata may still be finalized from metadata,
-- missing unit plus missing or invalid metadata is `RunUnknown`, not success or failure,
-- cancel stops/kills the unit,
-- still uses wrapper metadata for issueq-specific exit/result semantics.
-
-Systemd is a backend, not the core architecture. Core workflow should depend only on the `Supervisor` interface and issueq observation states.
+A future systemd implementation would launch the same wrapper under a transient unit, use the unit name as `supervisor_id`, map unit state plus wrapper metadata to `Observation`, and treat missing unit plus missing/invalid metadata as `RunUnknown`, not success or failure. Similar future implementations must preserve the same launch-token and wrapper-metadata invariants.
 
 ## Job wrapper contract
 
-`issueq job-wrapper` is the stable execution contract for wrapper and systemd backends.
+`issueq job-wrapper` is the stable execution contract for H5 and for future supervisors.
 
 Responsibilities:
 
@@ -402,7 +395,7 @@ The supervisor abstraction must not bypass ownership. Launch record persistence 
 
 ## Adoption, restart, and recovery
 
-Durable wrapper/systemd supervision creates a new case: a job can keep running after the issueq daemon that claimed it has exited. A later daemon must not blindly requeue that job, and it also must not mutate/finalize it while it is still owned by the dead runner instance.
+Durable wrapper supervision creates a new case: a job can keep running after the issueq daemon that claimed it has exited. A later daemon must not blindly requeue that job, and it also must not mutate/finalize it while it is still owned by the dead runner instance.
 
 Recovery therefore uses explicit adoption.
 
@@ -412,12 +405,12 @@ A daemon may adopt a `running` job owned by another `runner_instance_id` only if
 
 - the job lease is expired,
 - the owner heartbeat is missing or stale,
-- the job has durable supervisor metadata (`supervisor_kind`, `launch_token`, `supervisor_id` or metadata path) sufficient for the selected backend to inspect/cancel it,
-- the backend can verify launch identity using read-only evidence before adoption, e.g. completed metadata exists, the systemd unit is known, or the wrapper/process identity is verified.
+- the job has durable wrapper metadata (`supervisor_kind = wrapper`, `launch_token`, `supervisor_id` or metadata path) sufficient to inspect/cancel it,
+- the wrapper supervisor can verify launch identity using read-only evidence before adoption, e.g. completed metadata exists or the wrapper/process identity is verified.
 
 Rows without durable launch metadata follow the existing stale lease recovery path: requeue only after expired lease plus stale/missing heartbeat. They must not be PID-killed or finalized based on PID alone.
 
-Rows with durable launch metadata but unverifiable launch identity are different: they must not be automatically requeued, because doing so can duplicate a still-running detached wrapper/systemd job. Report them as unknown and keep them `running`. A daemon that has not adopted the job must not perform normal ownership-guarded mutations; it may either report unknown read-only, or use a dedicated stale-owner-safe store method that only marks `launch_state = unknown` when the lease is expired and the old owner heartbeat is stale/missing, without changing ownership, cancelling, finalizing, or applying GitHub side effects.
+Rows with durable launch metadata but unverifiable launch identity are different: they must not be automatically requeued, because doing so can duplicate a still-running detached wrapper job. Report them as unknown and keep them `running`. A daemon that has not adopted the job must not perform normal ownership-guarded mutations; it may either report unknown read-only, or use a dedicated stale-owner-safe store method that only marks `launch_state = unknown` when the lease is expired and the old owner heartbeat is stale/missing, without changing ownership, cancelling, finalizing, or applying GitHub side effects.
 
 ### Adoption operation
 
@@ -454,15 +447,15 @@ On daemon start and periodically:
 
 - heartbeat current runner instance,
 - inspect and renew running jobs already owned by the current runner instance,
-- for stale-owner jobs with durable launch metadata, perform a read-only backend verification/probe and attempt atomic adoption only when identity is verified,
-- after adoption, inspect the backend observation:
-  - completed wrapper/systemd metadata with matching launch token may be finalized,
+- for stale-owner jobs with durable launch metadata, perform a read-only wrapper verification/probe and attempt atomic adoption only when identity is verified,
+- after adoption, inspect the wrapper observation:
+  - completed wrapper metadata with matching launch token may be finalized,
   - still-running verified work may be renewed and left running,
   - timed-out verified work may be cancelled and finalized,
   - unknown launch state should remain running until an explicit operator intervention/stale-unknown policy handles it; unknown state may continue to consume configured capacity by design,
 - release/requeue expired jobs only when they have no durable launch metadata, are not safely inspectable/adoptable, and the owner heartbeat is stale/missing.
 
-On restart, reconciliation must dispatch by each row's persisted `supervisor_kind`, not merely by the currently configured default backend for new launches. If support for an existing row's backend is unavailable, inspection should leave the row `unknown` and operator-visible rather than requeueing or finalizing it.
+On restart, H5 reconciliation expects wrapper-owned rows. Rows with unsupported or future `supervisor_kind` values are operator-visible unknown, not requeued or finalized. Future implementations may add per-kind dispatch behind the same interface, but H5 must not build mixed-backend compatibility as part of the wrapper-only cutover.
 
 `once` and `dispatch` remain bounded waves. Full stale-owner adoption is a daemon responsibility. Bounded commands may perform a nonblocking recovery pre-pass for jobs in their captured frontier, but must not wait indefinitely on unrelated stale durable jobs or adopt work outside their bounded policy.
 
@@ -534,18 +527,19 @@ Cover:
 
 Scope: `internal/supervisor` behavior. No queue and no GitHub.
 
-Use a shared contract test style where practical for fake, wrapper, and future systemd backends.
+Use a shared contract test style where practical for fake, wrapper, and future implementations.
 
 Cover:
 
 - launch returns a valid `LaunchRecord`,
-- inspect maps backend state to `starting`, `running`, exited zero, exited nonzero, timed out, cancelled, and unknown,
-- stale `run.json`, stale unit evidence, or mismatched launch token is rejected or reported unknown,
+- inspect maps wrapper state to `starting`, `running`, exited zero, exited nonzero, timed out, cancelled, and unknown,
+- stale `run.json` or mismatched launch token is rejected or reported unknown,
 - PID reuse or process start-time mismatch is conservative where the platform exposes enough evidence,
 - elapsed `timeout_at` alone does not authorize blind kill/finalization without verified launch identity,
 - cancellation is idempotent,
 - stdout/stderr/result/metadata paths are respected,
-- backend mismatch or missing backend support is conservative and operator-visible.
+- unsupported/future `supervisor_kind` is conservative and operator-visible,
+- no production code silently falls back to the obsolete attached runner.
 
 ### Job wrapper tests
 
@@ -604,5 +598,5 @@ Keep E2E tests few and meaningful, using real SQLite plus the wrapper backend:
 - timeout kills process tree,
 - daemon shutdown cancels/finalizes owned jobs,
 - daemon restart finalizes a completed wrapper-backed job,
-- wrapper is the operational default after cutover,
+- wrapper is the only operational default after cutover,
 - `once --no-wait` remains unsupported unless durable detached semantics are explicitly implemented.

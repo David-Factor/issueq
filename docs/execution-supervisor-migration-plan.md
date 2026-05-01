@@ -12,9 +12,15 @@ internal/daemon       long-lived reconciliation policy
 internal/dispatcher   bounded once/dispatch policy
 ```
 
-The attached runner path is only a temporary bridge or test aid. Do not spend effort making attached supervision a polished durable backend. The preferred target backend is the direct wrapper supervisor; systemd remains optional later.
+The attached runner path was a temporary compile/test bridge during early phases only. H5 is a hard cutover: production execution must use the direct wrapper supervisor as the single supported runtime implementation. Do not preserve attached execution as a fallback, compatibility mode, or configurable production backend; delete or bypass it as H5 wiring lands.
 
-Future launch mechanisms and executors are explicitly out of scope for the hard cutover. Preserve the seams for later experimentation: systemd can be added as a supervisor backend that launches `issueq job-wrapper`, while Docker/container runtimes can be added as job-wrapper executors beneath the same wrapper contract. Do not introduce speculative generalized backend/executor registries before the local wrapper backend is working.
+Future launch mechanisms and executors are explicitly out of scope for the hard cutover. Preserve only the small `Supervisor` seam for later experimentation: systemd can be added as a supervisor implementation that launches `issueq job-wrapper`; Docker/container runtimes can be added later as wrapper executors or supervisors; launchd can be added later for native macOS supervision. Do not introduce speculative generalized backend/executor registries, mixed-backend compatibility, or runtime negotiation before the wrapper-only cutover is working.
+
+H5 supported implementations:
+
+- production: direct wrapper supervisor only,
+- test-only aid: fake supervisor,
+- unsupported during H5: attached runner fallback, mixed attached/wrapper execution, systemd/Docker/launchd runtime selection.
 
 ## Standard gates
 
@@ -65,7 +71,7 @@ Cover:
 
 Scope: `internal/supervisor` behavior. No queue and no GitHub.
 
-Use a shared contract test style where practical for fake, wrapper, and future systemd backends:
+Use a shared contract test style where practical for fake, wrapper, and future implementations:
 
 - launch returns a valid `LaunchRecord`,
 - inspect `starting`, `running`, exited zero, exited nonzero, timed out, cancelled, and unknown,
@@ -74,7 +80,7 @@ Use a shared contract test style where practical for fake, wrapper, and future s
 - elapsed `timeout_at` alone does not authorize blind kill/finalization without verified launch identity,
 - cancellation is idempotent,
 - stdout/stderr/result/metadata paths are respected,
-- backend mismatch or missing backend support is conservative.
+- no production code silently falls back to the obsolete attached runner.
 
 ### Job wrapper tests
 
@@ -117,9 +123,10 @@ Cover:
 - daemon polls/routes while jobs run,
 - daemon reaps/refills promptly,
 - daemon shutdown cancels owned jobs and deletes heartbeat only after clean cleanup,
-- daemon adopts only verified stale-owner durable jobs,
-- unknown durable jobs remain running/operator-visible and do not auto-requeue,
-- bounded commands do not adopt or wait on unrelated stale durable jobs.
+- daemon adopts only verified stale-owner durable wrapper jobs,
+- unknown durable wrapper jobs remain running/operator-visible and do not auto-requeue,
+- bounded commands do not adopt or wait on unrelated stale durable jobs,
+- no production path invokes the obsolete attached runner.
 
 ### End-to-end smokes
 
@@ -130,7 +137,7 @@ Keep these few and meaningful, using real SQLite plus wrapper backend:
 - timeout kills process tree,
 - daemon shutdown cancels/finalizes owned jobs,
 - daemon restart finalizes a completed wrapper-backed job,
-- wrapper is the operational default after cutover,
+- wrapper is the only operational default after cutover,
 - `once --no-wait` remains unsupported unless durable detached semantics are explicitly implemented.
 
 ## Completed setup phases
@@ -147,7 +154,7 @@ f856a1d Document execution supervisor refactor plan
 
 ### Phase E0a — harden execution supervisor invariants
 
-Added crash-window, launch-token, adoption/requeue/unknown, wrapper/systemd, and restart-finalization invariants.
+Added crash-window, launch-token, adoption/requeue/unknown, wrapper-first, and restart-finalization invariants.
 
 Commit:
 
@@ -179,9 +186,9 @@ Create the architectural seams early, without trying to preserve the old attache
   - prepare claimed job,
   - finalize observation,
   - cancel owned job.
-- Add a minimal attached supervisor adapter only as a bridge so existing commands can compile while wrapper support is built. Keep it small and mark it temporary; do not make it a durable backend.
+- Add a minimal attached supervisor adapter only as a short-lived compile bridge if unavoidable while H1 lands. It is not a supported runtime implementation and should be bypassed/deleted during H5 rather than polished.
 - Add a simple fake supervisor for workflow/daemon tests.
-- Keep current command behavior as much as practical, but do not over-invest in attached backend polish.
+- Keep current command behavior as much as practical for this early seam-creation phase, but prefer changes that make later wrapper-only cutover simpler over preserving attached behavior.
 
 ### Tests
 
@@ -291,8 +298,8 @@ Launch jobs through `issueq job-wrapper` directly and expose durable observation
   - startup grace,
   - unknown state conservatively.
 - Cancel wrapper/user process group with graceful-then-force behavior.
-- Add config selection for execution supervisor, but keep the operational default on the existing attached path until H5 rewrites entrypoints around durable reconciliation. H4 may expose wrapper through tests or an explicit experimental config only.
-- Keep attached runner only as temporary compatibility/test code if still needed.
+- Add config selection only if needed for experimental/manual testing, but do not present attached execution as a supported fallback. H5 will make wrapper the only production runtime path.
+- Keep attached runner only as temporary compile/test code if still needed; production paths must not depend on it after H5.
 
 ### Tests
 
@@ -308,63 +315,75 @@ Launch jobs through `issueq job-wrapper` directly and expose durable observation
 Add direct wrapper supervisor backend
 ```
 
-## Phase H5 — rewrite workflow and entrypoints around durable reconciliation
+## Phase H5 — hard-cut over workflow and entrypoints to wrapper reconciliation
 
 ### Goals
 
-Move daemon, `once`, and `dispatch` onto workflow primitives plus supervisor observations. This is the main simplification phase.
+Move daemon, `once`, and `dispatch` onto workflow primitives plus direct-wrapper supervisor observations. This is the main simplification phase and is a hard cutover: the wrapper supervisor becomes the only production execution path, the fake supervisor remains test-only, and the obsolete attached runner must not be used as a production fallback.
 
 ### Work items
 
-- Implement workflow primitives for:
+- Implement wrapper-only workflow primitives for:
   - heartbeat/recovery/pruning,
   - claim and prepare job,
   - launch transaction protocol,
-  - inspect/finalize owned running jobs,
-  - stale-owner verification/adoption,
-  - per-row backend dispatch using persisted `supervisor_kind`, including unavailable-backend handling as unknown/operator-visible,
+  - inspect/finalize owned running wrapper jobs,
+  - stale-owner wrapper verification/adoption,
+  - unsupported or non-wrapper persisted launch metadata treated as unknown/operator-visible rather than migrated or executed,
   - timeout/cancel handling,
   - GitHub lifecycle side effects with ownership checks.
 - Rewrite daemon as a DB reconciler:
   - heartbeat,
   - poll/route cadence,
-  - inspect owned running rows,
-  - adopt verified stale-owner durable rows,
+  - inspect owned running wrapper rows,
+  - adopt verified stale-owner durable wrapper rows,
   - finalize completed observations,
   - mark/report unknown durable rows conservatively,
-  - recover stale non-durable rows,
-  - claim/launch by DB-derived capacity,
+  - recover stale non-durable rows only when no wrapper side effect could have occurred,
+  - claim/launch by DB-derived capacity through the wrapper supervisor,
   - shutdown cleanup with heartbeat deletion only after success.
 - Rewrite `once` and `dispatch` as bounded frontier policies using the same workflow primitives.
-- Switch new launches and default config to the wrapper supervisor after durable reconciliation paths are in place.
-- Keep `once --no-wait` unsupported unless durable detached semantics are explicitly completed.
-- Remove or bypass daemon-owned active process map logic.
+- Make new launches and default config use the wrapper supervisor as the only supported production path.
+- Keep `once --no-wait` unsupported unless durable detached CLI semantics are explicitly completed.
+- Delete or bypass daemon-owned active process map logic and attached-runner invocation paths; if immediate deletion is not practical, clearly mark remaining code as obsolete cleanup debt, not supported behavior.
+- Do not add a backend registry, mixed-backend compatibility layer, or runtime fallback to attached execution.
+
+### Suggested implementation slices
+
+- H5.1 durable wrapper observation/reconciliation primitives.
+- H5.2 finalize DB-owned running wrapper jobs from observations.
+- H5.3 durable wrapper launch transaction path.
+- H5.4 daemon DB reconciler loop.
+- H5.5 bounded `once`/`dispatch` frontier policy.
+- H5.6 restart/stale-owner adoption plus conservative unknown handling.
+- H5.7 wrapper-only default path, attached bypass/deletion, and E2E smokes.
 
 ### Tests
 
 - Workflow tests with fake store/GitHub/supervisor for success, failure, timeout, cancelled, unknown, result JSON, stale route, transition/attempt limits, lost ownership, and restart finalization.
-- Entrypoint policy tests for bounded frontier, daemon poll responsiveness, reap/refill, adoption, unknown, and shutdown cleanup.
-- E2E smokes with real SQLite plus wrapper backend, including verification that wrapper is the operational default for new launches.
+- Entrypoint policy tests for bounded frontier, daemon poll responsiveness, reap/refill, adoption, unknown, shutdown cleanup, and no attached-runner fallback.
+- E2E smokes with real SQLite plus wrapper backend, including verification that wrapper is the only operational default for new launches.
 - Standard gates.
 
 ### Commit message
 
 ```text
-Rewrite execution around durable reconciliation
+Rewrite execution around durable wrapper reconciliation
 ```
 
-## Phase H6 — delete obsolete attached-handle architecture
+## Phase H6 — remove remaining obsolete supervision plumbing
 
 ### Goals
 
-Remove old complexity after wrapper-backed reconciliation is working.
+Finish cleanup after wrapper-only reconciliation is working. Because H5 is a hard cutover, H6 should be small: remove leftover attached-handle code, compatibility tests, and any temporary adapters that were not deleted during H5.
 
 ### Work items
 
-- Delete obsolete daemon active-map/process-handle plumbing.
-- Delete or reduce attached supervisor/runner compatibility code not needed for tests.
+- Delete any remaining obsolete daemon active-map/process-handle plumbing.
+- Delete attached supervisor/runner compatibility code not needed by wrapper or tests.
 - Simplify dispatcher/daemon tests that only existed for old internals.
 - Tighten package boundaries so workflow does not depend on process handles and supervisor does not depend on GitHub/queue policy.
+- Verify there is no config, command, or runtime fallback that selects attached execution.
 - Run race tests for daemon/workflow/supervisor packages if practical.
 
 ### Tests
@@ -419,7 +438,7 @@ Document the simplified architecture and prepare for final manual E2E.
 
 - Update README and `docs/v1-spec.md` where user-visible behavior/config changed.
 - Update `docs/v1-implementation-plan.md` Phase 9 status notes.
-- Document wrapper backend behavior, restart recovery, shutdown cleanup, unknown-state operator expectations, and optional systemd tradeoffs.
+- Document wrapper-only H5 behavior, restart recovery, shutdown cleanup, unknown-state operator expectations, and optional future supervisor tradeoffs.
 - Document why `once --no-wait` remains unsupported or define precise criteria for enabling it.
 
 ### Tests
