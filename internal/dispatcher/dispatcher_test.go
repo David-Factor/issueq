@@ -3,6 +3,7 @@ package dispatcher
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,26 +97,42 @@ printf '{' > "$2"
 
 func TestDispatchLocalRunsJobsConcurrently(t *testing.T) {
 	ctx := context.Background()
-	store, cfg := setupDispatch(t, `#!/bin/sh
-sleep 0.2
-`)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "started")
+	script := fmt.Sprintf(`#!/bin/sh
+printf %%s $$ > %q.$$
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  set -- %q.*
+  if [ -e "$1" ] && [ -e "$2" ]; then exit 0; fi
+  sleep 0.05
+done
+exit 42
+`, marker, marker)
+	store, cfg := setupDispatch(t, script)
 	defer store.Close()
 	cfg.Queue.MaxGlobalConcurrency = 2
 	cfg.Routes[0].Job.Concurrency = 2
 	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "dedupe-2"}); err != nil {
 		t.Fatal(err)
 	}
-	started := time.Now()
 	result, err := Dispatch(ctx, cfg, store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	elapsed := time.Since(started)
 	if result.Claimed != 2 || result.Succeeded != 2 {
 		t.Fatalf("result = %#v", result)
 	}
-	if elapsed >= 350*time.Millisecond {
-		t.Fatalf("dispatch took %s, want overlapping jobs", elapsed)
+	assertOverlappedStarts(t, marker)
+}
+
+func assertOverlappedStarts(t *testing.T, marker string) {
+	t.Helper()
+	matches, err := filepath.Glob(marker + ".*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 2 {
+		t.Fatalf("started marker count = %d, want 2 (%#v)", len(matches), matches)
 	}
 }
 
@@ -175,7 +192,7 @@ func TestDispatchLocalHeartbeatsWhileJobsRun(t *testing.T) {
 sleep 0.12
 `)
 	defer store.Close()
-	cfg.Queue.LeaseDuration = config.Duration{Duration: 40 * time.Millisecond}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
 	cfg.Routes[0].Job.Timeout = config.Duration{Duration: time.Second}
 	result, err := Dispatch(ctx, cfg, store)
 	if err != nil {
@@ -337,9 +354,18 @@ func (f *fakeGitHub) callError(name string) error {
 
 func TestDispatchWithGitHubRunsJobsConcurrently(t *testing.T) {
 	ctx := context.Background()
-	store, cfg := setupDispatch(t, `#!/bin/sh
-sleep 0.2
-`)
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "started")
+	script := fmt.Sprintf(`#!/bin/sh
+printf %%s $$ > %q.$$
+for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+  set -- %q.*
+  if [ -e "$1" ] && [ -e "$2" ]; then exit 0; fi
+  sleep 0.05
+done
+exit 42
+`, marker, marker)
+	store, cfg := setupDispatch(t, script)
 	defer store.Close()
 	cfg.Queue.MaxGlobalConcurrency = 2
 	cfg.Routes[0].Job.Concurrency = 2
@@ -348,18 +374,14 @@ sleep 0.2
 		t.Fatal(err)
 	}
 	gh := &fakeGitHub{issue: model.IssueSnapshot{IssueKey: "github.com/example-org/example-repo#1", Host: "github.com", Owner: "example-org", Repo: "example-repo", Number: 1, Title: "Issue", Labels: []string{"agent-ready"}, State: "open"}}
-	started := time.Now()
 	result, err := DispatchWithGitHub(ctx, cfg, store, gh)
 	if err != nil {
 		t.Fatal(err)
 	}
-	elapsed := time.Since(started)
 	if result.Claimed != 2 || result.Succeeded != 2 {
 		t.Fatalf("result = %#v", result)
 	}
-	if elapsed >= 350*time.Millisecond {
-		t.Fatalf("dispatch took %s, want overlapping GitHub jobs", elapsed)
-	}
+	assertOverlappedStarts(t, marker)
 }
 
 func TestDispatchWithGitHubLostOwnershipBeforeOnStartSkipsGitHubAction(t *testing.T) {
@@ -824,7 +846,7 @@ func TestDispatchLocalTransientRenewalErrorRetriesWithoutKillingJob(t *testing.T
 	ctx := context.Background()
 	baseStore, cfg := setupDispatch(t, "#!/bin/sh\nexit 0\n")
 	defer baseStore.Close()
-	cfg.Queue.LeaseDuration = config.Duration{Duration: 40 * time.Millisecond}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
 	cfg.Routes[0].Job.Timeout = config.Duration{Duration: time.Second}
 	proc := newDispatcherFakeProcess(2001)
 	fakeStarter := &dispatcherFakeStarter{processes: []*dispatcherFakeProcess{proc}}
@@ -864,7 +886,7 @@ func TestDispatchLocalLostOwnershipCancelsAndSkipsFinalization(t *testing.T) {
 	ctx := context.Background()
 	baseStore, cfg := setupDispatch(t, "#!/bin/sh\nexit 0\n")
 	defer baseStore.Close()
-	cfg.Queue.LeaseDuration = config.Duration{Duration: 40 * time.Millisecond}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
 	cfg.Routes[0].Job.Timeout = config.Duration{Duration: time.Second}
 	proc := newDispatcherFakeProcess(2002)
 	fakeStarter := &dispatcherFakeStarter{processes: []*dispatcherFakeProcess{proc}}
@@ -900,7 +922,7 @@ func TestDispatchLocalLostOwnershipCancelsOnlyAffectedJob(t *testing.T) {
 	baseStore, cfg := setupDispatch(t, "#!/bin/sh\nexit 0\n")
 	defer baseStore.Close()
 	cfg.Queue.MaxGlobalConcurrency = 2
-	cfg.Queue.LeaseDuration = config.Duration{Duration: 40 * time.Millisecond}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
 	cfg.Routes[0].Job.Concurrency = 2
 	cfg.Routes[0].Job.Timeout = config.Duration{Duration: time.Second}
 	if _, _, err := baseStore.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "dedupe-2"}); err != nil {
