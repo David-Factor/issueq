@@ -27,6 +27,15 @@ CREATE TABLE IF NOT EXISTS jobs (
   runner_instance_id text,
   lease_until text,
   pid integer,
+  pgid integer,
+  supervisor_kind text,
+  supervisor_id text,
+  launch_token text,
+  launch_state text,
+  process_started_at text,
+  run_metadata_path text,
+  launch_spec_path text,
+  timeout_at text,
   context_path text,
   result_path text,
   stdout_path text,
@@ -42,6 +51,11 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status_priority_created ON jobs(status, prio
 CREATE INDEX IF NOT EXISTS idx_jobs_issue_key ON jobs(issue_key);
 CREATE INDEX IF NOT EXISTS idx_jobs_status_lease_runner ON jobs(status, lease_until, runner_instance_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status_route_name ON jobs(status, route_name);
+CREATE INDEX IF NOT EXISTS idx_jobs_running_owner ON jobs(status, runner_instance_id, lease_until);
+CREATE INDEX IF NOT EXISTS idx_jobs_running_launch ON jobs(status, supervisor_kind, launch_state, launch_token);
+CREATE INDEX IF NOT EXISTS idx_jobs_running_route_capacity ON jobs(status, route_name);
+CREATE INDEX IF NOT EXISTS idx_jobs_running_timeout ON jobs(status, timeout_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_stale_durable_recovery ON jobs(status, lease_until, runner_instance_id, supervisor_kind, launch_token);
 
 CREATE TABLE IF NOT EXISTS issue_state (
   issue_key text primary key,

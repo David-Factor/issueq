@@ -26,6 +26,15 @@ type QueueStore interface {
 	FinalizeJobOwned(ctx context.Context, jobID string, runnerInstanceID string, result model.JobFinalize) error
 	UpdateJobArtifacts(ctx context.Context, jobID, contextPath, resultPath, stdoutPath, stderrPath string, pid int) error
 	UpdateJobArtifactsOwned(ctx context.Context, jobID, runnerInstanceID, contextPath, resultPath, stdoutPath, stderrPath string, pid int) error
+	PersistLaunchSpecOwned(ctx context.Context, jobID, runnerInstanceID string, record model.LaunchSpecRecord) error
+	MarkJobLaunchingOwned(ctx context.Context, jobID, runnerInstanceID, launchToken string) error
+	PersistLaunchRecordOwned(ctx context.Context, jobID, runnerInstanceID string, record model.LaunchRecord) error
+	ListOwnedRunningJobs(ctx context.Context, runnerInstanceID string) ([]model.Job, error)
+	CountRunningJobs(ctx context.Context) (int, error)
+	CountRunningJobsByRoute(ctx context.Context, routeName string) (int, error)
+	ListStaleDurableRunningJobs(ctx context.Context, now, staleHeartbeatBefore time.Time) ([]model.Job, error)
+	AdoptStaleRunningJob(ctx context.Context, jobID, oldRunnerInstanceID string, newIdentity model.RunnerIdentity, leaseDuration time.Duration, now, staleHeartbeatBefore time.Time) (*model.Job, error)
+	MarkStaleRunningJobUnknown(ctx context.Context, jobID, oldRunnerInstanceID string, now, staleHeartbeatBefore time.Time) error
 	UpdateJobAttempts(ctx context.Context, jobID string, attempts int) error
 	UpdateJobAttemptsOwned(ctx context.Context, jobID, runnerInstanceID string, attempts int) error
 	IncrementAttempts(ctx context.Context, issueKey string, generation int, routeName string) (int, error)

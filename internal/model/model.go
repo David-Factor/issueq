@@ -16,6 +16,13 @@ const (
 	JobStatusCancelled = "cancelled"
 )
 
+const (
+	LaunchStatePreparing = "preparing"
+	LaunchStateLaunching = "launching"
+	LaunchStateRunning   = "running"
+	LaunchStateUnknown   = "unknown"
+)
+
 type IssueSnapshot struct {
 	IssueKey        string    `json:"key"`
 	NodeID          string    `json:"node_id,omitempty"`
@@ -54,10 +61,19 @@ type Job struct {
 	RunnerInstanceID string
 	LeaseUntil       *time.Time
 	PID              int
+	PGID             int
+	SupervisorKind   string
+	SupervisorID     string
+	LaunchToken      string
+	LaunchState      string
+	ProcessStartedAt *time.Time
+	RunMetadataPath  string
+	LaunchSpecPath   string
 	ContextPath      string
 	ResultPath       string
 	StdoutPath       string
 	StderrPath       string
+	TimeoutAt        *time.Time
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	StartedAt        *time.Time
@@ -83,6 +99,36 @@ type RunnerInfo struct {
 type RunnerIdentity struct {
 	RunnerID   string
 	InstanceID string
+}
+
+type LaunchSpecRecord struct {
+	SupervisorKind  string
+	LaunchToken     string
+	LaunchState     string
+	LaunchSpecPath  string
+	ContextPath     string
+	ResultPath      string
+	StdoutPath      string
+	StderrPath      string
+	RunMetadataPath string
+	TimeoutAt       time.Time
+}
+
+type LaunchRecord struct {
+	SupervisorKind   string
+	SupervisorID     string
+	LaunchToken      string
+	LaunchState      string
+	PID              int
+	PGID             int
+	ProcessStartedAt time.Time
+	RunMetadataPath  string
+	LaunchSpecPath   string
+	ContextPath      string
+	ResultPath       string
+	StdoutPath       string
+	StderrPath       string
+	TimeoutAt        time.Time
 }
 
 type JobFinalize struct {

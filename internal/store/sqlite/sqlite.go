@@ -97,11 +97,33 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err := s.ensureColumn(ctx, "jobs", "runner_instance_id", "text"); err != nil {
 		return err
 	}
-	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_jobs_status_lease_runner ON jobs(status, lease_until, runner_instance_id)`); err != nil {
-		return fmt.Errorf("create jobs lease runner index: %w", err)
+	for _, column := range []struct{ name, typ string }{
+		{"supervisor_kind", "text"},
+		{"supervisor_id", "text"},
+		{"launch_token", "text"},
+		{"launch_state", "text"},
+		{"pgid", "integer"},
+		{"process_started_at", "text"},
+		{"run_metadata_path", "text"},
+		{"launch_spec_path", "text"},
+		{"timeout_at", "text"},
+	} {
+		if err := s.ensureColumn(ctx, "jobs", column.name, column.typ); err != nil {
+			return err
+		}
 	}
-	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_jobs_status_route_name ON jobs(status, route_name)`); err != nil {
-		return fmt.Errorf("create jobs status route index: %w", err)
+	for name, query := range map[string]string{
+		"idx_jobs_status_lease_runner":    `CREATE INDEX IF NOT EXISTS idx_jobs_status_lease_runner ON jobs(status, lease_until, runner_instance_id)`,
+		"idx_jobs_status_route_name":      `CREATE INDEX IF NOT EXISTS idx_jobs_status_route_name ON jobs(status, route_name)`,
+		"idx_jobs_running_owner":          `CREATE INDEX IF NOT EXISTS idx_jobs_running_owner ON jobs(status, runner_instance_id, lease_until)`,
+		"idx_jobs_running_launch":         `CREATE INDEX IF NOT EXISTS idx_jobs_running_launch ON jobs(status, supervisor_kind, launch_state, launch_token)`,
+		"idx_jobs_running_route_capacity": `CREATE INDEX IF NOT EXISTS idx_jobs_running_route_capacity ON jobs(status, route_name)`,
+		"idx_jobs_running_timeout":        `CREATE INDEX IF NOT EXISTS idx_jobs_running_timeout ON jobs(status, timeout_at)`,
+		"idx_jobs_stale_durable_recovery": `CREATE INDEX IF NOT EXISTS idx_jobs_stale_durable_recovery ON jobs(status, lease_until, runner_instance_id, supervisor_kind, launch_token)`,
+	} {
+		if _, err := s.db.ExecContext(ctx, query); err != nil {
+			return fmt.Errorf("create %s: %w", name, err)
+		}
 	}
 	if _, err := s.db.ExecContext(ctx, `
 CREATE TABLE IF NOT EXISTS runner_heartbeats (
@@ -232,8 +254,9 @@ func (s *Store) claimNextJob(ctx context.Context, identity model.RunnerIdentity,
 	}
 
 	rows, err := tx.QueryContext(ctx, `
-SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid,
-       context_path, result_path, stdout_path, stderr_path, created_at, updated_at, started_at, finished_at, last_error
+SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
+       supervisor_kind, supervisor_id, launch_token, launch_state, process_started_at, run_metadata_path, launch_spec_path,
+       context_path, result_path, stdout_path, stderr_path, timeout_at, created_at, updated_at, started_at, finished_at, last_error
 FROM jobs
 WHERE status = ? AND available_at <= ?
 ORDER BY priority DESC, created_at ASC, id ASC`, model.JobStatusPending, formatTime(now))
@@ -271,8 +294,10 @@ ORDER BY priority DESC, created_at ASC, id ASC`, model.JobStatusPending, formatT
 
 		res, err := tx.ExecContext(ctx, `
 UPDATE jobs
-SET status = ?, locked_by = ?, runner_instance_id = ?, lease_until = ?, started_at = COALESCE(started_at, ?), updated_at = ?, last_error = NULL
-WHERE id = ? AND status = ?`, model.JobStatusRunning, identity.RunnerID, identity.InstanceID, formatTime(leaseUntil), formatTime(now), formatTime(now), job.ID, model.JobStatusPending)
+SET status = ?, locked_by = ?, runner_instance_id = ?, lease_until = ?, started_at = COALESCE(started_at, ?), updated_at = ?, last_error = NULL,
+    launch_state = ?, supervisor_kind = NULL, supervisor_id = NULL, launch_token = NULL, pgid = NULL, process_started_at = NULL,
+    run_metadata_path = NULL, launch_spec_path = NULL, timeout_at = NULL
+WHERE id = ? AND status = ?`, model.JobStatusRunning, identity.RunnerID, identity.InstanceID, formatTime(leaseUntil), formatTime(now), formatTime(now), model.LaunchStatePreparing, job.ID, model.JobStatusPending)
 		if err != nil {
 			return nil, fmt.Errorf("claim job: %w", err)
 		}
@@ -320,7 +345,7 @@ LEFT JOIN runner_heartbeats h ON h.runner_instance_id = j.runner_instance_id
 WHERE j.status = ? AND j.lease_until IS NOT NULL AND j.lease_until < ? AND (
   j.runner_instance_id IS NULL OR j.runner_instance_id = '' OR
   h.runner_instance_id IS NULL OR h.heartbeat_at < ?
-)`, model.JobStatusRunning, formatTime(now), formatTime(staleHeartbeatBefore.UTC()))
+) AND (j.supervisor_kind IS NULL OR j.supervisor_kind = '' OR j.launch_token IS NULL OR j.launch_token = '' OR j.launch_state = ?)`, model.JobStatusRunning, formatTime(now), formatTime(staleHeartbeatBefore.UTC()), model.LaunchStatePreparing)
 	if err != nil {
 		return 0, fmt.Errorf("select expired leases: %w", err)
 	}
@@ -350,7 +375,10 @@ WHERE j.status = ? AND j.lease_until IS NOT NULL AND j.lease_until < ? AND (
 	for _, id := range ids {
 		res, err := tx.ExecContext(ctx, `
 UPDATE jobs
-SET status = ?, locked_by = NULL, runner_instance_id = NULL, lease_until = NULL, pid = NULL, updated_at = ?, last_error = 'lease expired'
+SET status = ?, locked_by = NULL, runner_instance_id = NULL, lease_until = NULL, pid = NULL, pgid = NULL,
+    supervisor_kind = NULL, supervisor_id = NULL, launch_token = NULL, launch_state = NULL, process_started_at = NULL,
+    run_metadata_path = NULL, launch_spec_path = NULL, timeout_at = NULL,
+    updated_at = ?, last_error = 'lease expired'
 WHERE id = ? AND status = ?`, model.JobStatusPending, formatTime(now), id, model.JobStatusRunning)
 		if err != nil {
 			return 0, fmt.Errorf("release expired lease %s: %w", id, err)
@@ -386,6 +414,101 @@ SET context_path = ?, result_path = ?, stdout_path = ?, stderr_path = ?, pid = ?
 WHERE id = ? AND runner_instance_id = ? AND status = ? AND (lease_until IS NULL OR lease_until >= ?)`, contextPath, resultPath, stdoutPath, stderrPath, pid, formatTime(now), jobID, runnerInstanceID, model.JobStatusRunning, formatTime(now))
 }
 
+func validateLaunchSpecRecord(record model.LaunchSpecRecord) error {
+	if record.SupervisorKind == "" {
+		return errors.New("supervisor kind is required")
+	}
+	if record.LaunchToken == "" {
+		return errors.New("launch token is required")
+	}
+	if record.LaunchSpecPath == "" {
+		return errors.New("launch spec path is required")
+	}
+	if record.RunMetadataPath == "" {
+		return errors.New("run metadata path is required")
+	}
+	if record.TimeoutAt.IsZero() {
+		return errors.New("timeout_at is required")
+	}
+	return nil
+}
+
+func (s *Store) PersistLaunchSpecOwned(ctx context.Context, jobID, runnerInstanceID string, record model.LaunchSpecRecord) error {
+	now := time.Now().UTC()
+	if err := validateLaunchSpecRecord(record); err != nil {
+		return err
+	}
+	return s.execOwned(ctx, jobID, runnerInstanceID, `
+UPDATE jobs
+SET supervisor_kind = ?, launch_token = ?, launch_state = ?, launch_spec_path = ?, context_path = ?, result_path = ?, stdout_path = ?, stderr_path = ?, run_metadata_path = ?, timeout_at = ?, updated_at = ?
+WHERE id = ? AND runner_instance_id = ? AND status = ? AND launch_state = ? AND (lease_until IS NULL OR lease_until >= ?)`, record.SupervisorKind, record.LaunchToken, model.LaunchStatePreparing, record.LaunchSpecPath, record.ContextPath, record.ResultPath, record.StdoutPath, record.StderrPath, record.RunMetadataPath, formatTime(record.TimeoutAt), formatTime(now), jobID, runnerInstanceID, model.JobStatusRunning, model.LaunchStatePreparing, formatTime(now))
+}
+
+func (s *Store) MarkJobLaunchingOwned(ctx context.Context, jobID, runnerInstanceID, launchToken string) error {
+	now := time.Now().UTC()
+	return s.execOwned(ctx, jobID, runnerInstanceID, `
+UPDATE jobs
+SET launch_state = ?, updated_at = ?
+WHERE id = ? AND runner_instance_id = ? AND status = ? AND launch_token = ? AND launch_state = ? AND (lease_until IS NULL OR lease_until >= ?)`, model.LaunchStateLaunching, formatTime(now), jobID, runnerInstanceID, model.JobStatusRunning, launchToken, model.LaunchStatePreparing, formatTime(now))
+}
+
+func validateLaunchRecord(record model.LaunchRecord) error {
+	if record.SupervisorKind == "" {
+		return errors.New("supervisor kind is required")
+	}
+	if record.SupervisorID == "" && record.RunMetadataPath == "" {
+		return errors.New("supervisor id or run metadata path is required")
+	}
+	if record.LaunchToken == "" {
+		return errors.New("launch token is required")
+	}
+	return nil
+}
+
+func (s *Store) PersistLaunchRecordOwned(ctx context.Context, jobID, runnerInstanceID string, record model.LaunchRecord) error {
+	now := time.Now().UTC()
+	if err := validateLaunchRecord(record); err != nil {
+		return err
+	}
+	processStartedAt := nullTime(record.ProcessStartedAt)
+	timeoutAt := nullTime(record.TimeoutAt)
+	return s.execOwned(ctx, jobID, runnerInstanceID, `
+UPDATE jobs
+SET supervisor_kind = COALESCE(NULLIF(?, ''), supervisor_kind), supervisor_id = ?, launch_token = COALESCE(NULLIF(?, ''), launch_token), launch_state = ?, pid = ?, pgid = ?, process_started_at = COALESCE(?, process_started_at), run_metadata_path = COALESCE(NULLIF(?, ''), run_metadata_path), launch_spec_path = COALESCE(NULLIF(?, ''), launch_spec_path), context_path = COALESCE(NULLIF(?, ''), context_path), result_path = COALESCE(NULLIF(?, ''), result_path), stdout_path = COALESCE(NULLIF(?, ''), stdout_path), stderr_path = COALESCE(NULLIF(?, ''), stderr_path), timeout_at = COALESCE(?, timeout_at), updated_at = ?
+WHERE id = ? AND runner_instance_id = ? AND status = ? AND launch_token = ? AND launch_state = ? AND (lease_until IS NULL OR lease_until >= ?)`, record.SupervisorKind, record.SupervisorID, record.LaunchToken, model.LaunchStateRunning, record.PID, record.PGID, processStartedAt, record.RunMetadataPath, record.LaunchSpecPath, record.ContextPath, record.ResultPath, record.StdoutPath, record.StderrPath, timeoutAt, formatTime(now), jobID, runnerInstanceID, model.JobStatusRunning, record.LaunchToken, model.LaunchStateLaunching, formatTime(now))
+}
+
+func (s *Store) ListOwnedRunningJobs(ctx context.Context, runnerInstanceID string) ([]model.Job, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
+       supervisor_kind, supervisor_id, launch_token, launch_state, process_started_at, run_metadata_path, launch_spec_path,
+       context_path, result_path, stdout_path, stderr_path, timeout_at, created_at, updated_at, started_at, finished_at, last_error
+FROM jobs
+WHERE status = ? AND runner_instance_id = ?
+ORDER BY started_at ASC, id ASC`, model.JobStatusRunning, runnerInstanceID)
+	if err != nil {
+		return nil, fmt.Errorf("list owned running jobs: %w", err)
+	}
+	defer rows.Close()
+	return scanJobs(rows, "owned running jobs")
+}
+
+func (s *Store) CountRunningJobs(ctx context.Context) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM jobs WHERE status = ?`, model.JobStatusRunning).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count running jobs: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) CountRunningJobsByRoute(ctx context.Context, routeName string) (int, error) {
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM jobs WHERE status = ? AND route_name = ?`, model.JobStatusRunning, routeName).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count running jobs by route: %w", err)
+	}
+	return count, nil
+}
+
 func (s *Store) UpdateJobAttempts(ctx context.Context, jobID string, attempts int) error {
 	_, err := s.db.ExecContext(ctx, `
 UPDATE jobs
@@ -412,7 +535,10 @@ func (s *Store) FinalizeJob(ctx context.Context, jobID string, result model.JobF
 	}
 	_, err := s.db.ExecContext(ctx, `
 UPDATE jobs
-SET status = ?, locked_by = NULL, runner_instance_id = NULL, lease_until = NULL, pid = NULL, result_path = COALESCE(NULLIF(?, ''), result_path),
+SET status = ?, locked_by = NULL, runner_instance_id = NULL, lease_until = NULL, pid = NULL, pgid = NULL,
+    supervisor_kind = NULL, supervisor_id = NULL, launch_token = NULL, launch_state = NULL, process_started_at = NULL,
+    run_metadata_path = NULL, launch_spec_path = NULL, timeout_at = NULL,
+    result_path = COALESCE(NULLIF(?, ''), result_path),
     stdout_path = COALESCE(NULLIF(?, ''), stdout_path), stderr_path = COALESCE(NULLIF(?, ''), stderr_path),
     finished_at = ?, updated_at = ?, last_error = ?
 WHERE id = ?`, result.Status, result.ResultPath, result.StdoutPath, result.StderrPath, formatTime(finished), formatTime(finished), nullString(result.LastError), jobID)
@@ -429,7 +555,10 @@ func (s *Store) FinalizeJobOwned(ctx context.Context, jobID string, runnerInstan
 	}
 	return s.execOwned(ctx, jobID, runnerInstanceID, `
 UPDATE jobs
-SET status = ?, locked_by = NULL, runner_instance_id = NULL, lease_until = NULL, pid = NULL, result_path = COALESCE(NULLIF(?, ''), result_path),
+SET status = ?, locked_by = NULL, runner_instance_id = NULL, lease_until = NULL, pid = NULL, pgid = NULL,
+    supervisor_kind = NULL, supervisor_id = NULL, launch_token = NULL, launch_state = NULL, process_started_at = NULL,
+    run_metadata_path = NULL, launch_spec_path = NULL, timeout_at = NULL,
+    result_path = COALESCE(NULLIF(?, ''), result_path),
     stdout_path = COALESCE(NULLIF(?, ''), stdout_path), stderr_path = COALESCE(NULLIF(?, ''), stderr_path),
     finished_at = ?, updated_at = ?, last_error = ?
 WHERE id = ? AND runner_instance_id = ? AND status = ? AND (lease_until IS NULL OR lease_until >= ?)`, result.Status, result.ResultPath, result.StdoutPath, result.StderrPath, formatTime(finished), formatTime(finished), nullString(result.LastError), jobID, runnerInstanceID, model.JobStatusRunning, formatTime(time.Now().UTC()))
@@ -746,8 +875,9 @@ ORDER BY priority DESC, created_at ASC, id ASC`, model.JobStatusPending, formatT
 
 func (s *Store) jobByID(ctx context.Context, id string) (model.Job, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid,
-       context_path, result_path, stdout_path, stderr_path, created_at, updated_at, started_at, finished_at, last_error
+SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
+       supervisor_kind, supervisor_id, launch_token, launch_state, process_started_at, run_metadata_path, launch_spec_path,
+       context_path, result_path, stdout_path, stderr_path, timeout_at, created_at, updated_at, started_at, finished_at, last_error
 FROM jobs WHERE id = ?`, id)
 	return scanJob(row)
 }
@@ -758,6 +888,80 @@ func stringSet(values []string) map[string]struct{} {
 		set[value] = struct{}{}
 	}
 	return set
+}
+
+func (s *Store) ListStaleDurableRunningJobs(ctx context.Context, now, staleHeartbeatBefore time.Time) ([]model.Job, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT j.id, j.issue_key, j.route_name, j.kind, j.status, j.priority, j.attempts, j.dedupe_key, j.available_at, j.locked_by, j.runner_instance_id, j.lease_until, j.pid, j.pgid,
+       j.supervisor_kind, j.supervisor_id, j.launch_token, j.launch_state, j.process_started_at, j.run_metadata_path, j.launch_spec_path,
+       j.context_path, j.result_path, j.stdout_path, j.stderr_path, j.timeout_at, j.created_at, j.updated_at, j.started_at, j.finished_at, j.last_error
+FROM jobs j
+LEFT JOIN runner_heartbeats h ON h.runner_instance_id = j.runner_instance_id
+WHERE j.status = ? AND j.lease_until IS NOT NULL AND j.lease_until < ? AND j.launch_state != ? AND j.supervisor_kind IS NOT NULL AND j.supervisor_kind != '' AND j.launch_token IS NOT NULL AND j.launch_token != ''
+  AND (j.supervisor_id IS NOT NULL AND j.supervisor_id != '' OR j.run_metadata_path IS NOT NULL AND j.run_metadata_path != '')
+  AND (j.runner_instance_id IS NULL OR j.runner_instance_id = '' OR h.runner_instance_id IS NULL OR h.heartbeat_at < ?)
+ORDER BY j.lease_until ASC, j.id ASC`, model.JobStatusRunning, formatTime(now.UTC()), model.LaunchStatePreparing, formatTime(staleHeartbeatBefore.UTC()))
+	if err != nil {
+		return nil, fmt.Errorf("list stale durable running jobs: %w", err)
+	}
+	defer rows.Close()
+	return scanJobs(rows, "stale durable running jobs")
+}
+
+func (s *Store) AdoptStaleRunningJob(ctx context.Context, jobID, oldRunnerInstanceID string, newIdentity model.RunnerIdentity, leaseDuration time.Duration, now, staleHeartbeatBefore time.Time) (*model.Job, error) {
+	if strings.TrimSpace(newIdentity.RunnerID) == "" {
+		return nil, errors.New("runner id is required")
+	}
+	if strings.TrimSpace(newIdentity.InstanceID) == "" {
+		return nil, errors.New("runner instance id is required")
+	}
+	if leaseDuration <= 0 {
+		return nil, errors.New("lease duration must be positive")
+	}
+	leaseUntil := now.UTC().Add(leaseDuration)
+	res, err := s.db.ExecContext(ctx, `
+UPDATE jobs
+SET locked_by = ?, runner_instance_id = ?, lease_until = ?, updated_at = ?
+WHERE id = ? AND status = ? AND runner_instance_id = ? AND lease_until IS NOT NULL AND lease_until < ?
+  AND launch_state != ? AND supervisor_kind IS NOT NULL AND supervisor_kind != '' AND launch_token IS NOT NULL AND launch_token != ''
+  AND (supervisor_id IS NOT NULL AND supervisor_id != '' OR run_metadata_path IS NOT NULL AND run_metadata_path != '')
+  AND NOT EXISTS (SELECT 1 FROM runner_heartbeats h WHERE h.runner_instance_id = ? AND h.heartbeat_at >= ?)`, newIdentity.RunnerID, newIdentity.InstanceID, formatTime(leaseUntil), formatTime(now.UTC()), jobID, model.JobStatusRunning, oldRunnerInstanceID, formatTime(now.UTC()), model.LaunchStatePreparing, oldRunnerInstanceID, formatTime(staleHeartbeatBefore.UTC()))
+	if err != nil {
+		return nil, fmt.Errorf("adopt stale running job: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return nil, fmt.Errorf("adopt stale running rows affected: %w", err)
+	}
+	if affected == 0 {
+		return nil, store.ErrNotOwner
+	}
+	job, err := s.jobByID(ctx, jobID)
+	if err != nil {
+		return nil, err
+	}
+	return &job, nil
+}
+
+func (s *Store) MarkStaleRunningJobUnknown(ctx context.Context, jobID, oldRunnerInstanceID string, now, staleHeartbeatBefore time.Time) error {
+	res, err := s.db.ExecContext(ctx, `
+UPDATE jobs
+SET launch_state = ?, updated_at = ?
+WHERE id = ? AND status = ? AND runner_instance_id = ? AND lease_until IS NOT NULL AND lease_until < ?
+  AND launch_state != ? AND supervisor_kind IS NOT NULL AND supervisor_kind != '' AND launch_token IS NOT NULL AND launch_token != ''
+  AND (supervisor_id IS NOT NULL AND supervisor_id != '' OR run_metadata_path IS NOT NULL AND run_metadata_path != '')
+  AND NOT EXISTS (SELECT 1 FROM runner_heartbeats h WHERE h.runner_instance_id = ? AND h.heartbeat_at >= ?)`, model.LaunchStateUnknown, formatTime(now.UTC()), jobID, model.JobStatusRunning, oldRunnerInstanceID, formatTime(now.UTC()), model.LaunchStatePreparing, oldRunnerInstanceID, formatTime(staleHeartbeatBefore.UTC()))
+	if err != nil {
+		return fmt.Errorf("mark stale running job unknown: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("mark stale running unknown rows affected: %w", err)
+	}
+	if affected == 0 {
+		return store.ErrNotOwner
+	}
+	return nil
 }
 
 func (s *Store) ListRoutableIssues(ctx context.Context) ([]model.IssueSnapshot, error) {
@@ -830,14 +1034,19 @@ VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
 
 func (s *Store) ListJobs(ctx context.Context) ([]model.Job, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid,
-       context_path, result_path, stdout_path, stderr_path, created_at, updated_at, started_at, finished_at, last_error
+SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
+       supervisor_kind, supervisor_id, launch_token, launch_state, process_started_at, run_metadata_path, launch_spec_path,
+       context_path, result_path, stdout_path, stderr_path, timeout_at, created_at, updated_at, started_at, finished_at, last_error
 FROM jobs
 ORDER BY priority DESC, created_at ASC, id ASC`)
 	if err != nil {
 		return nil, fmt.Errorf("list jobs: %w", err)
 	}
 	defer rows.Close()
+	return scanJobs(rows, "jobs")
+}
+
+func scanJobs(rows *sql.Rows, label string) ([]model.Job, error) {
 	var jobs []model.Job
 	for rows.Next() {
 		job, err := scanJob(rows)
@@ -847,7 +1056,7 @@ ORDER BY priority DESC, created_at ASC, id ASC`)
 		jobs = append(jobs, job)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("list jobs rows: %w", err)
+		return nil, fmt.Errorf("%s rows: %w", label, err)
 	}
 	return jobs, nil
 }
@@ -903,8 +1112,9 @@ ORDER BY created_at ASC, id ASC`, jobID, jobID)
 
 func (s *Store) jobByDedupeKey(ctx context.Context, key string) (model.Job, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid,
-       context_path, result_path, stdout_path, stderr_path, created_at, updated_at, started_at, finished_at, last_error
+SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
+       supervisor_kind, supervisor_id, launch_token, launch_state, process_started_at, run_metadata_path, launch_spec_path,
+       context_path, result_path, stdout_path, stderr_path, timeout_at, created_at, updated_at, started_at, finished_at, last_error
 FROM jobs WHERE dedupe_key = ?`, key)
 	return scanJob(row)
 }
@@ -930,10 +1140,12 @@ func scanIssue(row scanner) (model.IssueSnapshot, error) {
 
 func scanJob(row scanner) (model.Job, error) {
 	var job model.Job
-	var lockedBy, runnerInstanceID, leaseUntil, contextPath, resultPath, stdoutPath, stderrPath, startedAt, finishedAt, lastError sql.NullString
-	var pid sql.NullInt64
+	var lockedBy, runnerInstanceID, leaseUntil sql.NullString
+	var supervisorKind, supervisorID, launchToken, launchState, processStartedAt, runMetadataPath, launchSpecPath sql.NullString
+	var contextPath, resultPath, stdoutPath, stderrPath, timeoutAt, startedAt, finishedAt, lastError sql.NullString
+	var pid, pgid sql.NullInt64
 	var availableAt, createdAt, updatedAt string
-	if err := row.Scan(&job.ID, &job.IssueKey, &job.RouteName, &job.Kind, &job.Status, &job.Priority, &job.Attempts, &job.DedupeKey, &availableAt, &lockedBy, &runnerInstanceID, &leaseUntil, &pid, &contextPath, &resultPath, &stdoutPath, &stderrPath, &createdAt, &updatedAt, &startedAt, &finishedAt, &lastError); err != nil {
+	if err := row.Scan(&job.ID, &job.IssueKey, &job.RouteName, &job.Kind, &job.Status, &job.Priority, &job.Attempts, &job.DedupeKey, &availableAt, &lockedBy, &runnerInstanceID, &leaseUntil, &pid, &pgid, &supervisorKind, &supervisorID, &launchToken, &launchState, &processStartedAt, &runMetadataPath, &launchSpecPath, &contextPath, &resultPath, &stdoutPath, &stderrPath, &timeoutAt, &createdAt, &updatedAt, &startedAt, &finishedAt, &lastError); err != nil {
 		return model.Job{}, fmt.Errorf("scan job: %w", err)
 	}
 	job.AvailableAt = parseTime(availableAt)
@@ -946,10 +1158,25 @@ func scanJob(row scanner) (model.Job, error) {
 		job.LeaseUntil = &t
 	}
 	job.PID = int(pid.Int64)
+	job.PGID = int(pgid.Int64)
+	job.SupervisorKind = supervisorKind.String
+	job.SupervisorID = supervisorID.String
+	job.LaunchToken = launchToken.String
+	job.LaunchState = launchState.String
+	if processStartedAt.Valid {
+		t := parseTime(processStartedAt.String)
+		job.ProcessStartedAt = &t
+	}
+	job.RunMetadataPath = runMetadataPath.String
+	job.LaunchSpecPath = launchSpecPath.String
 	job.ContextPath = contextPath.String
 	job.ResultPath = resultPath.String
 	job.StdoutPath = stdoutPath.String
 	job.StderrPath = stderrPath.String
+	if timeoutAt.Valid {
+		t := parseTime(timeoutAt.String)
+		job.TimeoutAt = &t
+	}
 	if startedAt.Valid {
 		t := parseTime(startedAt.String)
 		job.StartedAt = &t
@@ -984,6 +1211,13 @@ func parseTime(s string) time.Time {
 		return time.Time{}
 	}
 	return t
+}
+
+func nullTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return formatTime(t)
 }
 
 func nullString(s string) any {

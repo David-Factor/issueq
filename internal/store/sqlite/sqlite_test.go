@@ -668,6 +668,151 @@ func TestTwoStoreInstancesDoNotOverclaimGlobalCapacity(t *testing.T) {
 	}
 }
 
+func TestDurableLaunchStateTransitionsAndScans(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	_, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", DedupeKey: "launch"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := identity("runner-launch")
+	job, err := store.ClaimNextJob(ctx, owner, []string{"code"}, 1, map[string]int{"code": 1}, time.Minute)
+	if err != nil || job == nil {
+		t.Fatalf("claim job=%#v err=%v", job, err)
+	}
+	if job.LaunchState != model.LaunchStatePreparing {
+		t.Fatalf("claimed launch state = %q", job.LaunchState)
+	}
+	timeoutAt := time.Now().UTC().Add(time.Minute)
+	spec := model.LaunchSpecRecord{SupervisorKind: "wrapper", LaunchToken: "tok", LaunchSpecPath: "spec.json", ContextPath: "context.json", ResultPath: "result.json", StdoutPath: "stdout.log", StderrPath: "stderr.log", RunMetadataPath: "run.json", TimeoutAt: timeoutAt}
+	if err := store.PersistLaunchSpecOwned(ctx, job.ID, owner.InstanceID, spec); err != nil {
+		t.Fatalf("PersistLaunchSpecOwned error = %v", err)
+	}
+	if err := store.MarkJobLaunchingOwned(ctx, job.ID, owner.InstanceID, "tok"); err != nil {
+		t.Fatalf("MarkJobLaunchingOwned error = %v", err)
+	}
+	started := time.Now().UTC()
+	record := model.LaunchRecord{SupervisorKind: "wrapper", SupervisorID: "pid-123", LaunchToken: "tok", PID: 123, PGID: 123, ProcessStartedAt: started, TimeoutAt: timeoutAt, RunMetadataPath: "run.json"}
+	if err := store.PersistLaunchRecordOwned(ctx, job.ID, owner.InstanceID, record); err != nil {
+		t.Fatalf("PersistLaunchRecordOwned error = %v", err)
+	}
+	jobs, err := store.ListOwnedRunningJobs(ctx, owner.InstanceID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].LaunchState != model.LaunchStateRunning || jobs[0].SupervisorKind != "wrapper" || jobs[0].SupervisorID != "pid-123" || jobs[0].PID != 123 || jobs[0].PGID != 123 || jobs[0].TimeoutAt == nil || jobs[0].ProcessStartedAt == nil {
+		t.Fatalf("owned running jobs = %#v", jobs)
+	}
+	count, err := store.CountRunningJobs(ctx)
+	if err != nil || count != 1 {
+		t.Fatalf("CountRunningJobs count=%d err=%v", count, err)
+	}
+	routeCount, err := store.CountRunningJobsByRoute(ctx, "code")
+	if err != nil || routeCount != 1 {
+		t.Fatalf("CountRunningJobsByRoute count=%d err=%v", routeCount, err)
+	}
+}
+
+func TestDurableLaunchValidationAndOwnershipFailures(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	_, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", DedupeKey: "launch-failures"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := identity("runner-failures")
+	job, err := store.ClaimNextJob(ctx, owner, []string{"code"}, 1, map[string]int{"code": 1}, time.Minute)
+	if err != nil || job == nil {
+		t.Fatalf("claim job=%#v err=%v", job, err)
+	}
+	if err := store.PersistLaunchSpecOwned(ctx, job.ID, owner.InstanceID, model.LaunchSpecRecord{}); err == nil {
+		t.Fatal("PersistLaunchSpecOwned invalid error = nil")
+	}
+	valid := model.LaunchSpecRecord{SupervisorKind: "wrapper", LaunchToken: "tok", LaunchSpecPath: "spec", RunMetadataPath: "run", TimeoutAt: time.Now().Add(time.Minute)}
+	if err := store.PersistLaunchSpecOwned(ctx, job.ID, "other", valid); !errors.Is(err, storepkg.ErrNotOwner) {
+		t.Fatalf("PersistLaunchSpecOwned wrong owner err = %v", err)
+	}
+	if err := store.PersistLaunchSpecOwned(ctx, job.ID, owner.InstanceID, valid); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkJobLaunchingOwned(ctx, job.ID, owner.InstanceID, "wrong"); !errors.Is(err, storepkg.ErrNotOwner) {
+		t.Fatalf("MarkJobLaunchingOwned wrong token err = %v", err)
+	}
+	if err := store.MarkJobLaunchingOwned(ctx, job.ID, owner.InstanceID, "tok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistLaunchRecordOwned(ctx, job.ID, owner.InstanceID, model.LaunchRecord{SupervisorKind: "wrapper", LaunchToken: "tok"}); err == nil {
+		t.Fatal("PersistLaunchRecordOwned invalid error = nil")
+	}
+}
+
+func TestDurableLaunchOwnershipGuardsAndStaleRecovery(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	now := time.Now().UTC()
+	owner := identity("stale-durable")
+	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "code", Kind: "code", DedupeKey: "durable"})
+	durable, _ := store.ClaimNextJob(ctx, owner, []string{"code"}, 10, map[string]int{"code": 10}, time.Minute)
+	if err := store.PersistLaunchSpecOwned(ctx, durable.ID, owner.InstanceID, model.LaunchSpecRecord{SupervisorKind: "wrapper", LaunchToken: "tok", LaunchSpecPath: "spec", RunMetadataPath: "run", TimeoutAt: now.Add(time.Minute)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkJobLaunchingOwned(ctx, durable.ID, owner.InstanceID, "tok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistLaunchRecordOwned(ctx, durable.ID, owner.InstanceID, model.LaunchRecord{SupervisorKind: "wrapper", SupervisorID: "sid", LaunchToken: "tok", PID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = store.db.ExecContext(ctx, `UPDATE jobs SET lease_until = ? WHERE id = ?`, formatTime(now.Add(-time.Minute)), durable.ID)
+	_ = store.HeartbeatRunner(ctx, owner, 1, now.Add(-time.Hour))
+
+	_, _, _ = store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-2", RouteName: "code", Kind: "code", DedupeKey: "preparing"})
+	preparing, _ := store.ClaimNextJob(ctx, owner, []string{"code"}, 10, map[string]int{"code": 10}, time.Minute)
+	_, _ = store.db.ExecContext(ctx, `UPDATE jobs SET lease_until = ? WHERE id = ?`, formatTime(now.Add(-time.Minute)), preparing.ID)
+
+	released, err := store.ReleaseExpiredLeases(ctx, now, now.Add(-time.Minute), "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if released != 1 {
+		t.Fatalf("released = %d, want only non-durable preparing row", released)
+	}
+	stale, err := store.ListStaleDurableRunningJobs(ctx, now, now.Add(-time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stale) != 1 || stale[0].ID != durable.ID {
+		t.Fatalf("stale durable = %#v", stale)
+	}
+	if err := store.MarkStaleRunningJobUnknown(ctx, durable.ID, owner.InstanceID, now, now.Add(-time.Minute)); err != nil {
+		t.Fatalf("MarkStaleRunningJobUnknown error = %v", err)
+	}
+	if _, err := store.AdoptStaleRunningJob(ctx, durable.ID, owner.InstanceID, model.RunnerIdentity{}, time.Minute, now, now.Add(-time.Minute)); err == nil {
+		t.Fatal("AdoptStaleRunningJob invalid identity error = nil")
+	}
+	jobs, _ := store.ListJobs(ctx)
+	byID := map[string]model.Job{}
+	for _, job := range jobs {
+		byID[job.ID] = job
+	}
+	if got := byID[durable.ID]; got.Status != model.JobStatusRunning || got.RunnerInstanceID != owner.InstanceID || got.LaunchState != model.LaunchStateUnknown {
+		t.Fatalf("durable after unknown = %#v", got)
+	}
+	newOwner := identity("new-owner")
+	adopted, err := store.AdoptStaleRunningJob(ctx, durable.ID, owner.InstanceID, newOwner, time.Minute, now, now.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("AdoptStaleRunningJob error = %v", err)
+	}
+	if adopted.RunnerInstanceID != newOwner.InstanceID || adopted.LockedBy != newOwner.RunnerID || adopted.LeaseUntil == nil {
+		t.Fatalf("adopted = %#v", adopted)
+	}
+	if got := byID[preparing.ID]; got.Status != model.JobStatusPending || got.LaunchToken != "" {
+		t.Fatalf("preparing after release = %#v", got)
+	}
+}
+
 func TestClaimUsesRouteNameConcurrencyNotKindFallback(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t, ctx)
