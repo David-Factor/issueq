@@ -14,6 +14,8 @@ internal/dispatcher   bounded once/dispatch policy
 
 The attached runner path is only a temporary bridge or test aid. Do not spend effort making attached supervision a polished durable backend. The preferred target backend is the direct wrapper supervisor; systemd remains optional later.
 
+Future launch mechanisms and executors are explicitly out of scope for the hard cutover. Preserve the seams for later experimentation: systemd can be added as a supervisor backend that launches `issueq job-wrapper`, while Docker/container runtimes can be added as job-wrapper executors beneath the same wrapper contract. Do not introduce speculative generalized backend/executor registries before the local wrapper backend is working.
+
 ## Standard gates
 
 Run after each code phase unless explicitly scoped smaller:
