@@ -208,6 +208,10 @@ func (e StartError) Error() string { return e.Result.ErrorString() }
 
 func Start(ctx context.Context, cfg config.Config, route config.RouteConfig, job model.Job, issue model.IssueSnapshot, runnerInfo model.RunnerInfo) (*Handle, error) {
 	paths := PreparePaths(cfg.Workdir.Path, job.ID)
+	return StartWithPaths(ctx, cfg, route, job, issue, runnerInfo, paths)
+}
+
+func StartWithPaths(ctx context.Context, cfg config.Config, route config.RouteConfig, job model.Job, issue model.IssueSnapshot, runnerInfo model.RunnerInfo, paths Paths) (*Handle, error) {
 	started := time.Now().UTC()
 	ctxData := Context{
 		Issue: issue,
