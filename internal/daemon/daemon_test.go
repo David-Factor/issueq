@@ -3,16 +3,16 @@ package daemon
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"issueq/internal/config"
 	"issueq/internal/model"
-	"issueq/internal/runner"
 	sqlitestore "issueq/internal/store/sqlite"
+	"issueq/internal/supervisor"
 )
 
 func TestOnceWaitsAndProcessesLocalRouteDispatch(t *testing.T) {
@@ -44,32 +44,24 @@ func TestRunStopsCleanlyOnContextCancel(t *testing.T) {
 	}
 }
 
-func TestRunPollsRoutesWhileLongJobActive(t *testing.T) {
+func TestRunLaunchesPendingJobThroughWrapperSupervisor(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store, cfg := setupOnce(t)
 	defer store.Close()
-	cfg.Polling.Interval = config.Duration{Duration: 25 * time.Millisecond}
-	cfg.Queue.LeaseDuration = config.Duration{Duration: 80 * time.Millisecond}
-	cfg.Routes[0].Job.Timeout = config.Duration{Duration: time.Second}
-
-	proc := newFakeProcess(3101)
+	cfg.Polling.Interval = config.Duration{Duration: time.Hour}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
 	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "dedupe"}); err != nil {
 		t.Fatal(err)
 	}
-	restore := runner.SetProcessStarterForTest(&fakeStarter{processes: []*fakeProcess{proc}})
-	defer restore()
-
+	backend := newFakeDaemonSupervisor()
 	done := make(chan error, 1)
-	go func() { done <- Run(ctx, cfg, store, nil, nil) }()
-	waitFor(t, 500*time.Millisecond, func() bool { return proc.started() })
-	if _, _, err := store.EnqueueJob(context.Background(), model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "created-while-active"}); err != nil {
-		t.Fatal(err)
-	}
-	waitFor(t, 500*time.Millisecond, func() bool {
+	go func() { done <- runWithSupervisor(ctx, cfg, store, nil, nil, backend) }()
+	waitFor(t, time.Second, func() bool { return backend.launchCount() == 1 })
+	waitFor(t, time.Second, func() bool {
 		jobs, _ := store.ListJobs(context.Background())
 		for _, job := range jobs {
-			if job.DedupeKey == "created-while-active" && job.Status == model.JobStatusPending {
+			if job.DedupeKey == "dedupe" && job.SupervisorKind == supervisor.KindWrapper && job.LaunchState == model.LaunchStateRunning {
 				return true
 			}
 		}
@@ -81,39 +73,59 @@ func TestRunPollsRoutesWhileLongJobActive(t *testing.T) {
 	}
 }
 
-func TestRunReapRefillWithoutWaitingForPollInterval(t *testing.T) {
+func TestRunReapsCompletedObservationAndRefills(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store, cfg := setupOnce(t)
 	defer store.Close()
 	cfg.Polling.Interval = config.Duration{Duration: time.Hour}
-	cfg.Queue.LeaseDuration = config.Duration{Duration: 80 * time.Millisecond}
-	cfg.Routes[0].Job.Timeout = config.Duration{Duration: time.Second}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
 	cfg.Routes[0].When.LabelsInclude = []string{"no-route"}
-	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "first"}); err != nil {
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 2, DedupeKey: "first"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "second"}); err != nil {
 		t.Fatal(err)
 	}
-	proc1 := newFakeProcess(3201)
-	proc2 := newFakeProcess(3202)
-	restore := runner.SetProcessStarterForTest(&fakeStarter{processes: []*fakeProcess{proc1, proc2}})
-	defer restore()
+	backend := newFakeDaemonSupervisor()
 	done := make(chan error, 1)
-	go func() { done <- Run(ctx, cfg, store, nil, nil) }()
-	waitFor(t, 500*time.Millisecond, func() bool { return proc1.started() })
-	proc1.finish(nil)
-	waitFor(t, 2*time.Second, func() bool { return proc2.started() })
-	proc2.finish(nil)
-	waitFor(t, 500*time.Millisecond, func() bool {
+	go func() { done <- runWithSupervisor(ctx, cfg, store, nil, nil, backend) }()
+	waitFor(t, time.Second, func() bool { return backend.launchCount() == 1 })
+	var first string
+	waitFor(t, time.Second, func() bool {
+		first = backend.firstJobID()
+		return first != ""
+	})
+	backend.complete(first, supervisor.RunExited)
+	waitFor(t, 2*time.Second, func() bool {
 		jobs, _ := store.ListJobs(context.Background())
+		var firstSucceeded bool
 		for _, job := range jobs {
+			if job.ID == first && job.Status == model.JobStatusSucceeded {
+				firstSucceeded = true
+			}
+		}
+		return firstSucceeded && backend.launchCount() == 2
+	})
+	var second string
+	waitFor(t, time.Second, func() bool {
+		second = backend.lastJobID()
+		return second != "" && second != first
+	})
+	backend.complete(second, supervisor.RunExited)
+	waitFor(t, time.Second, func() bool {
+		jobs, _ := store.ListJobs(context.Background())
+		seen := 0
+		for _, job := range jobs {
+			if job.DedupeKey != "first" && job.DedupeKey != "second" {
+				continue
+			}
+			seen++
 			if job.Status != model.JobStatusSucceeded {
 				return false
 			}
 		}
-		return true
+		return seen == 2
 	})
 	cancel()
 	if err := <-done; err != context.Canceled {
@@ -121,38 +133,169 @@ func TestRunReapRefillWithoutWaitingForPollInterval(t *testing.T) {
 	}
 }
 
-func TestRunShutdownCancelsActiveJobFinalizesCancelledAndDeletesHeartbeat(t *testing.T) {
+func TestRunRenewsRunningWrapperRows(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, cfg := setupOnce(t)
+	defer store.Close()
+	cfg.Polling.Interval = config.Duration{Duration: time.Hour}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "dedupe"}); err != nil {
+		t.Fatal(err)
+	}
+	backend := newFakeDaemonSupervisor()
+	done := make(chan error, 1)
+	go func() { done <- runWithSupervisor(ctx, cfg, store, nil, nil, backend) }()
+	waitFor(t, time.Second, func() bool { return backend.launchCount() == 1 })
+	var firstLease time.Time
+	waitFor(t, time.Second, func() bool {
+		jobs, _ := store.ListJobs(context.Background())
+		if len(jobs) == 0 || jobs[0].LeaseUntil == nil {
+			return false
+		}
+		firstLease = *jobs[0].LeaseUntil
+		return true
+	})
+	waitFor(t, 2*time.Second, func() bool {
+		jobs, _ := store.ListJobs(context.Background())
+		return len(jobs) > 0 && jobs[0].LeaseUntil != nil && jobs[0].LeaseUntil.After(firstLease)
+	})
+	cancel()
+	if err := <-done; err != context.Canceled {
+		t.Fatalf("Run error = %v", err)
+	}
+}
+
+func TestRunShutdownCancelsWrapperJobFinalizesCancelledAndDeletesHeartbeat(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, cfg := setupOnce(t)
+	defer store.Close()
+	cfg.Polling.Interval = config.Duration{Duration: time.Hour}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: 500 * time.Millisecond}
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "dedupe"}); err != nil {
+		t.Fatal(err)
+	}
+	backend := newFakeDaemonSupervisor()
+	done := make(chan error, 1)
+	go func() { done <- runWithSupervisor(ctx, cfg, store, nil, nil, backend) }()
+	waitFor(t, time.Second, func() bool {
+		jobs, _ := store.ListJobs(context.Background())
+		for _, job := range jobs {
+			if job.DedupeKey == "dedupe" && job.LaunchState == model.LaunchStateRunning {
+				return true
+			}
+		}
+		return false
+	})
+	cancel()
+	if err := <-done; err != context.Canceled {
+		t.Fatalf("Run error = %v", err)
+	}
+	if backend.cancelCount() != 1 {
+		t.Fatalf("cancel count = %d, want 1", backend.cancelCount())
+	}
+	jobs, _ := store.ListJobs(context.Background())
+	var cancelled bool
+	for _, job := range jobs {
+		if job.DedupeKey == "dedupe" {
+			cancelled = job.Status == model.JobStatusCancelled && job.LastError != ""
+		}
+	}
+	if !cancelled {
+		t.Fatalf("jobs = %#v", jobs)
+	}
+	if got := countHeartbeats(t, cfg); got != 0 {
+		t.Fatalf("heartbeats = %d, want 0", got)
+	}
+}
+
+func TestRunShutdownFinalizesPreparingRowsAndDeletesHeartbeat(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store, cfg := setupOnce(t)
+	defer store.Close()
+	cfg.Polling.Interval = config.Duration{Duration: time.Hour}
+	cfg.Queue.LeaseDuration = config.Duration{Duration: time.Second}
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "preparing"}); err != nil {
+		t.Fatal(err)
+	}
+	owner := model.RunnerIdentity{RunnerID: "runner", InstanceID: "runner-preparing"}
+	claimed, err := store.ClaimNextJob(ctx, owner, []string{"code"}, 1, map[string]int{"code": 1}, time.Second)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim preparing=%#v err=%v", claimed, err)
+	}
+	loop := newLoop(cfg, store, nil, nil, newFakeDaemonSupervisor())
+	loop.identity = owner
+	loop.runnerInfo = model.RunnerInfo{ID: owner.RunnerID}
+	if err := loop.heartbeat(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := loop.shutdown(context.Canceled); err != nil {
+		t.Fatalf("shutdown error = %v", err)
+	}
+	loop.deleteHeartbeatAfterCleanShutdown()
+	jobs, _ := store.ListJobs(context.Background())
+	if jobs[0].Status != model.JobStatusCancelled {
+		t.Fatalf("jobs = %#v", jobs)
+	}
+	if got := countHeartbeats(t, cfg); got != 0 {
+		t.Fatalf("heartbeats = %d, want 0", got)
+	}
+}
+
+func TestRunExpiredNonDurableReleasedButDurableForeignNotRequeued(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	store, cfg := setupOnce(t)
 	defer store.Close()
 	cfg.Polling.Interval = config.Duration{Duration: time.Hour}
 	cfg.Queue.LeaseDuration = config.Duration{Duration: 80 * time.Millisecond}
-	cfg.Routes[0].Job.Timeout = config.Duration{Duration: time.Second}
-	proc := newFakeProcess(3301)
-	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "dedupe"}); err != nil {
+	old := model.RunnerIdentity{RunnerID: "old", InstanceID: "old-instance"}
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 2, DedupeKey: "nondurable"}); err != nil {
 		t.Fatal(err)
 	}
-	restore := runner.SetProcessStarterForTest(&fakeStarter{processes: []*fakeProcess{proc}})
-	defer restore()
-	done := make(chan error, 1)
-	go func() { done <- Run(ctx, cfg, store, nil, nil) }()
-	waitFor(t, 500*time.Millisecond, func() bool { return proc.started() && countHeartbeats(t, cfg) == 1 })
-	cancel()
-	select {
-	case <-proc.killCh:
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("process was not killed on shutdown")
+	nondurable, err := store.ClaimNextJob(ctx, old, []string{"code"}, 10, map[string]int{"code": 10}, 50*time.Millisecond)
+	if err != nil || nondurable == nil {
+		t.Fatalf("claim nondurable=%#v err=%v", nondurable, err)
 	}
+	if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "github.com/example-org/example-repo#1", RouteName: "code", Kind: "code", Priority: 1, DedupeKey: "durable"}); err != nil {
+		t.Fatal(err)
+	}
+	durable, err := store.ClaimNextJob(ctx, old, []string{"code"}, 10, map[string]int{"code": 10}, 500*time.Millisecond)
+	if err != nil || durable == nil {
+		t.Fatalf("claim durable=%#v err=%v", durable, err)
+	}
+	timeoutAt := time.Now().Add(time.Minute)
+	if err := store.PersistLaunchSpecOwned(ctx, durable.ID, old.InstanceID, model.LaunchSpecRecord{SupervisorKind: supervisor.KindWrapper, LaunchToken: "tok", LaunchSpecPath: "spec", RunMetadataPath: "run", TimeoutAt: timeoutAt}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkJobLaunchingOwned(ctx, durable.ID, old.InstanceID, "tok"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PersistLaunchRecordOwned(ctx, durable.ID, old.InstanceID, model.LaunchRecord{SupervisorKind: supervisor.KindWrapper, SupervisorID: "pid-1", LaunchToken: "tok", PID: 1, RunMetadataPath: "run", TimeoutAt: timeoutAt}); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	backend := newFakeDaemonSupervisor()
+	done := make(chan error, 1)
+	go func() { done <- runWithSupervisor(ctx, cfg, store, nil, nil, backend) }()
+	waitFor(t, time.Second, func() bool {
+		jobs, _ := store.ListJobs(context.Background())
+		var nonPending, durableRunning bool
+		for _, job := range jobs {
+			if job.ID == nondurable.ID && job.Status == model.JobStatusPending {
+				nonPending = true
+			}
+			if job.ID == durable.ID && job.Status == model.JobStatusRunning && job.RunnerInstanceID == old.InstanceID {
+				durableRunning = true
+			}
+		}
+		return nonPending && durableRunning
+	})
+	cancel()
 	if err := <-done; err != context.Canceled {
 		t.Fatalf("Run error = %v", err)
-	}
-	jobs, _ := store.ListJobs(context.Background())
-	if jobs[0].Status != model.JobStatusCancelled || jobs[0].LastError == "" {
-		t.Fatalf("job = %#v", jobs[0])
-	}
-	if got := staleHeartbeats(t, cfg); got != 0 {
-		t.Fatalf("stale heartbeats = %d, want 0", got)
 	}
 }
 
@@ -203,64 +346,6 @@ func setupOnce(t *testing.T) (*sqlitestore.Store, config.Config) {
 		Routes:  []config.RouteConfig{{Name: "code", When: config.PredicateConfig{LabelsInclude: []string{"agent-ready"}}, Job: config.JobConfig{Kind: "code", Command: []string{script}, Timeout: config.Duration{Duration: time.Second}, Concurrency: 1, MaxAttempts: 3}}},
 	}
 	return store, cfg
-}
-
-type fakeStarter struct {
-	processes []*fakeProcess
-	started   int
-}
-
-func (s *fakeStarter) StartProcess(spec runner.ProcessSpec) (runner.Process, error) {
-	if s.started >= len(s.processes) {
-		return nil, errors.New("unexpected process start")
-	}
-	proc := s.processes[s.started]
-	s.started++
-	proc.markStarted()
-	return proc, nil
-}
-
-type fakeProcess struct {
-	pid       int
-	waitCh    chan error
-	killCh    chan struct{}
-	startCh   chan struct{}
-	killOnce  chan struct{}
-	finishMux chan struct{}
-}
-
-func newFakeProcess(pid int) *fakeProcess {
-	return &fakeProcess{pid: pid, waitCh: make(chan error, 1), killCh: make(chan struct{}), startCh: make(chan struct{}), killOnce: make(chan struct{}, 1), finishMux: make(chan struct{}, 1)}
-}
-
-func (p *fakeProcess) PID() int { return p.pid }
-func (p *fakeProcess) Wait() error {
-	return <-p.waitCh
-}
-func (p *fakeProcess) KillTree() error {
-	select {
-	case p.killOnce <- struct{}{}:
-		close(p.killCh)
-		p.finish(errors.New("killed"))
-	default:
-	}
-	return nil
-}
-func (p *fakeProcess) markStarted() { close(p.startCh) }
-func (p *fakeProcess) started() bool {
-	select {
-	case <-p.startCh:
-		return true
-	default:
-		return false
-	}
-}
-func (p *fakeProcess) finish(err error) {
-	select {
-	case p.finishMux <- struct{}{}:
-		p.waitCh <- err
-	default:
-	}
 }
 
 func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
@@ -319,4 +404,82 @@ func countHeartbeats(t *testing.T, cfg config.Config) int {
 		t.Fatal(err)
 	}
 	return count
+}
+
+type fakeDaemonSupervisor struct {
+	mu            sync.Mutex
+	launches      []supervisor.LaunchSpec
+	observations  map[string]supervisor.Observation
+	cancellations []supervisor.FakeCancellation
+}
+
+func newFakeDaemonSupervisor() *fakeDaemonSupervisor {
+	return &fakeDaemonSupervisor{observations: map[string]supervisor.Observation{}}
+}
+
+func (f *fakeDaemonSupervisor) Launch(ctx context.Context, spec supervisor.LaunchSpec) (supervisor.LaunchRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.launches = append(f.launches, spec)
+	record := supervisor.LaunchRecord{Kind: supervisor.KindWrapper, ID: spec.JobID + "-wrapper", JobID: spec.JobID, LaunchToken: spec.LaunchToken, PID: 1000 + len(f.launches), MetadataPath: spec.MetadataPath, StartedAt: time.Now().UTC(), TimeoutAt: time.Now().UTC().Add(spec.Timeout)}
+	f.observations[spec.JobID] = supervisor.Observation{State: supervisor.RunRunning, StartedAt: record.StartedAt, ResultPath: spec.ResultPath, StdoutPath: spec.StdoutPath, StderrPath: spec.StderrPath}
+	return record, nil
+}
+
+func (f *fakeDaemonSupervisor) Inspect(ctx context.Context, record supervisor.LaunchRecord) (supervisor.Observation, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	obs, ok := f.observations[record.JobID]
+	if !ok {
+		return supervisor.Observation{State: supervisor.RunUnknown, Error: "missing fake observation"}, nil
+	}
+	if obs.ResultPath == "" {
+		obs.ResultPath = record.MetadataPath
+	}
+	return obs, nil
+}
+
+func (f *fakeDaemonSupervisor) Cancel(ctx context.Context, record supervisor.LaunchRecord, reason supervisor.CancelReason) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancellations = append(f.cancellations, supervisor.FakeCancellation{Record: record, Reason: reason})
+	f.observations[record.JobID] = supervisor.Observation{State: supervisor.RunCancelled, Error: "runner shutting down", FinishedAt: time.Now().UTC(), ResultPath: record.MetadataPath}
+	return nil
+}
+
+func (f *fakeDaemonSupervisor) launchCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.launches)
+}
+func (f *fakeDaemonSupervisor) cancelCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.cancellations)
+}
+func (f *fakeDaemonSupervisor) firstJobID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.launches) == 0 {
+		return ""
+	}
+	return f.launches[0].JobID
+}
+func (f *fakeDaemonSupervisor) lastJobID() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.launches) == 0 {
+		return ""
+	}
+	return f.launches[len(f.launches)-1].JobID
+}
+func (f *fakeDaemonSupervisor) complete(jobID string, state supervisor.RunState) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	obs := f.observations[jobID]
+	obs.State = state
+	obs.FinishedAt = time.Now().UTC()
+	obs.HasExitCode = true
+	obs.ExitCode = 0
+	f.observations[jobID] = obs
 }
