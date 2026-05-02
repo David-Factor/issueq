@@ -1,6 +1,6 @@
 [Unit]
 Description=IssueQ daemon for %i
-Documentation=https://github.com/David-Factor/IssueQ
+Documentation=https://github.com/David-Factor/issueq
 After=network-online.target
 Wants=network-online.target
 

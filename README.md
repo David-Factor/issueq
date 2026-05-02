@@ -1,6 +1,6 @@
 # issueq
 
-[![CI](https://github.com/David-Factor/IssueQ/actions/workflows/ci.yml/badge.svg)](https://github.com/David-Factor/IssueQ/actions/workflows/ci.yml)
+[![CI](https://github.com/David-Factor/issueq/actions/workflows/ci.yml/badge.svg)](https://github.com/David-Factor/issueq/actions/workflows/ci.yml)
 
 IssueQ is a minimal local queue for running agent workflows from GitHub issues.
 
