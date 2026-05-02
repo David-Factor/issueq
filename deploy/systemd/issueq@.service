@@ -1,0 +1,29 @@
+[Unit]
+Description=IssueQ daemon for %i
+Documentation=https://github.com/David-Factor/IssueQ
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=issueq
+Group=issueq
+EnvironmentFile=-/srv/issueq/instances/%i/env
+WorkingDirectory=/srv/issueq/instances/%i
+ExecStart=/srv/issueq/bin/issueq --config /srv/issueq/instances/%i/issueq.yaml daemon
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=60s
+KillSignal=SIGTERM
+
+# Baseline hardening. Job commands execute on this host; adjust these paths if
+# your agents intentionally need access outside the instance directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/issueq/instances/%i
+ReadOnlyPaths=/srv/issueq/bin
+
+[Install]
+WantedBy=multi-user.target
