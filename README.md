@@ -2,51 +2,65 @@
 
 [![CI](https://github.com/David-Factor/IssueQ/actions/workflows/ci.yml/badge.svg)](https://github.com/David-Factor/IssueQ/actions/workflows/ci.yml)
 
-IssueQ is a small Go + SQLite runner for local GitHub issue automation.
+IssueQ is a minimal local queue for running agent workflows from GitHub issues.
 
-It polls GitHub issues, matches labels and predicates, records queue state in SQLite, runs configured local subprocess jobs, and reports results back to GitHub with labels/comments. Typical jobs include triage agents, coding agents, review agents, and cleanup tasks.
+It is meant as a practical starting point for experimenting with a personal "dark factory": a background automation loop where tasks are described, queued, executed by agents, reviewed, and advanced through workflow states.
 
-## Status: public preview
+## Why IssueQ?
 
-IssueQ is early public-preview software.
+As coding agents improve, more routine software work becomes a candidate for automation: triage, dependency bumps, investigations, migrations, test fixes, documentation updates, cleanup tasks, and small feature slices.
 
-Current scope:
+IssueQ lets you try that in an environment you control: your laptop, a VM, remote workstation, or controlled hosted dev environment. You keep the files, credentials, tools, prompts, and execution environment close enough to inspect and change.
 
-- GitHub Issues polling and label-based routing.
-- Local SQLite queue/state storage.
-- Durable wrapper-only subprocess supervision via `issueq job-wrapper`.
-- GitHub issue label/comment updates after job completion.
+GitHub issues are the interface because they already live near the code, labels, discussions, PRs, and project context. IssueQ treats issues as the visible source of intent while its local SQLite queue tracks execution state.
 
-Not current scope:
+## What IssueQ does
 
-- not a GitHub Actions replacement;
-- not a sandbox for untrusted code;
-- not yet a general GitHub event router for PRs, pushes, releases, etc.;
-- no supported fallback to the old attached/direct runner.
+You define:
 
-`issueq once --no-wait` remains intentionally unsupported until durable detached CLI semantics are explicitly designed. `dispatch --local-no-github` is only for local fixtures; normal dispatch is GitHub-aware.
+- the labels/states in your workflow;
+- which issues are eligible for automation;
+- which command or agent runs for each route;
+- what labels/comments should be applied on start, success, failure, or retry exhaustion;
+- concurrency, timeouts, attempts, and environment passing.
 
-## How it works
+IssueQ then runs this loop:
 
 ```text
-GitHub issues
-  -> issueq poll
-  -> local SQLite issue snapshots
-  -> route matching labels/predicates into jobs
-  -> dispatch claims jobs within concurrency limits
-  -> job-wrapper runs configured command
-  -> result JSON / stdout / stderr are captured
-  -> GitHub labels/comments are updated
+GitHub issue -> local queue -> configured agent command -> result -> next issue state
 ```
 
-Config paths are resolved relative to the config file when loaded from disk. That means an instance directory can contain `issueq.yaml`, `issueq.db`, `work/`, and `agents/` without depending on the daemon's current working directory.
+IssueQ is intentionally workflow-agnostic. It does not know what "triage", "code", "review", or "done" mean for your project; it just moves issues through the states and commands you configure.
+
+## Status and scope
+
+IssueQ is public-preview software, currently focused on single-operator GitHub Issues automation.
+
+Implemented:
+
+- GitHub Issues polling and label-based routing;
+- local SQLite queue/state storage;
+- durable wrapper-only subprocess supervision via `issueq job-wrapper`;
+- result JSON, stdout, stderr, and wrapper metadata capture;
+- GitHub issue label/comment updates after job completion;
+- systemd-oriented deployment docs for running one instance per repository.
+
+Not implemented yet:
+
+- broad GitHub event support for PRs, pushes, releases, etc.;
+- multi-user/shared-queue collaboration;
+- a sandbox for untrusted code;
+- GitHub-Actions-compatible workflow execution;
+- no supported fallback to the deprecated attached/direct runner.
+
+Single-person/local-first operation is intentional. It is the smallest useful step: automate your own recurring workflows safely before introducing shared stores, hosted runners, or team coordination. Future collaboration would likely come through a shared remote queue/store rather than treating one local SQLite instance as a team coordination system.
 
 ## Quick start
 
 Prerequisites:
 
 - Go installed for local development/builds.
-- A GitHub token with least-privilege access to the target repository's issues, labels, and comments.
+- A GitHub token with least-privilege access to the target repository: metadata read plus issues/labels/comments read-write; repository contents only if your configured agent needs them.
 - A repository with the labels used by your routes, for example `agent-ready`, `agent-running`, `agent-review`, `agent-failed`, and `manual-only`.
 
 Try the example config from a scratch instance directory:
@@ -96,6 +110,8 @@ When config is loaded from a file:
 
 Keep tokens in environment variables or secret managers, not in `issueq.yaml`.
 
+`issueq once --no-wait` remains intentionally unsupported until durable detached CLI semantics are designed. `dispatch --local-no-github` is only for local fixtures; normal dispatch is GitHub-aware.
+
 ## Operations and deployment
 
 Recommended production layout:
@@ -112,12 +128,13 @@ Recommended production layout:
   runbook.md
 ```
 
-Useful docs:
+Docs:
 
 - [Operator runbook](docs/operator-runbook.md)
 - [Deployment checklist](docs/deployment-checklist.md)
 - [systemd template](deploy/systemd/issueq@.service)
 - [example instance env file](deploy/systemd/instance.env.example)
+- [Roadmap](docs/roadmap.md)
 
 Useful commands:
 
@@ -143,12 +160,6 @@ Recommended baseline:
 - back up SQLite before manual repair or upgrades.
 
 See [SECURITY.md](SECURITY.md) for vulnerability reporting and [docs/operator-runbook.md](docs/operator-runbook.md) for recovery guidance.
-
-## Roadmap
-
-IssueQ currently focuses on GitHub Issues as the first durable event source. Future work may expand to PRs, comments, pushes, scheduled/manual triggers, and GitHub-Actions-inspired workflow files for local supervised automation.
-
-See [docs/roadmap.md](docs/roadmap.md).
 
 ## Development
 
