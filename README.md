@@ -2,19 +2,19 @@
 
 [![CI](https://github.com/David-Factor/issueq/actions/workflows/ci.yml/badge.svg)](https://github.com/David-Factor/issueq/actions/workflows/ci.yml)
 
-IssueQ is a minimal local queue for running agent workflows from GitHub issues.
+issueq is a minimal local queue for running agent workflows from GitHub issues.
 
 It is meant as a practical starting point for experimenting with a personal "dark factory": a background automation loop where tasks are described, queued, executed by agents, reviewed, and advanced through workflow states.
 
-## Why IssueQ?
+## Why issueq?
 
 As coding agents improve, more routine software work becomes a candidate for automation: triage, dependency bumps, investigations, migrations, test fixes, documentation updates, cleanup tasks, and small feature slices.
 
-IssueQ lets you try that in an environment you control: your laptop, a VM, remote workstation, or controlled hosted dev environment. You keep the files, credentials, tools, prompts, and execution environment close enough to inspect and change.
+issueq lets you try that in an environment you control: your laptop, a VM, remote workstation, or controlled hosted dev environment. You keep the files, credentials, tools, prompts, and execution environment close enough to inspect and change.
 
-GitHub issues are the interface because they already live near the code, labels, discussions, PRs, and project context. IssueQ treats issues as the visible source of intent while its local SQLite queue tracks execution state.
+GitHub issues are the interface because they already live near the code, labels, discussions, PRs, and project context. issueq treats issues as the visible source of intent while its local SQLite queue tracks execution state.
 
-## What IssueQ does
+## What issueq does
 
 You define:
 
@@ -24,17 +24,17 @@ You define:
 - what labels/comments should be applied on start, success, failure, or retry exhaustion;
 - concurrency, timeouts, attempts, and environment passing.
 
-IssueQ then runs this loop:
+issueq then runs this loop:
 
 ```text
 GitHub issue -> local queue -> configured agent command -> result -> next issue state
 ```
 
-IssueQ is intentionally workflow-agnostic. It does not know what "triage", "code", "review", or "done" mean for your project; it just moves issues through the states and commands you configure.
+issueq is intentionally workflow-agnostic. It does not know what "triage", "code", "review", or "done" mean for your project; it just moves issues through the states and commands you configure.
 
 ## Status and scope
 
-IssueQ is public-preview software, currently focused on single-operator GitHub Issues automation.
+issueq is public-preview software, currently focused on single-operator GitHub Issues automation.
 
 Implemented:
 
@@ -148,7 +148,7 @@ issueq --config ./issueq.yaml issues --json
 
 ## Security notes
 
-IssueQ executes configured local commands on the daemon host. If those commands check out or run repository content, that content executes with the permissions of the service user and with whatever secrets you pass through the job environment.
+issueq executes configured local commands on the daemon host. If those commands check out or run repository content, that content executes with the permissions of the service user and with whatever secrets you pass through the job environment.
 
 Recommended baseline:
 

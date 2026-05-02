@@ -1,10 +1,10 @@
 # Roadmap
 
-IssueQ is currently public-preview software. This roadmap is directional, not a compatibility promise.
+issueq is currently public-preview software. This roadmap is directional, not a compatibility promise.
 
 ## Current focus
 
-IssueQ's current implementation focuses on controlled GitHub Issues automation:
+issueq's current implementation focuses on controlled GitHub Issues automation:
 
 - poll one GitHub repository for issues;
 - route issues by labels and simple predicates;
@@ -44,7 +44,7 @@ PR and fork events need an explicit trust model before they can safely run jobs.
 
 ## Workflow files
 
-A future IssueQ workflow format may be inspired by GitHub Actions YAML without being drop-in compatible with GitHub Actions.
+A future issueq workflow format may be inspired by GitHub Actions YAML without being drop-in compatible with GitHub Actions.
 
 Possible shape:
 
@@ -86,7 +86,7 @@ Concepts to avoid or defer initially:
 - matrix builds;
 - service containers;
 - secret inheritance behavior;
-- pretending local IssueQ jobs have the same isolation properties as GitHub-hosted runners.
+- pretending local issueq jobs have the same isolation properties as GitHub-hosted runners.
 
 A likely split is:
 

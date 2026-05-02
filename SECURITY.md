@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-IssueQ is currently early public-preview software. Security fixes are made on `main` until formal releases are cut.
+issueq is currently early public-preview software. Security fixes are made on `main` until formal releases are cut.
 
 ## Reporting vulnerabilities
 
@@ -17,7 +17,7 @@ If GitHub private vulnerability reporting is enabled for the repository, use tha
 
 ## Operational security model
 
-IssueQ is not a sandbox. It runs configured local commands on the daemon host and writes queue/job state to SQLite.
+issueq is not a sandbox. It runs configured local commands on the daemon host and writes queue/job state to SQLite.
 
 Operators should:
 

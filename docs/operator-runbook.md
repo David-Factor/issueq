@@ -1,4 +1,4 @@
-# IssueQ operator runbook
+# issueq operator runbook
 
 This runbook is for operating a production `issueq` daemon instance.
 
@@ -6,7 +6,7 @@ This runbook is for operating a production `issueq` daemon instance.
 
 ## Trust boundary
 
-IssueQ executes commands on the host where the daemon runs. Treat configured job commands and any repository content they execute as trusted code unless you have added your own sandboxing.
+issueq executes commands on the host where the daemon runs. Treat configured job commands and any repository content they execute as trusted code unless you have added your own sandboxing.
 
 For public repositories, do not run untrusted fork/PR code with write tokens or host secrets. Use least-privilege GitHub tokens and separate instances for different trust levels.
 
@@ -222,18 +222,18 @@ sudo -u issueq sqlite3 "$DB" \
 
 If the daemon is alive, first inspect logs and wait for the configured timeout/lease behavior. Do not edit a live running row unless you have stopped the daemon and backed up the database.
 
-If the daemon crashed or host rebooted, restart it and let IssueQ reconcile durable running state:
+If the daemon crashed or host rebooted, restart it and let issueq reconcile durable running state:
 
 ```sh
 sudo systemctl restart issueq@$INSTANCE
 journalctl -u issueq@$INSTANCE -f
 ```
 
-IssueQ may adopt recoverable stale durable jobs, cancel jobs owned by a shutting-down runner, or mark unrecoverable launched work as `launch_state='unknown'` for human review.
+issueq may adopt recoverable stale durable jobs, cancel jobs owned by a shutting-down runner, or mark unrecoverable launched work as `launch_state='unknown'` for human review.
 
 ## Handling `launch_state=unknown`
 
-`launch_state='unknown'` means IssueQ cannot safely prove whether a previously launched subprocess is still running or what result it produced. Treat it as a human-intervention state.
+`launch_state='unknown'` means issueq cannot safely prove whether a previously launched subprocess is still running or what result it produced. Treat it as a human-intervention state.
 
 Procedure:
 
@@ -290,4 +290,4 @@ Your route configuration determines labels, but a common pattern is:
 - human intervention needed: `agent-needs-human`
 - opt-out/manual-only: `manual-only`
 
-Avoid using the same ready label for multiple live smoke scenarios unless you intend any IssueQ instance to pick them up. Scenario-specific ready labels prevent accidental cross-pickup.
+Avoid using the same ready label for multiple live smoke scenarios unless you intend any issueq instance to pick them up. Scenario-specific ready labels prevent accidental cross-pickup.

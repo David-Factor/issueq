@@ -1,4 +1,4 @@
-# IssueQ deployment checklist
+# issueq deployment checklist
 
 Use this checklist for a first production install or wrapper-only upgrade.
 
@@ -12,7 +12,7 @@ Use this checklist for a first production install or wrapper-only upgrade.
 
 ## Instance planning
 
-- [ ] Choose a systemd-safe instance name, e.g. `david-factor-issueq-smoke` rather than `David-Factor/IssueQ-Smoke`.
+- [ ] Choose a systemd-safe instance name, e.g. `owner-repo` rather than `owner/repo`.
 - [ ] Create/use a dedicated service user, e.g. `issueq`.
 - [ ] Use the standard layout:
 
@@ -184,4 +184,4 @@ Use this checklist for a first production install or wrapper-only upgrade.
 - [ ] Keep previous release binaries for rollback.
 - [ ] Keep an instance-local `runbook.md` with repository-specific labels, agents, and manual repair notes.
 - [ ] Periodically check token expiry and permissions.
-- [ ] Re-run a smoke issue after changing config, agents, labels, token permissions, or the IssueQ binary.
+- [ ] Re-run a smoke issue after changing config, agents, labels, token permissions, or the issueq binary.
