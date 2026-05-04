@@ -1,0 +1,54 @@
+name: issueq issue event bridge
+description: Create or update GitHub issues that route non-issue events into issueq.
+inputs:
+  event-kind:
+    description: Bridge event kind to translate. Currently supports ci-failure.
+    required: true
+  github-token:
+    description: Token used to read workflow/PR context and write issues.
+    required: true
+    default: ${{ github.token }}
+  routing-labels:
+    description: Comma or newline separated labels to apply to the bridge issue.
+    required: false
+    default: agent-ci-diagnose
+  ready-label:
+    description: Label that makes issueq eligible to route the issue.
+    required: false
+    default: agent-ready
+  dry-run:
+    description: When true, do not apply the ready label.
+    required: false
+    default: "true"
+  max-attempts:
+    description: Maximum automated ready-label attempts for the bridge marker.
+    required: false
+    default: "2"
+  human-labels:
+    description: Comma or newline separated labels to apply when max attempts are exhausted.
+    required: false
+    default: "agent-needs-human,manual-only"
+  generated-branch-prefixes:
+    description: Comma or newline separated branch prefixes that should not receive the ready label automatically.
+    required: false
+    default: "issueq/,agent/,codex/"
+  issue-title-prefix:
+    description: Prefix for created bridge issue titles.
+    required: false
+    default: "CI failure"
+  agent-instructions:
+    description: Instructions to include in the bridge issue body.
+    required: false
+    default: "Please inspect the failing CI run and produce a concise diagnosis."
+outputs:
+  issue-number:
+    description: Created or updated issue number.
+  issue-url:
+    description: Created or updated issue URL.
+  marker:
+    description: Hidden idempotency marker used for the bridge issue.
+  ready-applied:
+    description: Whether the ready label was applied.
+runs:
+  using: node20
+  main: bridge.mjs
