@@ -58,72 +58,125 @@ async function githubRequest(input) {
     body: input.body ? JSON.stringify(input.body) : undefined,
   });
   const text = await response.text();
-  const data = text ? JSON.parse(text) : null;
+  let data = null;
+  if (text) {
+    try {
+      data = JSON.parse(text);
+    } catch {
+      throw new Error(`GitHub API ${input.method ?? "GET"} ${input.path} returned invalid JSON: status=${response.status} body=${text.slice(0, 1000)}`);
+    }
+  }
   if (!response.ok) {
     throw new Error(`GitHub API ${input.method ?? "GET"} ${input.path} failed: status=${response.status} body=${text.slice(0, 1000)}`);
   }
   return data;
 }
 
-async function githubPaginate(input) {
-  const results = [];
-  for (let page = 1; page <= 10; page += 1) {
-    const separator = input.path.includes("?") ? "&" : "?";
-    const pageResults = await githubRequest({
-      token: input.token,
-      path: `${input.path}${separator}per_page=100&page=${page}`,
-    });
-    if (!Array.isArray(pageResults) || pageResults.length === 0) {
-      break;
-    }
-    results.push(...pageResults);
-    if (pageResults.length < 100) {
-      break;
-    }
-  }
-  return results;
-}
-
 function loadEventPayload() {
-  const eventPath = requireEnv("GITHUB_EVENT_PATH");
+  const eventPath = process.env.GITHUB_EVENT_PATH;
+  if (!eventPath) {
+    return {};
+  }
   return JSON.parse(fs.readFileSync(eventPath, "utf8"));
 }
 
 function sanitizeMarkerPart(value) {
-  return String(value)
+  return String(value ?? "")
     .toLowerCase()
     .replace(/[^a-z0-9._-]+/g, "-")
     .replace(/^-+|-+$/g, "") || "unknown";
 }
 
 function buildRunUrl(repo, runId) {
-  return `https://github.com/${repo.owner}/${repo.repo}/actions/runs/${runId}`;
+  return runId ? `https://github.com/${repo.owner}/${repo.repo}/actions/runs/${runId}` : "unknown";
 }
 
 function findIssueReference(text) {
-  const match = text.match(/(?:fixes|fixed|close[sd]?|resolve[sd]?|related to)\s+#(\d+)/i);
+  const match = String(text ?? "").match(/(?:fixes|fixed|close[sd]?|resolve[sd]?|related to)\s+#(\d+)/i);
   return match ? `#${match[1]}` : "unknown";
 }
 
 function inferIssueFromBranch(branch) {
-  const match = branch.match(/(?:issueq\/)?issue[-/](\d+)/i);
+  const match = String(branch ?? "").match(/(?:issueq\/)?issue[-/](\d+)/i);
   return match ? `#${match[1]}` : "unknown";
 }
 
 function branchIsGenerated(branch, prefixes) {
+  if (!branch) {
+    return false;
+  }
   return prefixes.some((prefix) => branch.startsWith(prefix));
 }
 
+function readPath(input, path) {
+  return path.split(".").reduce((value, part) => {
+    if (value === undefined || value === null) {
+      return undefined;
+    }
+    if (Array.isArray(value)) {
+      const index = Number.parseInt(part, 10);
+      return Number.isInteger(index) ? value[index] : undefined;
+    }
+    if (typeof value !== "object") {
+      return undefined;
+    }
+    return value[part];
+  }, input);
+}
+
+function flattenContext(input) {
+  const output = {};
+  function visit(prefix, value) {
+    if (value === undefined || value === null) {
+      output[prefix] = "";
+      return;
+    }
+    if (typeof value !== "object") {
+      output[prefix] = String(value);
+      return;
+    }
+    if (Array.isArray(value)) {
+      output[prefix] = JSON.stringify(value);
+      value.forEach((entry, index) => visit(`${prefix}.${index}`, entry));
+      return;
+    }
+    output[prefix] = JSON.stringify(value);
+    for (const [key, entry] of Object.entries(value)) {
+      visit(prefix ? `${prefix}.${key}` : key, entry);
+    }
+  }
+  visit("", input);
+  delete output[""];
+  return output;
+}
+
+function renderTemplate(template, context) {
+  const flattened = flattenContext(context);
+  return template.replace(/{{\s*([a-zA-Z0-9_.-]+)(?:\|([a-zA-Z0-9_-]+))?\s*}}/g, (_match, key, transform) => {
+    const value = flattened[key] ?? "";
+    if (transform === "slug") {
+      return sanitizeMarkerPart(value);
+    }
+    if (transform) {
+      throw new Error(`unsupported template transform: ${transform}`);
+    }
+    return value;
+  });
+}
+
 async function findPullRequestForWorkflowRun(input) {
-  const prs = input.workflowRun.pull_requests ?? [];
-  const first = prs[0];
+  const workflowRun = input.event.workflow_run;
+  if (!workflowRun) {
+    return null;
+  }
+  const first = workflowRun.pull_requests?.[0];
   if (first?.number) {
     return await githubRequest({
       token: input.token,
       path: `/repos/${input.repo.owner}/${input.repo.repo}/pulls/${first.number}`,
     });
   }
-  const headSha = input.workflowRun.head_sha;
+  const headSha = workflowRun.head_sha;
   if (!headSha) {
     return null;
   }
@@ -134,47 +187,45 @@ async function findPullRequestForWorkflowRun(input) {
   return Array.isArray(pulls) && pulls[0] ? pulls[0] : null;
 }
 
-function buildCiFailureBridge(input) {
-  const workflowRun = input.event.workflow_run;
-  if (!workflowRun) {
-    throw new Error("ci-failure requires a workflow_run event payload");
-  }
-  if (workflowRun.conclusion !== "failure") {
-    throw new Error(`ci-failure bridge only handles failed runs; conclusion=${workflowRun.conclusion ?? "unknown"}`);
-  }
+function buildDefaultWorkflowRunContext(input) {
+  const workflowRun = input.event.workflow_run ?? {};
   const workflowName = workflowRun.name || "workflow";
   const prNumber = input.pullRequest?.number ?? workflowRun.pull_requests?.[0]?.number ?? "unknown";
   const headBranch = input.pullRequest?.head?.ref ?? workflowRun.head_branch ?? "unknown";
   const headSha = input.pullRequest?.head?.sha ?? workflowRun.head_sha ?? "unknown";
   const baseBranch = input.pullRequest?.base?.ref ?? "unknown";
-  const backingIssue = input.pullRequest
+  const backingIssueFromPr = input.pullRequest
     ? findIssueReference(`${input.pullRequest.title ?? ""}\n${input.pullRequest.body ?? ""}`)
-    : inferIssueFromBranch(headBranch);
-  const inferredBackingIssue = backingIssue === "unknown" ? inferIssueFromBranch(headBranch) : backingIssue;
-  const marker = `<!-- issueq-bridge:ci-failure:pr-${sanitizeMarkerPart(prNumber)}:workflow-${sanitizeMarkerPart(workflowName)} -->`;
-  const title = `${input.titlePrefix}: PR #${prNumber}`;
-  const generatedBranch = branchIsGenerated(headBranch, input.generatedBranchPrefixes);
-  const body = `${marker}
+    : "unknown";
+  const backingIssue = backingIssueFromPr === "unknown" ? inferIssueFromBranch(headBranch) : backingIssueFromPr;
+  return {
+    event: input.event,
+    repository: `${input.repo.owner}/${input.repo.repo}`,
+    workflow: {
+      name: workflowName,
+      conclusion: workflowRun.conclusion ?? "unknown",
+      run_url: workflowRun.html_url ?? buildRunUrl(input.repo, workflowRun.id),
+      run_id: workflowRun.id ?? "unknown",
+    },
+    pr: {
+      number: prNumber,
+      url: input.pullRequest?.html_url ?? "unknown",
+      title: input.pullRequest?.title ?? "unknown",
+      base_branch: baseBranch,
+      head_branch: headBranch,
+      head_sha: headSha,
+      backing_issue: backingIssue,
+    },
+  };
+}
 
-PR: ${input.pullRequest?.html_url ?? "unknown"}
-Base branch: ${baseBranch}
-Head branch: ${headBranch}
-Head SHA: ${headSha}
-Workflow: ${workflowName}
-Run: ${workflowRun.html_url ?? buildRunUrl(input.repo, workflowRun.id)}
-Backing issue: ${inferredBackingIssue}
-Bridge event: ci-failure
-Bridge dry-run: ${input.dryRun ? "true" : "false"}
-Generated branch: ${generatedBranch ? "true" : "false"}
-
-Failure summary:
-- Workflow run concluded with failure.
-- Inspect the linked run for failing jobs and logs.
-
-Agent instructions:
-${input.agentInstructions}
-`;
-  return { marker, title, body, generatedBranch };
+async function buildContext(input) {
+  const explicit = readInput("context-json").trim();
+  if (explicit) {
+    return JSON.parse(explicit);
+  }
+  const pullRequest = await findPullRequestForWorkflowRun(input);
+  return buildDefaultWorkflowRunContext({ ...input, pullRequest });
 }
 
 async function findExistingIssue(input) {
@@ -200,7 +251,7 @@ function upsertAttempt(body, attempt) {
   if (/^Attempt:\s*\d+\s*$/m.test(body)) {
     return body.replace(/^Attempt:\s*\d+\s*$/m, `Attempt: ${attempt}`);
   }
-  return body.replace(/(Bridge event: .+\n)/, `$1Attempt: ${attempt}\n`);
+  return `${body.replace(/\s*$/, "")}\nAttempt: ${attempt}\n`;
 }
 
 async function ensureLabels(input) {
@@ -221,38 +272,32 @@ async function run() {
   if (!token) {
     throw new Error("github-token input or GITHUB_TOKEN is required");
   }
-  const eventKind = readInput("event-kind").trim();
-  if (eventKind !== "ci-failure") {
-    throw new Error(`unsupported event-kind: ${eventKind}`);
-  }
   const [owner, repoName] = requireEnv("GITHUB_REPOSITORY").split("/");
   if (!owner || !repoName) {
     throw new Error("GITHUB_REPOSITORY must be OWNER/REPO");
   }
   const repo = { owner, repo: repoName };
   const event = loadEventPayload();
-  const workflowRun = event.workflow_run;
-  const pullRequest = await findPullRequestForWorkflowRun({ token, repo, workflowRun });
-  const dryRun = parseBoolean(readInput("dry-run", "true"));
-  const generatedBranchPrefixes = parseList(readInput("generated-branch-prefixes", "issueq/,agent/,codex/"));
-  const bridge = buildCiFailureBridge({
-    event,
-    pullRequest,
-    repo,
-    dryRun,
-    generatedBranchPrefixes,
-    titlePrefix: readInput("issue-title-prefix", "CI failure"),
-    agentInstructions: readInput("agent-instructions", "Please inspect the failing CI run and produce a concise diagnosis."),
-  });
-  const existing = await findExistingIssue({ token, repo, marker: bridge.marker });
+  const context = await buildContext({ token, repo, event });
+  const marker = renderTemplate(readInput("marker"), context).trim();
+  const title = renderTemplate(readInput("title"), context).trim();
+  const bodyWithoutAttempt = renderTemplate(readInput("body"), context).trim();
+  if (!marker || !title || !bodyWithoutAttempt) {
+    throw new Error("marker, title, and body inputs must render to non-empty strings");
+  }
+  const existing = await findExistingIssue({ token, repo, marker });
   const previousAttempt = existing?.body ? extractAttempt(existing.body) : 0;
   const attempt = previousAttempt + 1;
-  const body = upsertAttempt(bridge.body, attempt);
+  const body = upsertAttempt(bodyWithoutAttempt.includes(marker) ? bodyWithoutAttempt : `${marker}\n\n${bodyWithoutAttempt}`, attempt);
+  const generatedBranch = renderTemplate(readInput("generated-branch"), context).trim();
+  const generatedBranchPrefixes = parseList(readInput("generated-branch-prefixes", "issueq/,agent/,codex/"));
+  const generated = branchIsGenerated(generatedBranch, generatedBranchPrefixes);
+  const applyReady = parseBoolean(readInput("apply-ready", "false"));
   const maxAttempts = parsePositiveInteger(readInput("max-attempts", "2"), "max-attempts");
-  const routingLabels = parseList(readInput("routing-labels", "agent-ci-diagnose"));
+  const routingLabels = parseList(readInput("routing-labels"));
   const readyLabel = readInput("ready-label", "agent-ready").trim();
   const humanLabels = parseList(readInput("human-labels", "agent-needs-human,manual-only"));
-  const readyAllowed = !dryRun && !bridge.generatedBranch && attempt <= maxAttempts;
+  const readyAllowed = applyReady && !generated && attempt <= maxAttempts;
   const labels = readyAllowed
     ? [...routingLabels, readyLabel]
     : attempt > maxAttempts
@@ -265,14 +310,14 @@ async function run() {
       token,
       method: "PATCH",
       path: `/repos/${repo.owner}/${repo.repo}/issues/${existing.number}`,
-      body: { title: bridge.title, body },
+      body: { title, body },
     });
   } else {
     issue = await githubRequest({
       token,
       method: "POST",
       path: `/repos/${repo.owner}/${repo.repo}/issues`,
-      body: { title: bridge.title, body, labels },
+      body: { title, body, labels },
     });
   }
   if (existing) {
@@ -280,12 +325,13 @@ async function run() {
   }
 
   console.log(`${existing ? "Updated" : "Created"} bridge issue #${issue.number}: ${issue.html_url}`);
-  console.log(`marker=${bridge.marker}`);
+  console.log(`marker=${marker}`);
   console.log(`attempt=${attempt} ready_applied=${readyAllowed}`);
   setOutput("issue-number", issue.number);
   setOutput("issue-url", issue.html_url);
-  setOutput("marker", bridge.marker);
+  setOutput("marker", marker);
   setOutput("ready-applied", readyAllowed ? "true" : "false");
+  setOutput("attempt", attempt);
 }
 
 run().catch((error) => {
