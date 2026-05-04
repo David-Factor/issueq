@@ -233,7 +233,18 @@ Successful validation:
 - Commit: `430971c7b50de80a6bef55067e8227a28bc68be3`
 - Draft PR: https://github.com/jakelawllm/gleg/pull/223
 
-The human checkout stayed isolated from automation. Future PR-producing examples should keep the same boundary: agent edits; wrapper owns publishing and issueq result serialization.
+The human checkout stayed isolated from automation. Future PR-producing examples can use either boundary depending on trust level: Codex `workspace-write` with wrapper-owned publishing for stricter containment, or Codex `danger-full-access` with agent-owned commit/push/PR on controlled private repos and secretless VMs.
+
+Follow-up full-access validation:
+
+- Issue: https://github.com/jakelawllm/gleg/issues/224
+- Job: `job_01KQRPARTGZD6WG1EB01WKF92Q`
+- Worktree: `/srv/issueq/instances/jakelawllm-gleg/repos/worktrees/issue-224-job-01KQRPARTGZD`
+- Branch: `issueq/issue-224/job-01KQRPARTGZD`
+- Commit: `b609a64013ff32ae4c3a98fb824633eb8d33f89d`
+- Draft PR: https://github.com/jakelawllm/gleg/pull/225
+
+The full-access route matched the desired agent-owned flow: the agent edited, verified, committed, pushed, and opened the draft PR; the wrapper verified/reporting only.
 
 
 When implementing this, start with one bridge workflow at a time:
