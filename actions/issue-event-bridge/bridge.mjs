@@ -269,7 +269,7 @@ async function ensureLabels(input) {
 }
 
 async function run() {
-  const token = readInput("github-token") || process.env.GITHUB_TOKEN;
+  const token = readInput("github-token") || process.env.GITHUB_TOKEN || process.env.INPUT_GITHUB_TOKEN;
   if (!token) {
     throw new Error("github-token input or GITHUB_TOKEN is required");
   }
