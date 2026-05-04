@@ -209,7 +209,32 @@ agent-live-smoke
 agent-live-fix-pr
 ```
 
-## Deferred implementation notes
+## Phase 2C instance validation
+
+The `jakelawllm-gleg` validation instance proved a skill-driven draft-PR workflow after the local worktree smoke.
+
+The route used:
+
+- labels: `agent-ready` + `issueq-pr-smoke`
+- script: `/srv/issueq/instances/jakelawllm-gleg/agents/agent-pr-smoke.sh`
+- skill: `/srv/issueq/instances/jakelawllm-gleg/agents/skills/pr-smoke.md`
+- agent: `codex exec --sandbox workspace-write`
+
+The final design kept the agent focused on editing and cheap verification. The wrapper prepared the worktree, committed the final diff, pushed the branch, opened the draft PR, and wrote issueq result JSON.
+
+The first attempt failed safely because the sandboxed agent could edit the linked worktree but could not push to the exe.dev Git integration host. The successful retry used wrapper-owned publish steps.
+
+Successful validation:
+
+- Issue: https://github.com/jakelawllm/gleg/issues/222
+- Job: `job_01KQRMJ465V0CN4YFNHV5HKTM5`
+- Worktree: `/srv/issueq/instances/jakelawllm-gleg/repos/worktrees/issue-222-job-01KQRMJ465V0`
+- Branch: `issueq/issue-222/job-01KQRMJ465V0`
+- Commit: `430971c7b50de80a6bef55067e8227a28bc68be3`
+- Draft PR: https://github.com/jakelawllm/gleg/pull/223
+
+The human checkout stayed isolated from automation. Future PR-producing examples should keep the same boundary: agent edits; wrapper owns publishing and issueq result serialization.
+
 
 When implementing this, start with one bridge workflow at a time:
 
