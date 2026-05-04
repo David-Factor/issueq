@@ -9,7 +9,8 @@ const apiVersionHeaders = {
 
 function readInput(name, fallback = "") {
   const key = `INPUT_${name.toUpperCase().replaceAll("-", "_")}`;
-  return process.env[key] ?? fallback;
+  const value = process.env[key];
+  return value && value.trim() ? value : fallback;
 }
 
 function setOutput(name, value) {
