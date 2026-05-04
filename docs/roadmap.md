@@ -23,7 +23,8 @@ Near-term work should make the existing issue-label runner easier and safer to o
 - better CLI inspection and recovery commands for jobs, events, and artifacts;
 - clearer retry/dead-letter/manual-resolution workflows;
 - metrics and health reporting;
-- stronger smoke tests around upgrades, daemon restarts, and GitHub API edge cases.
+- stronger smoke tests around upgrades, daemon restarts, and GitHub API edge cases;
+- GitHub Actions bridge examples for PR/CI events that create or update issueq-routing issues; see `docs/event-bridge-routing-plan.md`.
 
 ## Broader GitHub event support
 
