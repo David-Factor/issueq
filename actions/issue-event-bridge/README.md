@@ -31,7 +31,7 @@ jobs:
     steps:
       - uses: David-Factor/issueq/actions/issue-event-bridge@main
         with:
-          routing-labels: agent-ci-diagnose
+          routing-labels: agent-route-ci-diagnose
           apply-ready: "false"
           generated-branch: "{{ pr.head_branch }}"
           marker: "<!-- issueq-bridge:ci-failure:pr-{{ pr.number|slug }}:workflow-{{ workflow.name|slug }} -->"
