@@ -46,6 +46,14 @@ inputs:
     description: Comma or newline separated branch prefixes that should not receive the ready label automatically.
     required: false
     default: "issueq/,agent/,codex/"
+  pr-comment-marker:
+    description: Hidden marker template used to create/update one source PR comment. Leave empty to skip PR backlinking.
+    required: false
+    default: ""
+  pr-comment:
+    description: Source PR comment body template. Rendered after bridge issue creation with bridge_issue.* context.
+    required: false
+    default: ""
 outputs:
   issue-number:
     description: Created or updated issue number.
@@ -57,6 +65,8 @@ outputs:
     description: Whether the ready label was applied.
   attempt:
     description: Bridge attempt count for the rendered marker.
+  pr-comment-url:
+    description: Created or updated source PR comment URL, when PR backlinking is configured.
 runs:
   using: node20
   main: bridge.mjs

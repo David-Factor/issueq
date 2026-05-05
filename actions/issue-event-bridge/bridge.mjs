@@ -276,6 +276,35 @@ async function ensureLabels(input) {
   });
 }
 
+async function findExistingIssueComment(input) {
+  if (!input.marker) {
+    return null;
+  }
+  const comments = await githubRequest({
+    token: input.token,
+    path: `/repos/${input.repo.owner}/${input.repo.repo}/issues/${input.issueNumber}/comments?per_page=100`,
+  });
+  return Array.isArray(comments) ? comments.find((entry) => entry.body?.includes(input.marker)) ?? null : null;
+}
+
+async function upsertIssueComment(input) {
+  const existing = await findExistingIssueComment(input);
+  if (existing) {
+    return await githubRequest({
+      token: input.token,
+      method: "PATCH",
+      path: `/repos/${input.repo.owner}/${input.repo.repo}/issues/comments/${existing.id}`,
+      body: { body: input.body },
+    });
+  }
+  return await githubRequest({
+    token: input.token,
+    method: "POST",
+    path: `/repos/${input.repo.owner}/${input.repo.repo}/issues/${input.issueNumber}/comments`,
+    body: { body: input.body },
+  });
+}
+
 async function run() {
   const token = readInput("github-token") || process.env.GITHUB_TOKEN || process.env.INPUT_GITHUB_TOKEN;
   if (!token) {
@@ -333,7 +362,47 @@ async function run() {
     await ensureLabels({ token, repo, issueNumber: issue.number, labels });
   }
 
+  const bridgeContext = {
+    ...context,
+    bridge_issue: {
+      number: issue.number,
+      url: issue.html_url,
+      title,
+      marker,
+      attempt,
+      ready_applied: readyAllowed ? "true" : "false",
+    },
+  };
+  const prCommentMarker = renderTemplate(readInput("pr-comment-marker"), bridgeContext).trim();
+  const prCommentTemplate = readInput("pr-comment");
+  let prComment = null;
+  if (prCommentMarker || prCommentTemplate.trim()) {
+    const prNumber = Number.parseInt(String(context.pr?.number ?? ""), 10);
+    if (!Number.isInteger(prNumber) || prNumber < 1) {
+      throw new Error("pr-comment configured but no source PR number is available in context");
+    }
+    const renderedPrComment = renderTemplate(prCommentTemplate, bridgeContext).trim();
+    if (!prCommentMarker || !renderedPrComment) {
+      throw new Error("both pr-comment-marker and pr-comment must render to non-empty strings when PR backlinking is configured");
+    }
+    const bodyWithMarker = renderedPrComment.includes(prCommentMarker)
+      ? renderedPrComment
+      : `${prCommentMarker}
+
+${renderedPrComment}`;
+    prComment = await upsertIssueComment({
+      token,
+      repo,
+      issueNumber: prNumber,
+      marker: prCommentMarker,
+      body: bodyWithMarker,
+    });
+  }
+
   console.log(`${existing ? "Updated" : "Created"} bridge issue #${issue.number}: ${issue.html_url}`);
+  if (prComment) {
+    console.log(`Updated PR backlink comment: ${prComment.html_url}`);
+  }
   console.log(`marker=${marker}`);
   console.log(`attempt=${attempt} ready_applied=${readyAllowed}`);
   setOutput("issue-number", issue.number);
@@ -341,6 +410,7 @@ async function run() {
   setOutput("marker", marker);
   setOutput("ready-applied", readyAllowed ? "true" : "false");
   setOutput("attempt", attempt);
+  setOutput("pr-comment-url", prComment?.html_url ?? "");
 }
 
 run().catch((error) => {

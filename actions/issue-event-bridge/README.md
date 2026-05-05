@@ -36,6 +36,14 @@ jobs:
           generated-branch: "{{ pr.head_branch }}"
           marker: "<!-- issueq-bridge:ci-failure:pr-{{ pr.number|slug }}:workflow-{{ workflow.name|slug }} -->"
           title: "CI failure: PR #{{ pr.number }}"
+          pr-comment-marker: "<!-- issueq-pr-backlink:ci-failure:pr-{{ pr.number|slug }}:workflow-{{ workflow.name|slug }} -->"
+          pr-comment: |
+            issueq CI diagnosis issue: #{{ bridge_issue.number }}
+
+            - Issue: {{ bridge_issue.url }}
+            - Workflow: {{ workflow.name }}
+            - Run: {{ workflow.run_url }}
+            - Head SHA: `{{ pr.head_sha }}`
           body: |
             <!-- issueq-bridge:ci-failure:pr-{{ pr.number|slug }}:workflow-{{ workflow.name|slug }} -->
 
@@ -95,6 +103,24 @@ step, then reference its fields in the templates.
 
 The rendered `marker` is searched in open issue bodies before create. If found,
 the existing issue is patched instead of creating a duplicate.
+
+## PR backlink comments
+
+Set `pr-comment-marker` and `pr-comment` to create or update one stable comment
+on the source pull request. The PR comment template is rendered after the bridge
+issue exists, so it can reference:
+
+```text
+bridge_issue.number
+bridge_issue.url
+bridge_issue.title
+bridge_issue.marker
+bridge_issue.attempt
+bridge_issue.ready_applied
+```
+
+The PR comment marker is searched in the source PR's comments before create. If
+found, the existing comment is patched instead of creating a duplicate.
 
 ## Loop control
 
