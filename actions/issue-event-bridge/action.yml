@@ -54,6 +54,10 @@ inputs:
     description: Source PR comment body template. Rendered after bridge issue creation with bridge_issue.* context.
     required: false
     default: ""
+  pr-comment-required:
+    description: When true, fail the action if PR backlink comment creation/update fails. Defaults to false so bridge issue creation is not blocked by comment permissions.
+    required: false
+    default: "false"
 outputs:
   issue-number:
     description: Created or updated issue number.
@@ -67,6 +71,8 @@ outputs:
     description: Bridge attempt count for the rendered marker.
   pr-comment-url:
     description: Created or updated source PR comment URL, when PR backlinking is configured.
+  pr-comment-error:
+    description: Non-fatal PR backlink comment error, when backlinking fails and pr-comment-required is false.
 runs:
   using: node20
   main: bridge.mjs

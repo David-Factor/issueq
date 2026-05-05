@@ -375,28 +375,38 @@ async function run() {
   };
   const prCommentMarker = renderTemplate(readInput("pr-comment-marker"), bridgeContext).trim();
   const prCommentTemplate = readInput("pr-comment");
+  const prCommentRequired = parseBoolean(readInput("pr-comment-required", "false"));
   let prComment = null;
+  let prCommentError = "";
   if (prCommentMarker || prCommentTemplate.trim()) {
-    const prNumber = Number.parseInt(String(context.pr?.number ?? ""), 10);
-    if (!Number.isInteger(prNumber) || prNumber < 1) {
-      throw new Error("pr-comment configured but no source PR number is available in context");
-    }
-    const renderedPrComment = renderTemplate(prCommentTemplate, bridgeContext).trim();
-    if (!prCommentMarker || !renderedPrComment) {
-      throw new Error("both pr-comment-marker and pr-comment must render to non-empty strings when PR backlinking is configured");
-    }
-    const bodyWithMarker = renderedPrComment.includes(prCommentMarker)
-      ? renderedPrComment
-      : `${prCommentMarker}
+    try {
+      const prNumber = Number.parseInt(String(context.pr?.number ?? ""), 10);
+      if (!Number.isInteger(prNumber) || prNumber < 1) {
+        throw new Error("pr-comment configured but no source PR number is available in context");
+      }
+      const renderedPrComment = renderTemplate(prCommentTemplate, bridgeContext).trim();
+      if (!prCommentMarker || !renderedPrComment) {
+        throw new Error("both pr-comment-marker and pr-comment must render to non-empty strings when PR backlinking is configured");
+      }
+      const bodyWithMarker = renderedPrComment.includes(prCommentMarker)
+        ? renderedPrComment
+        : `${prCommentMarker}
 
 ${renderedPrComment}`;
-    prComment = await upsertIssueComment({
-      token,
-      repo,
-      issueNumber: prNumber,
-      marker: prCommentMarker,
-      body: bodyWithMarker,
-    });
+      prComment = await upsertIssueComment({
+        token,
+        repo,
+        issueNumber: prNumber,
+        marker: prCommentMarker,
+        body: bodyWithMarker,
+      });
+    } catch (error) {
+      prCommentError = error instanceof Error ? error.message : String(error);
+      if (prCommentRequired) {
+        throw error;
+      }
+      console.warn(`PR backlink comment failed: ${prCommentError}`);
+    }
   }
 
   console.log(`${existing ? "Updated" : "Created"} bridge issue #${issue.number}: ${issue.html_url}`);
@@ -411,6 +421,7 @@ ${renderedPrComment}`;
   setOutput("ready-applied", readyAllowed ? "true" : "false");
   setOutput("attempt", attempt);
   setOutput("pr-comment-url", prComment?.html_url ?? "");
+  setOutput("pr-comment-error", prCommentError);
 }
 
 run().catch((error) => {

@@ -120,7 +120,10 @@ bridge_issue.ready_applied
 ```
 
 The PR comment marker is searched in the source PR's comments before create. If
-found, the existing comment is patched instead of creating a duplicate.
+found, the existing comment is patched instead of creating a duplicate. By
+default PR comment failures are non-fatal so bridge issue creation still
+succeeds even when a token cannot comment on a PR from a fork or restricted
+context. Set `pr-comment-required: "true"` to make backlink failures fatal.
 
 ## Loop control
 
