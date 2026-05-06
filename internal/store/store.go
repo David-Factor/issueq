@@ -43,6 +43,9 @@ type QueueStore interface {
 	ListEligibleJobIDs(ctx context.Context, now time.Time) ([]string, error)
 	ListJobs(ctx context.Context) ([]model.Job, error)
 	ListIssues(ctx context.Context) ([]model.IssueSnapshot, error)
+	UpsertHandoff(ctx context.Context, handoff model.Handoff) (bool, error)
+	ListHandoffsForIssue(ctx context.Context, issueKey string) ([]model.Handoff, error)
+	LatestMatchingHandoff(ctx context.Context, query model.HandoffQuery) (*model.Handoff, error)
 	InsertJobEvent(ctx context.Context, event model.JobEvent) (model.JobEvent, error)
 	ListJobEvents(ctx context.Context, jobID string) ([]model.JobEvent, error)
 	Close() error

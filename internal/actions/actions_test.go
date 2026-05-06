@@ -129,6 +129,10 @@ func (f *fakeClient) ListOpenIssues(ctx context.Context, owner, repo string) ([]
 	return nil, nil
 }
 
+func (f *fakeClient) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]model.IssueComment, error) {
+	return nil, nil
+}
+
 func (f *fakeClient) GetIssue(ctx context.Context, owner, repo string, number int) (model.IssueSnapshot, error) {
 	f.calls = append(f.calls, "get")
 	if len(f.issues) == 0 {

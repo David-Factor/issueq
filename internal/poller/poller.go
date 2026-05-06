@@ -8,12 +8,15 @@ import (
 
 	"issueq/internal/config"
 	issuegithub "issueq/internal/github"
+	"issueq/internal/handoff"
 	"issueq/internal/store"
 )
 
 type Result struct {
-	IssuesFetched  int
-	IssuesUpserted int
+	IssuesFetched    int
+	IssuesUpserted   int
+	HandoffsFound    int
+	HandoffsInserted int
 }
 
 func Poll(ctx context.Context, cfg config.Config, client issuegithub.Client, queue store.QueueStore) (Result, error) {
@@ -42,6 +45,23 @@ func Poll(ctx context.Context, cfg config.Config, client issuegithub.Client, que
 			return Result{}, fmt.Errorf("upsert issue %s: %w", issue.IssueKey, err)
 		}
 		result.IssuesUpserted++
+		comments, err := client.ListIssueComments(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number)
+		if err != nil {
+			return Result{}, fmt.Errorf("list issue comments for %s: %w", issue.IssueKey, err)
+		}
+		for _, comment := range comments {
+			parsed := handoff.ParseComment(issue.IssueKey, comment.Body, comment.CreatedAt)
+			result.HandoffsFound += len(parsed.Handoffs)
+			for _, h := range parsed.Handoffs {
+				inserted, err := queue.UpsertHandoff(ctx, h)
+				if err != nil {
+					return Result{}, fmt.Errorf("upsert handoff %s for issue %s: %w", h.ID, issue.IssueKey, err)
+				}
+				if inserted {
+					result.HandoffsInserted++
+				}
+			}
+		}
 	}
 	return result, nil
 }

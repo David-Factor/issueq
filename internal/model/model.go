@@ -38,6 +38,38 @@ type IssueSnapshot struct {
 	SyncedAt        time.Time `json:"synced_at,omitempty"`
 }
 
+type Handoff struct {
+	ID                string
+	IssueKey          string
+	RouteName         string
+	Decision          string
+	NextRoute         string
+	SourceKind        string
+	SourceKey         string
+	SourceFingerprint string
+	TargetKind        string
+	TargetKey         string
+	PayloadJSON       string
+	CreatedAt         time.Time
+}
+
+type HandoffQuery struct {
+	IssueKey   string
+	RouteNames []string
+	Decisions  []string
+	NextRoute  string
+	TargetKind string
+	TargetKey  string
+}
+
+type IssueComment struct {
+	ID        string
+	IssueKey  string
+	Body      string
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
 type JobCreate struct {
 	IssueKey    string
 	RouteName   string

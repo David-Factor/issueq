@@ -22,11 +22,18 @@ func TestMigrationsCreateTablesAndAreIdempotent(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("second Migrate() error = %v", err)
 	}
-	for _, table := range []string{"issues", "jobs", "issue_state", "route_attempts", "runner_heartbeats", "job_events"} {
+	for _, table := range []string{"issues", "jobs", "issue_state", "route_attempts", "runner_heartbeats", "job_events", "handoffs"} {
 		var name string
 		err := store.db.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&name)
 		if err != nil {
 			t.Fatalf("table %s missing: %v", table, err)
+		}
+	}
+	for _, index := range []string{"handoffs_issue_route_idx", "handoffs_issue_next_route_idx", "handoffs_target_idx"} {
+		var name string
+		err := store.db.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?", index).Scan(&name)
+		if err != nil {
+			t.Fatalf("handoff index %s missing: %v", index, err)
 		}
 	}
 }
@@ -180,6 +187,68 @@ func TestJobEventsCanBeWrittenAndRead(t *testing.T) {
 	}
 	if len(events) != 1 || events[0].Message != "hello" || events[0].DataJSON != `{"ok":true}` {
 		t.Fatalf("events = %#v", events)
+	}
+}
+
+func TestHandoffsCanBeUpsertedAndQueried(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+
+	earliest := sampleHandoff("h1", "triage", "needs_work", "", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	olderMatch := sampleHandoff("h2", "triage", "accepted", "fix", time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC))
+	latestMatch := sampleHandoff("h3", "qa", "accepted", "fix", time.Date(2026, 1, 1, 2, 0, 0, 0, time.UTC))
+	for _, h := range []model.Handoff{earliest, olderMatch, latestMatch} {
+		inserted, err := store.UpsertHandoff(ctx, h)
+		if err != nil || !inserted {
+			t.Fatalf("UpsertHandoff inserted=%v err=%v", inserted, err)
+		}
+	}
+	reinserted, err := store.UpsertHandoff(ctx, latestMatch)
+	if err != nil {
+		t.Fatalf("UpsertHandoff duplicate error = %v", err)
+	}
+	if reinserted {
+		t.Fatal("duplicate handoff inserted = true")
+	}
+
+	all, err := store.ListHandoffsForIssue(ctx, earliest.IssueKey)
+	if err != nil {
+		t.Fatalf("ListHandoffsForIssue error = %v", err)
+	}
+	if len(all) != 3 || all[0].ID != earliest.ID || all[2].ID != latestMatch.ID {
+		t.Fatalf("handoff order = %#v", all)
+	}
+	got, err := store.LatestMatchingHandoff(ctx, model.HandoffQuery{IssueKey: earliest.IssueKey, RouteNames: []string{"triage", "qa"}, Decisions: []string{"accepted"}, NextRoute: "fix", TargetKind: "issue", TargetKey: "#1"})
+	if err != nil {
+		t.Fatalf("LatestMatchingHandoff error = %v", err)
+	}
+	if got == nil || got.ID != latestMatch.ID {
+		t.Fatalf("latest handoff = %#v", got)
+	}
+	missing, err := store.LatestMatchingHandoff(ctx, model.HandoffQuery{IssueKey: earliest.IssueKey, Decisions: []string{"rejected"}})
+	if err != nil {
+		t.Fatalf("LatestMatchingHandoff missing error = %v", err)
+	}
+	if missing != nil {
+		t.Fatalf("missing handoff = %#v", missing)
+	}
+}
+
+func sampleHandoff(id, route, decision, nextRoute string, created time.Time) model.Handoff {
+	return model.Handoff{
+		ID:                id,
+		IssueKey:          "github.com/example-org/example-repo#1",
+		RouteName:         route,
+		Decision:          decision,
+		NextRoute:         nextRoute,
+		SourceKind:        "issue",
+		SourceKey:         "#1",
+		SourceFingerprint: "fp-" + id,
+		TargetKind:        "issue",
+		TargetKey:         "#1",
+		PayloadJSON:       `{"schema":"issueq-handoff/v1"}`,
+		CreatedAt:         created,
 	}
 }
 

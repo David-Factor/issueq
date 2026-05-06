@@ -910,6 +910,137 @@ FROM issues `+suffix)
 	return issues, nil
 }
 
+func (s *Store) UpsertHandoff(ctx context.Context, handoff model.Handoff) (bool, error) {
+	if strings.TrimSpace(handoff.ID) == "" {
+		return false, errors.New("handoff id is required")
+	}
+	if strings.TrimSpace(handoff.IssueKey) == "" {
+		return false, errors.New("handoff issue key is required")
+	}
+	if strings.TrimSpace(handoff.RouteName) == "" {
+		return false, errors.New("handoff route name is required")
+	}
+	if strings.TrimSpace(handoff.Decision) == "" {
+		return false, errors.New("handoff decision is required")
+	}
+	if strings.TrimSpace(handoff.PayloadJSON) == "" {
+		return false, errors.New("handoff payload JSON is required")
+	}
+	if handoff.CreatedAt.IsZero() {
+		handoff.CreatedAt = time.Now().UTC()
+	}
+	tx, err := s.beginImmediate(ctx)
+	if err != nil {
+		return false, fmt.Errorf("begin handoff upsert: %w", err)
+	}
+	defer tx.Rollback()
+	var existing int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM handoffs WHERE id = ?`, handoff.ID).Scan(&existing); err != nil {
+		return false, fmt.Errorf("check handoff existence: %w", err)
+	}
+	_, err = tx.ExecContext(ctx, `
+INSERT INTO handoffs (id, issue_key, route_name, decision, next_route, source_kind, source_key, source_fingerprint, target_kind, target_key, payload_json, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+  issue_key = excluded.issue_key,
+  route_name = excluded.route_name,
+  decision = excluded.decision,
+  next_route = excluded.next_route,
+  source_kind = excluded.source_kind,
+  source_key = excluded.source_key,
+  source_fingerprint = excluded.source_fingerprint,
+  target_kind = excluded.target_kind,
+  target_key = excluded.target_key,
+  payload_json = excluded.payload_json,
+  created_at = excluded.created_at
+`, handoff.ID, handoff.IssueKey, handoff.RouteName, handoff.Decision, nullString(handoff.NextRoute), nullString(handoff.SourceKind), nullString(handoff.SourceKey), nullString(handoff.SourceFingerprint), nullString(handoff.TargetKind), nullString(handoff.TargetKey), handoff.PayloadJSON, formatTime(handoff.CreatedAt))
+	if err != nil {
+		return false, fmt.Errorf("upsert handoff: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit handoff upsert: %w", err)
+	}
+	return existing == 0, nil
+}
+
+func (s *Store) ListHandoffsForIssue(ctx context.Context, issueKey string) ([]model.Handoff, error) {
+	rows, err := s.db.QueryContext(ctx, `
+SELECT id, issue_key, route_name, decision, next_route, source_kind, source_key, source_fingerprint, target_kind, target_key, payload_json, created_at
+FROM handoffs
+WHERE issue_key = ?
+ORDER BY created_at ASC, id ASC`, issueKey)
+	if err != nil {
+		return nil, fmt.Errorf("list handoffs: %w", err)
+	}
+	defer rows.Close()
+	return scanHandoffs(rows, "handoffs")
+}
+
+func (s *Store) LatestMatchingHandoff(ctx context.Context, query model.HandoffQuery) (*model.Handoff, error) {
+	var clauses []string
+	var args []any
+	if strings.TrimSpace(query.IssueKey) != "" {
+		clauses = append(clauses, "issue_key = ?")
+		args = append(args, query.IssueKey)
+	}
+	if len(query.RouteNames) > 0 {
+		placeholders := make([]string, 0, len(query.RouteNames))
+		for _, route := range query.RouteNames {
+			if strings.TrimSpace(route) == "" {
+				continue
+			}
+			placeholders = append(placeholders, "?")
+			args = append(args, route)
+		}
+		if len(placeholders) > 0 {
+			clauses = append(clauses, "route_name IN ("+strings.Join(placeholders, ",")+")")
+		}
+	}
+	if len(query.Decisions) > 0 {
+		placeholders := make([]string, 0, len(query.Decisions))
+		for _, decision := range query.Decisions {
+			if strings.TrimSpace(decision) == "" {
+				continue
+			}
+			placeholders = append(placeholders, "?")
+			args = append(args, decision)
+		}
+		if len(placeholders) > 0 {
+			clauses = append(clauses, "decision IN ("+strings.Join(placeholders, ",")+")")
+		}
+	}
+	if strings.TrimSpace(query.NextRoute) != "" {
+		clauses = append(clauses, "next_route = ?")
+		args = append(args, query.NextRoute)
+	}
+	if strings.TrimSpace(query.TargetKind) != "" {
+		clauses = append(clauses, "target_kind = ?")
+		args = append(args, query.TargetKind)
+	}
+	if strings.TrimSpace(query.TargetKey) != "" {
+		clauses = append(clauses, "target_key = ?")
+		args = append(args, query.TargetKey)
+	}
+	where := "1=1"
+	if len(clauses) > 0 {
+		where = strings.Join(clauses, " AND ")
+	}
+	row := s.db.QueryRowContext(ctx, `
+SELECT id, issue_key, route_name, decision, next_route, source_kind, source_key, source_fingerprint, target_kind, target_key, payload_json, created_at
+FROM handoffs
+WHERE `+where+`
+ORDER BY created_at DESC, id DESC
+LIMIT 1`, args...)
+	handoff, err := scanHandoff(row)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &handoff, nil
+}
+
 func (s *Store) EnqueueJob(ctx context.Context, create model.JobCreate) (model.Job, bool, error) {
 	now := time.Now().UTC()
 	if create.AvailableAt.IsZero() {
@@ -1037,6 +1168,38 @@ FROM jobs WHERE dedupe_key = ?`, key)
 
 type scanner interface {
 	Scan(dest ...any) error
+}
+
+func scanHandoffs(rows *sql.Rows, label string) ([]model.Handoff, error) {
+	var handoffs []model.Handoff
+	for rows.Next() {
+		handoff, err := scanHandoff(rows)
+		if err != nil {
+			return nil, err
+		}
+		handoffs = append(handoffs, handoff)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list %s rows: %w", label, err)
+	}
+	return handoffs, nil
+}
+
+func scanHandoff(row scanner) (model.Handoff, error) {
+	var handoff model.Handoff
+	var nextRoute, sourceKind, sourceKey, sourceFingerprint, targetKind, targetKey sql.NullString
+	var createdAt string
+	if err := row.Scan(&handoff.ID, &handoff.IssueKey, &handoff.RouteName, &handoff.Decision, &nextRoute, &sourceKind, &sourceKey, &sourceFingerprint, &targetKind, &targetKey, &handoff.PayloadJSON, &createdAt); err != nil {
+		return model.Handoff{}, fmt.Errorf("scan handoff: %w", err)
+	}
+	handoff.NextRoute = nextRoute.String
+	handoff.SourceKind = sourceKind.String
+	handoff.SourceKey = sourceKey.String
+	handoff.SourceFingerprint = sourceFingerprint.String
+	handoff.TargetKind = targetKind.String
+	handoff.TargetKey = targetKey.String
+	handoff.CreatedAt = parseTime(createdAt)
+	return handoff, nil
 }
 
 func scanIssue(row scanner) (model.IssueSnapshot, error) {

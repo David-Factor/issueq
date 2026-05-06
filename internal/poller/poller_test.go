@@ -13,8 +13,9 @@ import (
 )
 
 type fakeGitHub struct {
-	issues []model.IssueSnapshot
-	err    error
+	issues   []model.IssueSnapshot
+	comments map[int][]model.IssueComment
+	err      error
 }
 
 func (f fakeGitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]model.IssueSnapshot, error) {
@@ -22,6 +23,9 @@ func (f fakeGitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]m
 		return nil, f.err
 	}
 	return f.issues, nil
+}
+func (f fakeGitHub) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]model.IssueComment, error) {
+	return f.comments[number], nil
 }
 func (f fakeGitHub) GetIssue(ctx context.Context, owner, repo string, number int) (model.IssueSnapshot, error) {
 	return model.IssueSnapshot{}, nil
@@ -125,6 +129,60 @@ func TestPollReportsGitHubErrorsClearly(t *testing.T) {
 	if !strings.Contains(err.Error(), "list GitHub issues: rate limited") {
 		t.Fatalf("error = %v", err)
 	}
+}
+
+func TestPollIngestsHandoffCommentsIdempotently(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t, ctx)
+	defer store.Close()
+	updated := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	commented := time.Date(2026, 1, 2, 4, 0, 0, 0, time.UTC)
+	client := fakeGitHub{
+		issues: []model.IssueSnapshot{{
+			Host:            "github.com",
+			Owner:           "example-org",
+			Repo:            "example-repo",
+			Number:          123,
+			Title:           "Add CSV export",
+			Labels:          []string{"agent-ready"},
+			State:           "open",
+			GitHubUpdatedAt: updated,
+		}},
+		comments: map[int][]model.IssueComment{123: {{Body: handoffCommentPayload(), CreatedAt: commented}}},
+	}
+	result, err := Poll(ctx, testConfig(), client, store)
+	if err != nil {
+		t.Fatalf("Poll() error = %v", err)
+	}
+	if result.HandoffsFound != 1 || result.HandoffsInserted != 1 {
+		t.Fatalf("handoff result = %#v", result)
+	}
+	again, err := Poll(ctx, testConfig(), client, store)
+	if err != nil {
+		t.Fatalf("second Poll() error = %v", err)
+	}
+	if again.HandoffsFound != 1 || again.HandoffsInserted != 0 {
+		t.Fatalf("second handoff result = %#v", again)
+	}
+	handoffs, err := store.ListHandoffsForIssue(ctx, "github.com/example-org/example-repo#123")
+	if err != nil {
+		t.Fatalf("ListHandoffsForIssue error = %v", err)
+	}
+	if len(handoffs) != 1 || handoffs[0].RouteName != "triage" || handoffs[0].Decision != "accepted" || handoffs[0].NextRoute != "fix" {
+		t.Fatalf("handoffs = %#v", handoffs)
+	}
+}
+
+func handoffCommentPayload() string {
+	return "```json\n" + `{
+  "schema": "issueq-handoff/v1",
+  "schema_version": "1",
+  "route": "triage",
+  "decision": "accepted",
+  "next_route": "fix",
+  "source": {"kind": "github_issue", "issue_number": 123, "body_sha256": "abc"},
+  "target": {"kind": "github_issue", "issue_number": 123}
+}` + "\n```"
 }
 
 func testConfig() config.Config {

@@ -739,6 +739,10 @@ func (f *fakeDaemonGitHub) ListOpenIssues(ctx context.Context, owner, repo strin
 	return []model.IssueSnapshot{f.issue}, nil
 }
 
+func (f *fakeDaemonGitHub) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]model.IssueComment, error) {
+	return nil, nil
+}
+
 func (f *fakeDaemonGitHub) GetIssue(ctx context.Context, owner, repo string, number int) (model.IssueSnapshot, error) {
 	f.calls = append(f.calls, "get")
 	return f.issue, nil
