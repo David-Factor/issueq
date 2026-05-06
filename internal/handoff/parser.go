@@ -14,7 +14,7 @@ import (
 
 const SchemaV1 = "issueq-handoff/v1"
 
-var fencedBlockRE = regexp.MustCompile("(?s)```(?:json|issueq-handoff)?[ \\t]*\\n(.*?)\\n```")
+var fencedBlockRE = regexp.MustCompile("(?s)```issueq-handoff[ \\t]*\\n(.*?)\\n```")
 
 type Diagnostic struct {
 	Reason string

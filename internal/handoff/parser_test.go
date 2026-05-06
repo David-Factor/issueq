@@ -8,7 +8,7 @@ import (
 
 func TestParseCommentExtractsValidHandoff(t *testing.T) {
 	created := time.Date(2026, 5, 6, 1, 2, 3, 0, time.UTC)
-	result := ParseComment("github.com/o/r#191", "prefix\n```json\n"+validPayload()+"\n```\nsuffix", created)
+	result := ParseComment("github.com/o/r#191", "prefix\n```issueq-handoff\n"+validPayload()+"\n```\nsuffix", created)
 	if len(result.Diagnostics) != 0 {
 		t.Fatalf("diagnostics = %#v", result.Diagnostics)
 	}
@@ -34,14 +34,35 @@ func TestParseCommentExtractsValidHandoff(t *testing.T) {
 }
 
 func TestParseCommentIgnoresNonHandoffComments(t *testing.T) {
-	result := ParseComment("issue", "hello\n```json\n{\"schema\":\"else\"}\n```", time.Now())
+	result := ParseComment("issue", "hello\n```issueq-handoff\n{\"schema\":\"else\"}\n```", time.Now())
+	if len(result.Handoffs) != 0 || len(result.Diagnostics) != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestParseCommentIgnoresOrdinaryJSONFence(t *testing.T) {
+	result := ParseComment("issue", "```json\n"+validPayload()+"\n```", time.Now())
+	if len(result.Handoffs) != 0 || len(result.Diagnostics) != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestParseCommentIgnoresUnlabeledFence(t *testing.T) {
+	result := ParseComment("issue", "```\n"+validPayload()+"\n```", time.Now())
+	if len(result.Handoffs) != 0 || len(result.Diagnostics) != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestParseCommentIgnoresLegacyHTMLMarker(t *testing.T) {
+	result := ParseComment("issue", "<!-- issueq-handoff:v1 {\"schema\":\"issueq-handoff/v1\",\"route\":\"bug-triage\",\"decision\":\"accepted\"} -->", time.Now())
 	if len(result.Handoffs) != 0 || len(result.Diagnostics) != 0 {
 		t.Fatalf("result = %#v", result)
 	}
 }
 
 func TestParseCommentMalformedHandoffDiagnostic(t *testing.T) {
-	result := ParseComment("issue", "```json\n{\"schema\":\"issueq-handoff/v1\",\n```", time.Now())
+	result := ParseComment("issue", "```issueq-handoff\n{\"schema\":\"issueq-handoff/v1\",\n```", time.Now())
 	if len(result.Handoffs) != 0 {
 		t.Fatalf("handoffs = %#v", result.Handoffs)
 	}
@@ -51,7 +72,7 @@ func TestParseCommentMalformedHandoffDiagnostic(t *testing.T) {
 }
 
 func TestParseCommentPreservesUnknownPayloadFields(t *testing.T) {
-	result := ParseComment("issue", "```json\n"+validPayload()+"\n```", time.Now())
+	result := ParseComment("issue", "```issueq-handoff\n"+validPayload()+"\n```", time.Now())
 	if len(result.Handoffs) != 1 {
 		t.Fatalf("handoffs len = %d", len(result.Handoffs))
 	}
@@ -61,8 +82,8 @@ func TestParseCommentPreservesUnknownPayloadFields(t *testing.T) {
 }
 
 func TestParseCommentIDIsStable(t *testing.T) {
-	first := ParseComment("issue", "```json\n"+validPayload()+"\n```", time.Now()).Handoffs[0]
-	second := ParseComment("issue", "```json\n"+validPayload()+"\n```", time.Now().Add(time.Hour)).Handoffs[0]
+	first := ParseComment("issue", "```issueq-handoff\n"+validPayload()+"\n```", time.Now()).Handoffs[0]
+	second := ParseComment("issue", "```issueq-handoff\n"+validPayload()+"\n```", time.Now().Add(time.Hour)).Handoffs[0]
 	if first.ID != second.ID {
 		t.Fatalf("ids differ: %q %q", first.ID, second.ID)
 	}

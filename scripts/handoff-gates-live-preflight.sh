@@ -123,7 +123,7 @@ else
 fi
 echo "1. Pause intake if applicable, then stop the production issueq service and confirm it is inactive."
 echo "2. Apply labels: agent-ready, agent-route-bug-fix-pr, agent-write-approved."
-echo "3. Confirm no accepted bug-triage issueq-handoff/v1 comment exists on the issue."
+echo "3. Confirm no accepted bug-triage canonical issueq-handoff fenced comment exists on the issue."
 echo "4. Run: $issueq_cmd --config $config once"
 echo "5. Verify a missing_handoff block comment/label appeared and no bug-fix-pr attempt row was consumed."
 echo "6. Add a fresh bug-triage handoff comment, restore route labels if the block action removed them, then run once again."

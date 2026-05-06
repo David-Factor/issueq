@@ -120,10 +120,10 @@ CREATE INDEX handoffs_target_idx
 
 ### 5.1 Handoff envelope format
 
-Existing `issueq-handoff/v1` comment payloads are close to the desired envelope.
-The durable handoff parser should accept envelopes with at least:
+Issue comments may publish handoffs only as canonical `issueq-handoff` fenced JSON blocks.
+The durable handoff parser accepts blocks shaped as:
 
-```json
+```issueq-handoff
 {
   "schema": "issueq-handoff/v1",
   "schema_version": "1",
@@ -417,8 +417,10 @@ necessary, the SQLite backup.
 
 - Existing configs remain valid because `gate` and `attempt_scope` are optional.
 - Existing `route_attempts` rows migrate to `scope_hash = 'legacy'`.
-- Existing issue comments containing `issueq-handoff/v1` should be parsed into
-  the `handoffs` table on poll or route. Re-parsing must be idempotent.
+- Issue comments containing canonical `issueq-handoff` fenced blocks with schema
+  `issueq-handoff/v1` should be parsed into the `handoffs` table on poll or route.
+  Re-parsing must be idempotent. Ordinary `json`, `text`, shell, unlabeled, or
+  legacy marker blocks are not handoffs.
 - If the handoff table is empty, routes without handoff gates behave as they do
   today.
 

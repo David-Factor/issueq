@@ -174,7 +174,7 @@ func TestPollIngestsHandoffCommentsIdempotently(t *testing.T) {
 }
 
 func handoffCommentPayload() string {
-	return "```json\n" + `{
+	return "```issueq-handoff\n" + `{
   "schema": "issueq-handoff/v1",
   "schema_version": "1",
   "route": "triage",

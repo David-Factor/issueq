@@ -59,8 +59,8 @@ git diff --check
 ### Scope
 
 - Add migration for `handoffs` table and indexes.
-- Implement handoff envelope parser for `issueq-handoff/v1` JSON fenced blocks in
-  issue comments or result comments.
+- Implement handoff envelope parser for canonical `issueq-handoff` fenced JSON
+  blocks with schema `issueq-handoff/v1` in issue comments or result comments.
 - Store handoffs idempotently.
 - Preserve full payload in `payload_json`.
 - Expose store methods:

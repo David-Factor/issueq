@@ -227,7 +227,7 @@ func smokeIssue(labels []string) model.IssueSnapshot {
 }
 
 func smokeHandoffComment(issue model.IssueSnapshot) string {
-	return fmt.Sprintf("triage handoff\n\n```json\n{\"schema\":\"issueq-handoff/v1\",\"schema_version\":\"1\",\"route\":\"bug-triage\",\"decision\":\"bug_fix_candidate\",\"next_route\":\"bug-fix-pr\",\"source\":{\"kind\":\"github_issue\",\"issue_number\":191,\"body_sha256\":\"%s\"},\"target\":{\"kind\":\"github_issue\",\"issue_number\":191}}\n```", bodySHA256(issue.Body))
+	return fmt.Sprintf("```issueq-handoff\n{\"schema\":\"issueq-handoff/v1\",\"schema_version\":\"1\",\"route\":\"bug-triage\",\"decision\":\"bug_fix_candidate\",\"next_route\":\"bug-fix-pr\",\"source\":{\"kind\":\"github_issue\",\"issue_number\":191,\"body_sha256\":\"%s\"},\"target\":{\"kind\":\"github_issue\",\"issue_number\":191}}\n```\n\ntriage handoff", bodySHA256(issue.Body))
 }
 
 func bodySHA256(body string) string {

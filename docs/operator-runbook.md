@@ -299,7 +299,7 @@ Live smoke procedure:
    If the instance is not managed by systemd, stop the observed daemon process with the local service manager and confirm no `issueq daemon` process is polling this config/DB before continuing.
 
 3. Apply only the labels needed for the gated write route, for example `agent-ready`, `agent-route-bug-fix-pr`, and `agent-write-approved`.
-4. Confirm the issue has no accepted `issueq-handoff/v1` comment from `bug-triage`.
+4. Confirm the issue has no accepted canonical `issueq-handoff` fenced comment from `bug-triage`.
 5. Run one foreground cycle:
 
    ```sh
@@ -317,7 +317,7 @@ Live smoke procedure:
    sudo -u issueq "$ISSUEQ_BIN" --config "$CONFIG" jobs --json | jq '.[] | {id, status, route: .RouteName, attempts: .Attempts}'
    ```
 
-8. Add or trigger a fresh `bug-triage` handoff comment whose `next_route` is the gated route and whose source fingerprint still matches the issue.
+8. Add or trigger a fresh `bug-triage` handoff comment whose top-level canonical `issueq-handoff` fenced JSON block has `schema: issueq-handoff/v1`, `next_route` set to the gated route, and a source fingerprint that still matches the issue.
 9. Restore the route labels if the block action removed them, then run `once` again.
 10. Verify the gated work route launched exactly once and its scoped attempt count is `1`, not `2`.
 11. Re-arm the same route labels for the same handoff/scope and run `once` once more.
