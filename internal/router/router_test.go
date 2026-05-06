@@ -334,6 +334,53 @@ func TestGateAcceptedFreshHandoffAllowsJob(t *testing.T) {
 	}
 }
 
+func TestGateAcceptedEmptyBodyFingerprintAllowsJob(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t, ctx)
+	defer store.Close()
+	cfg := gatedTestConfig()
+	issue := testIssue([]string{"agent-ready"}, "open")
+	if err := store.UpsertIssue(ctx, issue); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpsertHandoff(ctx, gateHandoff("h1", "accepted", "code", bodySHA(""))); err != nil {
+		t.Fatal(err)
+	}
+	result, err := RouteWithGitHub(ctx, cfg, store, &fakeRouterGitHub{issue: issue})
+	if err != nil {
+		t.Fatalf("RouteWithGitHub() error = %v", err)
+	}
+	if result.JobsCreated != 1 || result.GateBlocked != 0 {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
+func TestAttemptScopeHashScopedRoutesFailClosedWhenGateBlocked(t *testing.T) {
+	tests := []string{
+		config.AttemptScopeHandoff,
+		config.AttemptScopeIssue,
+		config.AttemptScopePRHead,
+		config.AttemptScopeCIHead,
+	}
+	for _, attemptScope := range tests {
+		t.Run(attemptScope, func(t *testing.T) {
+			ctx := context.Background()
+			store := openStore(t, ctx)
+			defer store.Close()
+			cfg := gatedTestConfig()
+			cfg.Routes[0].Job.AttemptScope = attemptScope
+			issue := testIssue([]string{"agent-ready"}, "open")
+			if err := store.UpsertIssue(ctx, issue); err != nil {
+				t.Fatal(err)
+			}
+			_, err := AttemptScopeHash(ctx, store, cfg.Routes[0], issue)
+			if !errors.Is(err, ErrAttemptScopeBlocked) {
+				t.Fatalf("AttemptScopeHash() error = %v, want ErrAttemptScopeBlocked", err)
+			}
+		})
+	}
+}
+
 func TestAttemptScopeHashUsesAcceptedHandoff(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t, ctx)

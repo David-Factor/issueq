@@ -221,84 +221,23 @@ func issueFingerprints(issue model.IssueSnapshot) map[string]struct{} {
 		fps[issue.GitHubUpdatedAt.UTC().Format(time.RFC3339Nano)] = struct{}{}
 		fps[issue.GitHubUpdatedAt.UTC().Format("2006-01-02T15:04:05.999999999Z07:00")] = struct{}{}
 	}
-	if issue.Body != "" {
-		h := sha256.Sum256([]byte(issue.Body))
-		fps[hex.EncodeToString(h[:])] = struct{}{}
-	}
+	fps[issueBodySHA256(issue)] = struct{}{}
 	return fps
 }
 
 func gateScopeHash(issue model.IssueSnapshot, decision gateDecision) string {
-	h := sha256.New()
 	if decision.Handoff != nil {
-		h.Write([]byte("handoff"))
-		h.Write([]byte{0})
-		h.Write([]byte(decision.Handoff.ID))
-	} else {
-		h.Write([]byte("issue"))
-		h.Write([]byte{0})
-		h.Write([]byte(issue.IssueKey))
-		h.Write([]byte{0})
-		h.Write([]byte(issue.GitHubUpdatedAt.UTC().Format(time.RFC3339Nano)))
+		return hashScope("handoff", decision.Handoff.ID)
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	return hashScope("issue", issue.IssueKey, issue.GitHubUpdatedAt.UTC().Format(time.RFC3339Nano))
 }
 
 func AttemptScopeHash(ctx context.Context, queue store.QueueStore, route config.RouteConfig, issue model.IssueSnapshot) (string, error) {
-	switch strings.TrimSpace(route.Job.AttemptScope) {
-	case "", config.AttemptScopeLegacy:
-		return config.AttemptScopeLegacy, nil
-	case config.AttemptScopeHandoff:
-		decision, err := EvaluateGate(ctx, queue, route, issue)
-		if err != nil {
-			return "", err
-		}
-		if decision.Blocked {
-			return "", fmt.Errorf("%w: %s", ErrAttemptScopeBlocked, decision.Reason)
-		}
-		if decision.Handoff == nil {
-			return "", fmt.Errorf("%w: %s", ErrAttemptScopeBlocked, model.GateBlockReasonMissingHandoff)
-		}
-		return handoffAttemptScopeHash(*decision.Handoff), nil
-	case config.AttemptScopeIssue:
-		return issueAttemptScopeHash(issue), nil
-	case config.AttemptScopePRHead:
-		return targetAttemptScopeHash(ctx, queue, route, issue, "pr_head", []string{"github_pr", "github_pull_request", "pull_request"})
-	case config.AttemptScopeCIHead:
-		return targetAttemptScopeHash(ctx, queue, route, issue, "ci_head", []string{"github_ci", "github_check_run", "ci_run"})
-	default:
+	descriptor := attemptScopeDescriptorFor(route.Job.AttemptScope)
+	if descriptor.namespace == config.AttemptScopeLegacy {
 		return config.AttemptScopeLegacy, nil
 	}
-}
 
-func handoffAttemptScopeHash(handoff model.Handoff) string {
-	h := sha256.New()
-	h.Write([]byte(config.AttemptScopeHandoff))
-	h.Write([]byte{0})
-	if strings.TrimSpace(handoff.ID) != "" {
-		h.Write([]byte(handoff.ID))
-	} else {
-		h.Write([]byte(handoff.SourceFingerprint))
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-func issueAttemptScopeHash(issue model.IssueSnapshot) string {
-	h := sha256.New()
-	h.Write([]byte(config.AttemptScopeIssue))
-	h.Write([]byte{0})
-	h.Write([]byte(issue.IssueKey))
-	h.Write([]byte{0})
-	h.Write([]byte(issue.GitHubUpdatedAt.UTC().Format(time.RFC3339Nano)))
-	h.Write([]byte{0})
-	if issue.Body != "" {
-		bodyHash := sha256.Sum256([]byte(issue.Body))
-		h.Write([]byte(hex.EncodeToString(bodyHash[:])))
-	}
-	return hex.EncodeToString(h.Sum(nil))
-}
-
-func targetAttemptScopeHash(ctx context.Context, queue store.QueueStore, route config.RouteConfig, issue model.IssueSnapshot, namespace string, kinds []string) (string, error) {
 	decision, err := EvaluateGate(ctx, queue, route, issue)
 	if err != nil {
 		return "", err
@@ -306,20 +245,78 @@ func targetAttemptScopeHash(ctx context.Context, queue store.QueueStore, route c
 	if decision.Blocked {
 		return "", fmt.Errorf("%w: %s", ErrAttemptScopeBlocked, decision.Reason)
 	}
-	if decision.Handoff == nil || strings.TrimSpace(decision.Handoff.TargetKey) == "" {
+
+	switch descriptor.namespace {
+	case config.AttemptScopeHandoff:
+		if decision.Handoff == nil {
+			return "", fmt.Errorf("%w: %s", ErrAttemptScopeBlocked, model.GateBlockReasonMissingHandoff)
+		}
+		return handoffAttemptScopeHash(*decision.Handoff), nil
+	case config.AttemptScopeIssue:
+		return issueAttemptScopeHash(issue), nil
+	case config.AttemptScopePRHead, config.AttemptScopeCIHead:
+		return targetAttemptScopeHash(descriptor, decision), nil
+	default:
 		return config.AttemptScopeLegacy, nil
+	}
+}
+
+func handoffAttemptScopeHash(handoff model.Handoff) string {
+	fingerprint := handoff.SourceFingerprint
+	if strings.TrimSpace(handoff.ID) != "" {
+		fingerprint = handoff.ID
+	}
+	return hashScope(config.AttemptScopeHandoff, fingerprint)
+}
+
+func issueAttemptScopeHash(issue model.IssueSnapshot) string {
+	return hashScope(config.AttemptScopeIssue, issue.IssueKey, issue.GitHubUpdatedAt.UTC().Format(time.RFC3339Nano), issueBodySHA256(issue))
+}
+
+func targetAttemptScopeHash(descriptor attemptScopeDescriptor, decision gateDecision) string {
+	if decision.Handoff == nil || strings.TrimSpace(decision.Handoff.TargetKey) == "" {
+		return config.AttemptScopeLegacy
 	}
 	targetKind := strings.TrimSpace(decision.Handoff.TargetKind)
-	if targetKind != "" && !containsString(kinds, targetKind) {
-		return config.AttemptScopeLegacy, nil
+	if targetKind != "" && !containsString(descriptor.targetKinds, targetKind) {
+		return config.AttemptScopeLegacy
 	}
+	return hashScope(descriptor.namespace, decision.Handoff.TargetKind, decision.Handoff.TargetKey)
+}
+
+type attemptScopeDescriptor struct {
+	namespace   string
+	targetKinds []string
+}
+
+func attemptScopeDescriptorFor(scope string) attemptScopeDescriptor {
+	switch strings.TrimSpace(scope) {
+	case config.AttemptScopeHandoff:
+		return attemptScopeDescriptor{namespace: config.AttemptScopeHandoff}
+	case config.AttemptScopeIssue:
+		return attemptScopeDescriptor{namespace: config.AttemptScopeIssue}
+	case config.AttemptScopePRHead:
+		return attemptScopeDescriptor{namespace: config.AttemptScopePRHead, targetKinds: []string{"github_pr", "github_pull_request", "pull_request"}}
+	case config.AttemptScopeCIHead:
+		return attemptScopeDescriptor{namespace: config.AttemptScopeCIHead, targetKinds: []string{"github_ci", "github_check_run", "ci_run"}}
+	default:
+		return attemptScopeDescriptor{namespace: config.AttemptScopeLegacy}
+	}
+}
+
+func issueBodySHA256(issue model.IssueSnapshot) string {
+	h := sha256.Sum256([]byte(issue.Body))
+	return hex.EncodeToString(h[:])
+}
+
+func hashScope(namespace string, parts ...string) string {
 	h := sha256.New()
 	h.Write([]byte(namespace))
-	h.Write([]byte{0})
-	h.Write([]byte(decision.Handoff.TargetKind))
-	h.Write([]byte{0})
-	h.Write([]byte(decision.Handoff.TargetKey))
-	return hex.EncodeToString(h.Sum(nil)), nil
+	for _, part := range parts {
+		h.Write([]byte{0})
+		h.Write([]byte(part))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func containsString(values []string, want string) bool {
