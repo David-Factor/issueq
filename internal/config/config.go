@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,6 +23,16 @@ const (
 	DefaultWorkdir        = "./.issueq"
 	DefaultGitHubHost     = "github.com"
 	DefaultGitHubTokenEnv = "GITHUB_TOKEN"
+
+	HandoffFreshnessNone                = "none"
+	HandoffFreshnessSourceUnchanged     = "source_unchanged"
+	HandoffFreshnessTargetHeadUnchanged = "target_head_unchanged"
+
+	AttemptScopeLegacy  = "legacy"
+	AttemptScopeHandoff = "handoff"
+	AttemptScopeIssue   = "issue"
+	AttemptScopePRHead  = "pr_head"
+	AttemptScopeCIHead  = "ci_head"
 )
 
 var defaultEnvPass = []string{"PATH", "HOME"}
@@ -87,7 +98,61 @@ type WorkflowConfig struct {
 type RouteConfig struct {
 	Name string          `yaml:"name"`
 	When PredicateConfig `yaml:"when"`
+	Gate GateConfig      `yaml:"gate"`
 	Job  JobConfig       `yaml:"job"`
+}
+
+type GateConfig struct {
+	Handoff HandoffGateConfig `yaml:"handoff"`
+	OnBlock ActionConfig      `yaml:"on_block"`
+}
+
+type HandoffGateConfig struct {
+	Required  bool                   `yaml:"required"`
+	From      []string               `yaml:"from"`
+	Decisions []string               `yaml:"decisions"`
+	NextRoute HandoffNextRouteConfig `yaml:"next_route"`
+	Freshness string                 `yaml:"freshness"`
+}
+
+type HandoffNextRouteMode string
+
+const (
+	HandoffNextRouteDisabled HandoffNextRouteMode = ""
+	HandoffNextRouteCurrent  HandoffNextRouteMode = "current"
+	HandoffNextRouteExact    HandoffNextRouteMode = "exact"
+)
+
+type HandoffNextRouteConfig struct {
+	Mode  HandoffNextRouteMode
+	Value string
+}
+
+func (c *HandoffNextRouteConfig) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind != yaml.ScalarNode {
+		return fmt.Errorf("next_route must be a boolean or string")
+	}
+	switch value.Tag {
+	case "!!bool":
+		parsed, err := strconv.ParseBool(value.Value)
+		if err != nil {
+			return fmt.Errorf("next_route boolean must be true or false")
+		}
+		if parsed {
+			*c = HandoffNextRouteConfig{Mode: HandoffNextRouteCurrent}
+		} else {
+			*c = HandoffNextRouteConfig{}
+		}
+		return nil
+	case "!!str":
+		if strings.TrimSpace(value.Value) == "" {
+			return fmt.Errorf("next_route string must not be empty")
+		}
+		*c = HandoffNextRouteConfig{Mode: HandoffNextRouteExact, Value: value.Value}
+		return nil
+	default:
+		return fmt.Errorf("next_route must be a boolean or string")
+	}
 }
 
 type PredicateConfig struct {
@@ -102,6 +167,7 @@ type JobConfig struct {
 	Concurrency        int           `yaml:"concurrency"`
 	MaxAttempts        int           `yaml:"max_attempts"`
 	Priority           int           `yaml:"priority"`
+	AttemptScope       string        `yaml:"attempt_scope"`
 	Env                EnvPassConfig `yaml:"env"`
 	OnStart            ActionConfig  `yaml:"on_start"`
 	OnSuccess          ActionConfig  `yaml:"on_success"`
@@ -307,18 +373,31 @@ func (c Config) Validate(opts ValidateOptions) error {
 	errs = append(errs, validateAction("workflow.on_transitions_exceeded", c.Workflow.OnTransitionsExceeded)...)
 
 	seenRoutes := map[string]struct{}{}
+	for _, route := range c.Routes {
+		name := strings.TrimSpace(route.Name)
+		if name == "" {
+			continue
+		}
+		if _, exists := seenRoutes[name]; exists {
+			continue
+		}
+		seenRoutes[name] = struct{}{}
+	}
+
+	validatedRoutes := map[string]struct{}{}
 	for i, route := range c.Routes {
 		prefix := fmt.Sprintf("routes[%d]", i)
 		name := strings.TrimSpace(route.Name)
 		if name == "" {
 			errs = append(errs, prefix+".name is required")
-		} else if _, exists := seenRoutes[name]; exists {
+		} else if _, exists := validatedRoutes[name]; exists {
 			errs = append(errs, fmt.Sprintf("%s.name %q is duplicated", prefix, name))
 		} else {
-			seenRoutes[name] = struct{}{}
+			validatedRoutes[name] = struct{}{}
 		}
 
 		errs = append(errs, validatePredicate(prefix+".when", route.When)...)
+		errs = append(errs, validateGate(prefix+".gate", route.Gate, seenRoutes)...)
 
 		jobPrefix := prefix + ".job"
 		if strings.TrimSpace(route.Job.Kind) == "" {
@@ -341,6 +420,9 @@ func (c Config) Validate(opts ValidateOptions) error {
 		}
 		if route.Job.MaxAttempts <= 0 {
 			errs = append(errs, jobPrefix+".max_attempts must be positive")
+		}
+		if scope := strings.TrimSpace(route.Job.AttemptScope); scope != "" && !validAttemptScope(scope) {
+			errs = append(errs, fmt.Sprintf("%s.attempt_scope %q is not supported", jobPrefix, route.Job.AttemptScope))
 		}
 		errs = append(errs, validateEnvPass(jobPrefix+".env.pass", route.Job.Env.Pass, c.GitHub.TokenEnv)...)
 		errs = append(errs, validateAction(jobPrefix+".on_start", route.Job.OnStart)...)
@@ -412,6 +494,68 @@ func validatePredicate(path string, predicate PredicateConfig) []string {
 	sort.Strings(conflicts)
 	for _, label := range conflicts {
 		errs = append(errs, fmt.Sprintf("%s includes and excludes label %q", path, label))
+	}
+	return errs
+}
+
+func validateGate(path string, gate GateConfig, routeNames map[string]struct{}) []string {
+	var errs []string
+	errs = append(errs, validateAction(path+".on_block", gate.OnBlock)...)
+
+	handoff := gate.Handoff
+	if strings.TrimSpace(handoff.Freshness) != "" && !validHandoffFreshness(handoff.Freshness) {
+		errs = append(errs, fmt.Sprintf("%s.handoff.freshness %q is not supported", path, handoff.Freshness))
+	}
+	if handoff.Required && len(handoff.From) == 0 {
+		errs = append(errs, path+".handoff.from is required when handoff.required is true")
+	}
+	errs = append(errs, validateStringList(path+".handoff.from", handoff.From)...)
+	errs = append(errs, validateStringList(path+".handoff.decisions", handoff.Decisions)...)
+	for _, from := range handoff.From {
+		trimmed := strings.TrimSpace(from)
+		if trimmed == "" {
+			continue
+		}
+		if _, ok := routeNames[trimmed]; !ok {
+			errs = append(errs, fmt.Sprintf("%s.handoff.from references unknown route %q", path, from))
+		}
+	}
+	if handoff.NextRoute.Mode == HandoffNextRouteExact && strings.TrimSpace(handoff.NextRoute.Value) == "" {
+		errs = append(errs, path+".handoff.next_route must not be empty")
+	}
+	return errs
+}
+
+func validHandoffFreshness(value string) bool {
+	switch value {
+	case HandoffFreshnessNone, HandoffFreshnessSourceUnchanged, HandoffFreshnessTargetHeadUnchanged:
+		return true
+	default:
+		return false
+	}
+}
+
+func validAttemptScope(value string) bool {
+	switch value {
+	case AttemptScopeLegacy, AttemptScopeHandoff, AttemptScopeIssue, AttemptScopePRHead, AttemptScopeCIHead:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateStringList(path string, values []string) []string {
+	var errs []string
+	seen := map[string]struct{}{}
+	for i, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			errs = append(errs, fmt.Sprintf("%s[%d] must not be empty", path, i))
+		}
+		if _, exists := seen[trimmed]; exists {
+			errs = append(errs, fmt.Sprintf("%s contains duplicate %q", path, value))
+		}
+		seen[trimmed] = struct{}{}
 	}
 	return errs
 }
