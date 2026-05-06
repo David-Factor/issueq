@@ -215,31 +215,65 @@ Scenario:
 - Include assertions over DB rows (`handoffs`, `route_attempts`, `gate_blocks`,
   `jobs`) and fake GitHub label/comment operations.
 
-## Phase 7 — Optional live smoke runbook
+## Phase 7 — Live smoke and gleg/glerg production rollout runbook
 
 ### Scope
 
-Document a manual/live smoke for a controlled scratch issue and instance. This
-is not required in automated CI, but is required before deploying the feature to
-a long-running production issueq instance.
+Roll the feature into the long-running gleg/glerg issueq instance only after the
+binary supports the new `gate` and `attempt_scope` config fields. Treat this as a
+separate deployment step from the core semantics implementation so config changes
+can be reviewed, backed out, and verified independently.
+
+Planned rollout steps:
+
+1. Build and verify a new issueq binary from the implementation branch.
+2. Back up the live instance SQLite database and current config.
+3. Update the live instance config, e.g.
+   `/srv/issueq/instances/jakelawllm-gleg/issueq.yaml`, so `bug-fix-pr` requires
+   an accepted fresh `bug-triage` handoff before work starts.
+4. Keep `bug-fix-pr` `max_attempts: 1` for real fix work unless the operator
+   intentionally changes policy.
+5. Set `bug-fix-pr` `attempt_scope: handoff` so a premature pre-triage block
+   cannot poison the later triage-approved fix attempt.
+6. Install the rebuilt binary at the instance's configured binary path, e.g.
+   `/srv/issueq/bin/issueq`.
+7. Restart the daemon through its service manager, for example:
+
+   ```bash
+   sudo systemctl restart <issueq-service>
+   ```
+
+   If the instance is not systemd-managed, restart the observed daemon process
+   using the instance's normal deployment path.
+8. Reconcile any existing poisoned live state from earlier semantics. For gleg
+   issue #191 this may include removing stale terminal labels such as
+   `agent-failed` / `agent-needs-human` when intentionally re-arming the issue,
+   and either clearing the bad `bug-fix-pr` attempt row or relying on the new
+   scoped-attempt key to make it irrelevant.
+9. Tail logs and verify the gated smoke path against the live or scratch issue.
 
 ### Requirement gates
 
-- Runbook includes setup labels, scratch issue creation, commands, expected DB
-  rows, expected comments, and cleanup steps.
-- Runbook explicitly says to back up SQLite before running against an existing
-  instance.
-- Runbook includes rollback steps: remove new gate config, restore DB backup,
-  restart daemon.
+- New config is not applied until the deployed binary can parse and enforce it.
+- Live SQLite and config are backed up before migration or state reconciliation.
+- `issueq config-check` or equivalent validation passes against the updated live
+  config before daemon restart.
+- The daemon restarts cleanly and reports no config/migration errors.
+- The live smoke confirms:
+  - pre-triage `bug-fix-pr` blocks without incrementing work attempts;
+  - `bug-triage` emits/stores the accepted handoff;
+  - post-triage `bug-fix-pr` runs once;
+  - repeating the same scoped real work hits `max_attempts`.
 
-### Tests
+### Rollback
 
-- Manual execution in a controlled repository or scratch instance:
-  - pre-triage bug-fix route blocks without counting;
-  - post-triage bug-fix route runs once;
-  - repeated real work caps correctly.
+- Stop or restart the daemon with the previous binary.
+- Restore the previous `issueq.yaml`.
+- Restore the SQLite backup if migrations or state reconciliation need to be
+  reverted.
+- Remove any temporary scratch labels/comments used for the smoke test.
 
-## Phase 8 — Instance rollout guidance
+## Phase 8 — Operator docs and config examples
 
 ### Scope
 

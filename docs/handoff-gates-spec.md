@@ -380,7 +380,40 @@ Scenario: **gated bug-fix after triage**
 This smoke should be documented as a manual/live test first, then automated with
 fake GitHub if practical.
 
-## 11. Compatibility and migration
+## 11. Production rollout and live instance configuration
+
+After the core feature is implemented and tested, deployment to a long-running
+instance should be treated as an explicit rollout phase rather than an incidental
+config tweak.
+
+For the gleg/glerg instance, the expected rollout is:
+
+1. Deploy an issueq binary that supports handoff storage, gate evaluation, and
+   scoped attempts.
+2. Back up the live SQLite database and current `issueq.yaml`.
+3. Update the live route config, for example
+   `/srv/issueq/instances/jakelawllm-gleg/issueq.yaml`, so `bug-fix-pr` has a
+   handoff gate requiring a fresh accepted `bug-triage` handoff.
+4. Keep `bug-fix-pr` `max_attempts: 1` to preserve the strict cap on real fix
+   work, but set `attempt_scope: handoff` so only the accepted handoff scope is
+   counted.
+5. Validate the updated config before restart.
+6. Restart the issueq daemon using the instance's service manager, typically
+   systemd for persistent deployments.
+7. Reconcile legacy poisoned state where needed. For example, an issue that was
+   already marked `agent-failed` / `agent-needs-human` because of the old
+   counter semantics may need those labels removed before re-arming it; stale
+   unscoped attempt rows may be cleared or rendered irrelevant by scoped
+   attempts.
+8. Tail logs and run the gated smoke scenario against a scratch issue or an
+   explicitly approved live issue.
+
+Rollout ordering matters: do not apply config containing new `gate` or
+`attempt_scope` fields to an instance until the deployed binary can parse and
+enforce those fields. Rollback should restore the previous binary/config and, if
+necessary, the SQLite backup.
+
+## 12. Compatibility and migration
 
 - Existing configs remain valid because `gate` and `attempt_scope` are optional.
 - Existing `route_attempts` rows migrate to `scope_hash = 'legacy'`.
@@ -389,7 +422,7 @@ fake GitHub if practical.
 - If the handoff table is empty, routes without handoff gates behave as they do
   today.
 
-## 12. Acceptance criteria
+## 13. Acceptance criteria
 
 The implementation is acceptable when:
 
@@ -401,3 +434,5 @@ The implementation is acceptable when:
 6. The existing workflow transition cap still stops broad automation loops.
 7. The controlled smoke scenario demonstrates pre-triage bug-fix route blocking
    without poisoning post-triage bug-fix execution.
+8. The production rollout runbook covers live config update, binary deployment,
+   daemon restart, state reconciliation, verification, and rollback.
