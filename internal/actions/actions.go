@@ -19,6 +19,7 @@ type ResultAction struct {
 	Comment      string   `json:"comment"`
 	LabelsAdd    []string `json:"labels_add"`
 	LabelsRemove []string `json:"labels_remove"`
+	WorkStarted  *bool    `json:"work_started,omitempty"`
 }
 
 type ResultActionEnvelope struct {
@@ -45,7 +46,7 @@ func ParseResultFile(path string) (ResultAction, bool, error) {
 	}
 	for key := range raw {
 		switch key {
-		case "comment", "labels_add", "labels_remove":
+		case "comment", "labels_add", "labels_remove", "work_started":
 		default:
 			return ResultAction{}, true, fmt.Errorf("unsupported result JSON field %q", key)
 		}
@@ -55,6 +56,32 @@ func ParseResultFile(path string) (ResultAction, bool, error) {
 		return ResultAction{}, true, fmt.Errorf("parse result JSON: %w", err)
 	}
 	return result, true, nil
+}
+
+func ParseWorkStartedFile(path string) (*bool, bool, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("read result JSON: %w", err)
+	}
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return nil, false, nil
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, true, fmt.Errorf("parse result JSON: %w", err)
+	}
+	value, ok := raw["work_started"]
+	if !ok {
+		return nil, true, nil
+	}
+	var workStarted bool
+	if err := json.Unmarshal(value, &workStarted); err != nil {
+		return nil, true, fmt.Errorf("parse result JSON: %w", err)
+	}
+	return &workStarted, true, nil
 }
 
 func Merge(base config.ActionConfig, result ResultAction) config.ActionConfig {

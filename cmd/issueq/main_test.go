@@ -73,6 +73,21 @@ func TestConfigCheckValidConfig(t *testing.T) {
 	}
 }
 
+func TestConfigCheckGatedConfig(t *testing.T) {
+	cmd := newRootCommand()
+	buf := new(bytes.Buffer)
+	cmd.SetOut(buf)
+	cmd.SetErr(buf)
+	cmd.SetArgs([]string{"--config", filepath.Join("..", "..", "testdata", "gated-config.yaml"), "config-check"})
+
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !strings.Contains(buf.String(), "config OK:") {
+		t.Fatalf("output = %q, want config OK", buf.String())
+	}
+}
+
 func TestConfigCheckInvalidConfig(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "issueq.yaml")

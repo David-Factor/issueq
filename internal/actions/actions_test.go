@@ -129,6 +129,10 @@ func (f *fakeClient) ListOpenIssues(ctx context.Context, owner, repo string) ([]
 	return nil, nil
 }
 
+func (f *fakeClient) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]model.IssueComment, error) {
+	return nil, nil
+}
+
 func (f *fakeClient) GetIssue(ctx context.Context, owner, repo string, number int) (model.IssueSnapshot, error) {
 	f.calls = append(f.calls, "get")
 	if len(f.issues) == 0 {
@@ -171,5 +175,35 @@ func TestParseResultFileErrors(t *testing.T) {
 	_, found, err = ParseResultFile(enqueue)
 	if !found || err == nil || !strings.Contains(err.Error(), `unsupported result JSON field "enqueue"`) {
 		t.Fatalf("found=%v err=%v", found, err)
+	}
+}
+
+func TestParseResultFileAcceptsWorkStarted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "result.json")
+	if err := os.WriteFile(path, []byte(`{"comment":"blocked","work_started":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, found, err := ParseResultFile(path)
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	if result.WorkStarted == nil || *result.WorkStarted {
+		t.Fatalf("WorkStarted = %#v, want false", result.WorkStarted)
+	}
+}
+
+func TestParseWorkStartedFileIgnoresOtherFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "result.json")
+	if err := os.WriteFile(path, []byte(`{"enqueue":[],"work_started":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workStarted, found, err := ParseWorkStartedFile(path)
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	if workStarted == nil || *workStarted {
+		t.Fatalf("workStarted = %#v, want false", workStarted)
 	}
 }

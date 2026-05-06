@@ -60,6 +60,40 @@ func TestRESTClientParsesIssuesAndSendsAuthorization(t *testing.T) {
 	}
 }
 
+func TestRESTClientListsIssueComments(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/repos/example-org/example-repo/issues/12/comments" {
+			t.Fatalf("path = %s", r.URL.Path)
+		}
+		if r.URL.Query().Get("per_page") != "100" {
+			t.Fatalf("per_page query = %q", r.URL.Query().Get("per_page"))
+		}
+		body := "```json\n{}\n```"
+		_ = json.NewEncoder(w).Encode([]map[string]any{{
+			"id":         99,
+			"node_id":    "comment-node-99",
+			"body":       body,
+			"created_at": "2026-01-01T00:00:00Z",
+			"updated_at": "2026-01-01T00:01:00Z",
+		}})
+	}))
+	defer server.Close()
+	client, err := NewRESTClientWithBaseURL("github.com", server.URL, "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	comments, err := client.ListIssueComments(context.Background(), "example-org", "example-repo", 12)
+	if err != nil {
+		t.Fatalf("ListIssueComments() error = %v", err)
+	}
+	if len(comments) != 1 {
+		t.Fatalf("comments len = %d", len(comments))
+	}
+	if comments[0].ID != "comment-node-99" || comments[0].IssueKey != "github.com/example-org/example-repo#12" || comments[0].Body != "```json\n{}\n```" {
+		t.Fatalf("comment = %#v", comments[0])
+	}
+}
+
 func TestRESTClientSkipsPullRequests(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]map[string]any{{

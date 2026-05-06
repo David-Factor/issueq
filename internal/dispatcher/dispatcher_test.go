@@ -200,6 +200,9 @@ type fakeDispatchGitHub struct{ issue model.IssueSnapshot }
 func (f *fakeDispatchGitHub) ListOpenIssues(ctx context.Context, owner, repo string) ([]model.IssueSnapshot, error) {
 	return []model.IssueSnapshot{f.issue}, nil
 }
+func (f *fakeDispatchGitHub) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]model.IssueComment, error) {
+	return nil, nil
+}
 func (f *fakeDispatchGitHub) GetIssue(ctx context.Context, owner, repo string, number int) (model.IssueSnapshot, error) {
 	return f.issue, nil
 }

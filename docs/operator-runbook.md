@@ -224,6 +224,119 @@ Procedure:
 5. To retry through normal routing, adjust GitHub labels according to your route rules, for example remove `agent-failed` and re-add `agent-ready` if your config allows it.
 6. If max attempts were exceeded, prefer a new issue generation/label workflow over direct DB edits.
 
+## Handoff-gates live smoke
+
+Run this after the deterministic local smoke passes and before relying on a new
+handoff-gated write route in production. Use a scratch issue in the configured
+repository or an explicitly approved live issue. Do not run this against normal
+intake labels unless you intend the daemon to pick up the issue.
+
+Primary safety rule: the preflight helper is offline. The live steps below are
+manual because they mutate GitHub labels/comments and may launch configured job
+commands.
+
+Prerequisites:
+
+```sh
+INSTANCE=david-factor-issueq-smoke
+SERVICE=issueq@$INSTANCE
+CONFIG=/srv/issueq/instances/$INSTANCE/issueq.yaml
+DB=/srv/issueq/instances/$INSTANCE/issueq.db
+ISSUEQ_BIN=/srv/issueq/bin/issueq
+```
+
+Run local deterministic verification from the source checkout:
+
+```sh
+GOCACHE=/tmp/issueq-go-build go test -count=1 ./internal/daemon -run 'TestLocal(HandoffGatesSmoke|WorkStartedFallbackSmoke)'
+```
+
+Run offline preflight against the live config:
+
+```sh
+./scripts/handoff-gates-live-preflight.sh \
+  --bin "$ISSUEQ_BIN" \
+  --config "$CONFIG" \
+  --db "$DB" \
+  --issue OWNER/REPO#123
+```
+
+Back up state before live mutation:
+
+```sh
+sudo -u issueq sqlite3 "$DB" ".backup '$DB.before-handoff-gates-smoke-$(date -u +%Y%m%dT%H%M%SZ)'"
+sudo cp "$CONFIG" "$CONFIG.before-handoff-gates-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+The smoke route should match this shape:
+
+```yaml
+gate:
+  handoff:
+    required: true
+    from: [bug-triage]
+    decisions: [bug_fix_candidate]
+    next_route: true
+    freshness: source_unchanged
+job:
+  max_attempts: 1
+  attempt_scope: handoff
+```
+
+Live smoke procedure:
+
+1. Create or choose a scratch issue.
+2. Open a controlled smoke window: pause external intake if applicable, then stop the production service before applying labels or comments that match the gated route.
+
+   ```sh
+   sudo systemctl stop "$SERVICE"
+   if systemctl is-active --quiet "$SERVICE"; then
+     echo "service still active" >&2
+     exit 1
+   fi
+   ```
+
+   If the instance is not managed by systemd, stop the observed daemon process with the local service manager and confirm no `issueq daemon` process is polling this config/DB before continuing.
+
+3. Apply only the labels needed for the gated write route, for example `agent-ready`, `agent-route-bug-fix-pr`, and `agent-write-approved`.
+4. Confirm the issue has no accepted `issueq-handoff/v1` comment from `bug-triage`.
+5. Run one foreground cycle:
+
+   ```sh
+   sudo -u issueq "$ISSUEQ_BIN" --config "$CONFIG" once
+   ```
+
+6. Verify GitHub received the configured block label/comment, such as `agent-needs-human` or `issueq route blocked: missing_handoff`.
+7. Verify no work launched and no work attempt was consumed:
+
+   ```sh
+   sudo -u issueq sqlite3 "$DB" \
+     "SELECT route_name, reason, count FROM gate_blocks ORDER BY updated_at DESC LIMIT 5;"
+   sudo -u issueq sqlite3 "$DB" \
+     "SELECT route_name, scope_hash, attempts FROM route_attempts WHERE issue_key = 'github.com/OWNER/REPO#123';"
+   sudo -u issueq "$ISSUEQ_BIN" --config "$CONFIG" jobs --json | jq '.[] | {id, status, route: .RouteName, attempts: .Attempts}'
+   ```
+
+8. Add or trigger a fresh `bug-triage` handoff comment whose `next_route` is the gated route and whose source fingerprint still matches the issue.
+9. Restore the route labels if the block action removed them, then run `once` again.
+10. Verify the gated work route launched exactly once and its scoped attempt count is `1`, not `2`.
+11. Re-arm the same route labels for the same handoff/scope and run `once` once more.
+12. Verify max attempts stops the repeated route and applies the configured human/failure action without a second work launch.
+13. Clean up smoke-only labels/comments or leave an explicit closing comment if the issue is retained as evidence.
+14. Restart the service and tail logs before closing the smoke window:
+
+    ```sh
+    sudo systemctl start "$SERVICE"
+    journalctl -u "$SERVICE" -f
+    ```
+
+Rollback and cleanup:
+
+- Keep the service stopped until smoke labels/comments are cleaned up or intentionally documented.
+- If the config caused unexpected routing, stop the service, restore the previous config and binary, run `config-check`, then restart.
+- If SQLite needs repair, stop the daemon first, restore from the pre-smoke backup when possible, and keep the changed DB as evidence until the incident is understood.
+- If a job command launched unexpectedly, inspect artifacts and process state before editing labels or DB rows.
+
 ## Handling cancelled jobs
 
 Jobs become `cancelled` when the daemon shuts down while supervising work. A clean SIGTERM/SIGINT should mark owned running jobs cancelled with `last_error='runner shutting down'`.

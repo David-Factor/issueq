@@ -24,6 +24,7 @@ const (
 
 type Client interface {
 	ListOpenIssues(ctx context.Context, owner, repo string) ([]model.IssueSnapshot, error)
+	ListIssueComments(ctx context.Context, owner, repo string, number int) ([]model.IssueComment, error)
 	GetIssue(ctx context.Context, owner, repo string, number int) (model.IssueSnapshot, error)
 	AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error
 	RemoveLabels(ctx context.Context, owner, repo string, number int, labels []string) error
@@ -100,6 +101,24 @@ func (c *RESTClient) GetIssue(ctx context.Context, owner, repo string, number in
 		return model.IssueSnapshot{}, err
 	}
 	return raw.snapshot(c.host, owner, repo), nil
+}
+
+func (c *RESTClient) ListIssueComments(ctx context.Context, owner, repo string, number int) ([]model.IssueComment, error) {
+	var all []model.IssueComment
+	for page := 1; ; page++ {
+		path := githubPath("/repos/%s/%s/issues/%d/comments?per_page=100&page=%d", owner, repo, number, page)
+		var raw []restIssueComment
+		if err := c.do(ctx, http.MethodGet, path, nil, &raw); err != nil {
+			return nil, err
+		}
+		for _, comment := range raw {
+			all = append(all, comment.comment(model.IssueKey(c.host, owner, repo, number)))
+		}
+		if len(raw) < 100 {
+			break
+		}
+	}
+	return all, nil
 }
 
 func (c *RESTClient) AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
@@ -194,6 +213,26 @@ type restIssue struct {
 	UpdatedAt   time.Time        `json:"updated_at"`
 	Labels      []restLabel      `json:"labels"`
 	PullRequest *json.RawMessage `json:"pull_request"`
+}
+
+type restIssueComment struct {
+	ID        int64     `json:"id"`
+	NodeID    string    `json:"node_id"`
+	Body      *string   `json:"body"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (c restIssueComment) comment(issueKey string) model.IssueComment {
+	body := ""
+	if c.Body != nil {
+		body = *c.Body
+	}
+	id := c.NodeID
+	if id == "" && c.ID != 0 {
+		id = strconv.FormatInt(c.ID, 10)
+	}
+	return model.IssueComment{ID: id, IssueKey: issueKey, Body: body, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt}
 }
 
 type restLabel struct {

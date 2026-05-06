@@ -21,12 +21,23 @@ CREATE TABLE IF NOT EXISTS jobs (
   status text not null,
   priority integer not null default 0,
   attempts integer not null default 0,
+  attempt_generation integer not null default 0,
+  attempt_scope_hash text,
   dedupe_key text not null unique,
   available_at text not null,
   locked_by text,
   runner_instance_id text,
   lease_until text,
   pid integer,
+  pgid integer,
+  supervisor_kind text,
+  supervisor_id text,
+  launch_token text,
+  launch_state text,
+  process_started_at text,
+  run_metadata_path text,
+  launch_spec_path text,
+  timeout_at text,
   context_path text,
   result_path text,
   stdout_path text,
@@ -42,6 +53,11 @@ CREATE INDEX IF NOT EXISTS idx_jobs_status_priority_created ON jobs(status, prio
 CREATE INDEX IF NOT EXISTS idx_jobs_issue_key ON jobs(issue_key);
 CREATE INDEX IF NOT EXISTS idx_jobs_status_lease_runner ON jobs(status, lease_until, runner_instance_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_status_route_name ON jobs(status, route_name);
+CREATE INDEX IF NOT EXISTS idx_jobs_running_owner ON jobs(status, runner_instance_id, lease_until);
+CREATE INDEX IF NOT EXISTS idx_jobs_running_launch ON jobs(status, supervisor_kind, launch_state, launch_token);
+CREATE INDEX IF NOT EXISTS idx_jobs_running_route_capacity ON jobs(status, route_name);
+CREATE INDEX IF NOT EXISTS idx_jobs_running_timeout ON jobs(status, timeout_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_stale_durable_recovery ON jobs(status, lease_until, runner_instance_id, supervisor_kind, launch_token);
 
 CREATE TABLE IF NOT EXISTS issue_state (
   issue_key text primary key,
@@ -56,9 +72,10 @@ CREATE TABLE IF NOT EXISTS route_attempts (
   issue_key text not null,
   generation integer not null,
   route_name text not null,
+  scope_hash text not null default 'legacy',
   attempts integer not null default 0,
   updated_at text not null,
-  primary key (issue_key, generation, route_name)
+  primary key (issue_key, generation, route_name, scope_hash)
 );
 
 CREATE TABLE IF NOT EXISTS runner_heartbeats (
@@ -83,3 +100,40 @@ CREATE TABLE IF NOT EXISTS job_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_job_events_job_created ON job_events(job_id, created_at ASC);
+
+CREATE TABLE IF NOT EXISTS handoffs (
+  id text primary key,
+  issue_key text not null,
+  route_name text not null,
+  decision text not null,
+  next_route text,
+  source_kind text,
+  source_key text,
+  source_fingerprint text,
+  target_kind text,
+  target_key text,
+  payload_json text not null,
+  created_at text not null
+);
+
+CREATE INDEX IF NOT EXISTS handoffs_issue_route_idx
+  ON handoffs(issue_key, route_name, created_at);
+
+CREATE INDEX IF NOT EXISTS handoffs_issue_next_route_idx
+  ON handoffs(issue_key, next_route, created_at);
+
+CREATE INDEX IF NOT EXISTS handoffs_target_idx
+  ON handoffs(target_kind, target_key, created_at);
+
+CREATE TABLE IF NOT EXISTS gate_blocks (
+  issue_key text not null,
+  generation integer not null,
+  route_name text not null,
+  reason text not null,
+  scope_hash text not null,
+  count integer not null default 1,
+  action_applied_at text,
+  created_at text not null,
+  updated_at text not null,
+  primary key (issue_key, generation, route_name, reason, scope_hash)
+);

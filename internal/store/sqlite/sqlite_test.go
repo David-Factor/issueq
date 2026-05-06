@@ -22,12 +22,116 @@ func TestMigrationsCreateTablesAndAreIdempotent(t *testing.T) {
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatalf("second Migrate() error = %v", err)
 	}
-	for _, table := range []string{"issues", "jobs", "issue_state", "route_attempts", "runner_heartbeats", "job_events"} {
+	for _, table := range []string{"issues", "jobs", "issue_state", "route_attempts", "runner_heartbeats", "job_events", "handoffs", "gate_blocks"} {
 		var name string
 		err := store.db.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&name)
 		if err != nil {
 			t.Fatalf("table %s missing: %v", table, err)
 		}
+	}
+	for _, index := range []string{"handoffs_issue_route_idx", "handoffs_issue_next_route_idx", "handoffs_target_idx"} {
+		var name string
+		err := store.db.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?", index).Scan(&name)
+		if err != nil {
+			t.Fatalf("handoff index %s missing: %v", index, err)
+		}
+	}
+}
+
+func TestMigrateRouteAttemptsAddsLegacyScope(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "issueq.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.ExecContext(ctx, `
+CREATE TABLE route_attempts (
+  issue_key text not null,
+  generation integer not null,
+  route_name text not null,
+  attempts integer not null default 0,
+  updated_at text not null,
+  primary key (issue_key, generation, route_name)
+);
+INSERT INTO route_attempts (issue_key, generation, route_name, attempts, updated_at)
+VALUES ('issue-1', 2, 'fix', 3, '2026-05-06T00:00:00Z');`)
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := Open(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	var scopeHash string
+	var attempts int
+	if err := store.db.QueryRowContext(ctx, `SELECT scope_hash, attempts FROM route_attempts WHERE issue_key = 'issue-1' AND generation = 2 AND route_name = 'fix'`).Scan(&scopeHash, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if scopeHash != "legacy" || attempts != 3 {
+		t.Fatalf("migrated scope=%q attempts=%d, want legacy/3", scopeHash, attempts)
+	}
+	if err := store.Migrate(ctx); err != nil {
+		t.Fatalf("second Migrate() error = %v", err)
+	}
+}
+
+func TestRecordGateBlockInsertsThenDedupes(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+
+	block := model.GateBlock{IssueKey: "issue-1", Generation: 2, RouteName: "fix", Reason: model.GateBlockReasonMissingHandoff, ScopeHash: "scope-1"}
+	inserted, count, actionApplied, err := store.RecordGateBlock(ctx, block)
+	if err != nil {
+		t.Fatalf("RecordGateBlock insert error = %v", err)
+	}
+	if !inserted || count != 1 || actionApplied {
+		t.Fatalf("first inserted=%v count=%d actionApplied=%v, want true/1/false", inserted, count, actionApplied)
+	}
+	inserted, count, actionApplied, err = store.RecordGateBlock(ctx, block)
+	if err != nil {
+		t.Fatalf("RecordGateBlock duplicate error = %v", err)
+	}
+	if inserted || count != 2 || actionApplied {
+		t.Fatalf("duplicate inserted=%v count=%d actionApplied=%v, want false/2/false", inserted, count, actionApplied)
+	}
+	if err := store.MarkGateBlockActionApplied(ctx, block); err != nil {
+		t.Fatalf("MarkGateBlockActionApplied error = %v", err)
+	}
+	inserted, count, actionApplied, err = store.RecordGateBlock(ctx, block)
+	if err != nil {
+		t.Fatalf("RecordGateBlock after action applied error = %v", err)
+	}
+	if inserted || count != 3 || !actionApplied {
+		t.Fatalf("after action applied inserted=%v count=%d actionApplied=%v, want false/3/true", inserted, count, actionApplied)
+	}
+	var rowCount, storedCount int
+	if err := store.db.QueryRowContext(ctx, `SELECT count(*), max(count) FROM gate_blocks`).Scan(&rowCount, &storedCount); err != nil {
+		t.Fatal(err)
+	}
+	if rowCount != 1 || storedCount != 3 {
+		t.Fatalf("gate block rows=%d count=%d, want 1/3", rowCount, storedCount)
+	}
+	var appliedAt sql.NullString
+	if err := store.db.QueryRowContext(ctx, `SELECT action_applied_at FROM gate_blocks`).Scan(&appliedAt); err != nil {
+		t.Fatal(err)
+	}
+	if !appliedAt.Valid || appliedAt.String == "" {
+		t.Fatal("action_applied_at is empty after mark")
+	}
+	var attemptRows int
+	if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM route_attempts`).Scan(&attemptRows); err != nil {
+		t.Fatal(err)
+	}
+	if attemptRows != 0 {
+		t.Fatalf("route_attempt rows = %d, want 0", attemptRows)
 	}
 }
 
@@ -183,6 +287,68 @@ func TestJobEventsCanBeWrittenAndRead(t *testing.T) {
 	}
 }
 
+func TestHandoffsCanBeUpsertedAndQueried(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+
+	earliest := sampleHandoff("h1", "triage", "needs_work", "", time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+	olderMatch := sampleHandoff("h2", "triage", "accepted", "fix", time.Date(2026, 1, 1, 1, 0, 0, 0, time.UTC))
+	latestMatch := sampleHandoff("h3", "qa", "accepted", "fix", time.Date(2026, 1, 1, 2, 0, 0, 0, time.UTC))
+	for _, h := range []model.Handoff{earliest, olderMatch, latestMatch} {
+		inserted, err := store.UpsertHandoff(ctx, h)
+		if err != nil || !inserted {
+			t.Fatalf("UpsertHandoff inserted=%v err=%v", inserted, err)
+		}
+	}
+	reinserted, err := store.UpsertHandoff(ctx, latestMatch)
+	if err != nil {
+		t.Fatalf("UpsertHandoff duplicate error = %v", err)
+	}
+	if reinserted {
+		t.Fatal("duplicate handoff inserted = true")
+	}
+
+	all, err := store.ListHandoffsForIssue(ctx, earliest.IssueKey)
+	if err != nil {
+		t.Fatalf("ListHandoffsForIssue error = %v", err)
+	}
+	if len(all) != 3 || all[0].ID != earliest.ID || all[2].ID != latestMatch.ID {
+		t.Fatalf("handoff order = %#v", all)
+	}
+	got, err := store.LatestMatchingHandoff(ctx, model.HandoffQuery{IssueKey: earliest.IssueKey, RouteNames: []string{"triage", "qa"}, Decisions: []string{"accepted"}, NextRoute: "fix", TargetKind: "issue", TargetKey: "#1"})
+	if err != nil {
+		t.Fatalf("LatestMatchingHandoff error = %v", err)
+	}
+	if got == nil || got.ID != latestMatch.ID {
+		t.Fatalf("latest handoff = %#v", got)
+	}
+	missing, err := store.LatestMatchingHandoff(ctx, model.HandoffQuery{IssueKey: earliest.IssueKey, Decisions: []string{"rejected"}})
+	if err != nil {
+		t.Fatalf("LatestMatchingHandoff missing error = %v", err)
+	}
+	if missing != nil {
+		t.Fatalf("missing handoff = %#v", missing)
+	}
+}
+
+func sampleHandoff(id, route, decision, nextRoute string, created time.Time) model.Handoff {
+	return model.Handoff{
+		ID:                id,
+		IssueKey:          "github.com/example-org/example-repo#1",
+		RouteName:         route,
+		Decision:          decision,
+		NextRoute:         nextRoute,
+		SourceKind:        "issue",
+		SourceKey:         "#1",
+		SourceFingerprint: "fp-" + id,
+		TargetKind:        "issue",
+		TargetKey:         "#1",
+		PayloadJSON:       `{"schema":"issueq-handoff/v1"}`,
+		CreatedAt:         created,
+	}
+}
+
 func TestEmptyDBAutomaticallyInitialized(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "issueq.db")
@@ -215,6 +381,10 @@ func openTempStore(t *testing.T, ctx context.Context) *Store {
 
 func identity(id string) model.RunnerIdentity {
 	return model.RunnerIdentity{RunnerID: id, InstanceID: id + "-instance"}
+}
+
+func boolPtr(value bool) *bool {
+	return &value
 }
 
 func sampleIssue() model.IssueSnapshot {
@@ -462,7 +632,7 @@ func TestIncrementAttemptsForJobIsAtomicWithOwnership(t *testing.T) {
 	if err != nil || job == nil {
 		t.Fatalf("claim job=%#v err=%v", job, err)
 	}
-	if attempts, err := store.IncrementAttemptsForJob(ctx, job.ID, "other-instance", "issue-1", 0, "code"); !errors.Is(err, storepkg.ErrNotOwner) || attempts != 0 {
+	if attempts, err := store.IncrementAttemptsForJob(ctx, job.ID, "other-instance", "issue-1", 0, "code", "legacy"); !errors.Is(err, storepkg.ErrNotOwner) || attempts != 0 {
 		t.Fatalf("wrong owner attempts=%d err=%v", attempts, err)
 	}
 	var routeRows int
@@ -472,9 +642,140 @@ func TestIncrementAttemptsForJobIsAtomicWithOwnership(t *testing.T) {
 	if routeRows != 0 {
 		t.Fatalf("route_attempts rows = %d, want 0", routeRows)
 	}
-	attempts, err := store.IncrementAttemptsForJob(ctx, job.ID, owner.InstanceID, "issue-1", 0, "code")
+	attempts, err := store.IncrementAttemptsForJob(ctx, job.ID, owner.InstanceID, "issue-1", 0, "code", "legacy")
 	if err != nil || attempts != 1 {
 		t.Fatalf("owner attempts=%d err=%v", attempts, err)
+	}
+	var scopeHash string
+	if err := store.db.QueryRowContext(ctx, `SELECT scope_hash FROM route_attempts`).Scan(&scopeHash); err != nil {
+		t.Fatal(err)
+	}
+	if scopeHash != "legacy" {
+		t.Fatalf("scope_hash = %q, want legacy", scopeHash)
+	}
+}
+
+func TestIncrementAttemptsForJobScopesCounters(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	owner := identity("runner-scoped-attempt")
+	for _, dedupe := range []string{"scope-a-1", "scope-a-2", "scope-b-1"} {
+		if _, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "fix", Kind: "code", DedupeKey: dedupe}); err != nil {
+			t.Fatal(err)
+		}
+		job, err := store.ClaimNextJob(ctx, owner, []string{"code"}, 1, map[string]int{"fix": 1}, 30*time.Minute)
+		if err != nil || job == nil {
+			t.Fatalf("claim job=%#v err=%v", job, err)
+		}
+		scope := "handoff-a"
+		if dedupe == "scope-b-1" {
+			scope = "handoff-b"
+		}
+		attempts, err := store.IncrementAttemptsForJob(ctx, job.ID, owner.InstanceID, "issue-1", 0, "fix", scope)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dedupe == "scope-a-2" && attempts != 2 {
+			t.Fatalf("second scope-a attempts = %d, want 2", attempts)
+		}
+		if dedupe != "scope-a-2" && attempts != 1 {
+			t.Fatalf("%s attempts = %d, want 1", dedupe, attempts)
+		}
+		if err := store.FinalizeJobOwned(ctx, job.ID, owner.InstanceID, model.JobFinalize{Status: model.JobStatusSucceeded}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var rows int
+	if err := store.db.QueryRowContext(ctx, `SELECT count(*) FROM route_attempts WHERE issue_key = 'issue-1' AND route_name = 'fix'`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 2 {
+		t.Fatalf("route_attempts rows = %d, want 2", rows)
+	}
+}
+
+func TestFinalizeJobOwnedCanReverseUnstartedAttemptOnce(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	_, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "fix", Kind: "code", DedupeKey: "unstarted"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := identity("runner-unstarted")
+	job, err := store.ClaimNextJob(ctx, owner, []string{"code"}, 1, map[string]int{"fix": 1}, 30*time.Minute)
+	if err != nil || job == nil {
+		t.Fatalf("claim job=%#v err=%v", job, err)
+	}
+	if attempts, err := store.IncrementAttemptsForJob(ctx, job.ID, owner.InstanceID, "issue-1", 4, "fix", "handoff-a"); err != nil || attempts != 1 {
+		t.Fatalf("increment attempts=%d err=%v", attempts, err)
+	}
+	workStarted := false
+	if err := store.FinalizeJobOwned(ctx, job.ID, owner.InstanceID, model.JobFinalize{Status: model.JobStatusSucceeded, WorkStarted: &workStarted}); err != nil {
+		t.Fatal(err)
+	}
+	var routeAttempts int
+	if err := store.db.QueryRowContext(ctx, `SELECT attempts FROM route_attempts WHERE issue_key = 'issue-1' AND generation = 4 AND route_name = 'fix' AND scope_hash = 'handoff-a'`).Scan(&routeAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if routeAttempts != 0 {
+		t.Fatalf("route attempts = %d, want 0", routeAttempts)
+	}
+	jobs, err := store.ListJobs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(jobs) != 1 || jobs[0].Attempts != 0 || jobs[0].Status != model.JobStatusSucceeded {
+		t.Fatalf("jobs = %#v, want succeeded job with zero attempts", jobs)
+	}
+	if err := store.FinalizeJobOwned(ctx, job.ID, owner.InstanceID, model.JobFinalize{Status: model.JobStatusSucceeded, WorkStarted: &workStarted}); !errors.Is(err, storepkg.ErrNotOwner) {
+		t.Fatalf("second finalize err = %v, want ErrNotOwner", err)
+	}
+	if err := store.db.QueryRowContext(ctx, `SELECT attempts FROM route_attempts WHERE issue_key = 'issue-1' AND generation = 4 AND route_name = 'fix' AND scope_hash = 'handoff-a'`).Scan(&routeAttempts); err != nil {
+		t.Fatal(err)
+	}
+	if routeAttempts != 0 {
+		t.Fatalf("route attempts after second finalize = %d, want 0", routeAttempts)
+	}
+}
+
+func TestFinalizeJobOwnedKeepsStartedAttempts(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	for _, tt := range []struct {
+		name        string
+		workStarted *bool
+	}{
+		{name: "omitted"},
+		{name: "true", workStarted: boolPtr(true)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dedupe := "started-" + tt.name
+			_, _, err := store.EnqueueJob(ctx, model.JobCreate{IssueKey: "issue-1", RouteName: "fix", Kind: "code", DedupeKey: dedupe})
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner := identity("runner-started-" + tt.name)
+			job, err := store.ClaimNextJob(ctx, owner, []string{"code"}, 1, map[string]int{"fix": 1}, 30*time.Minute)
+			if err != nil || job == nil {
+				t.Fatalf("claim job=%#v err=%v", job, err)
+			}
+			if attempts, err := store.IncrementAttemptsForJob(ctx, job.ID, owner.InstanceID, "issue-1", 0, "fix", dedupe); err != nil || attempts != 1 {
+				t.Fatalf("increment attempts=%d err=%v", attempts, err)
+			}
+			if err := store.FinalizeJobOwned(ctx, job.ID, owner.InstanceID, model.JobFinalize{Status: model.JobStatusSucceeded, WorkStarted: tt.workStarted}); err != nil {
+				t.Fatal(err)
+			}
+			var routeAttempts int
+			if err := store.db.QueryRowContext(ctx, `SELECT attempts FROM route_attempts WHERE issue_key = 'issue-1' AND generation = 0 AND route_name = 'fix' AND scope_hash = ?`, dedupe).Scan(&routeAttempts); err != nil {
+				t.Fatal(err)
+			}
+			if routeAttempts != 1 {
+				t.Fatalf("route attempts = %d, want 1", routeAttempts)
+			}
+		})
 	}
 }
 

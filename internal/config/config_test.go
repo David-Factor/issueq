@@ -31,6 +31,58 @@ func TestValidSampleConfigLoads(t *testing.T) {
 	}
 }
 
+func TestGatedConfigLoads(t *testing.T) {
+	cfg, err := LoadFile(filepath.Join("..", "..", "testdata", "gated-config.yaml"))
+	if err != nil {
+		t.Fatalf("LoadFile() error = %v", err)
+	}
+	if len(cfg.Routes) != 2 {
+		t.Fatalf("routes len = %d, want 2", len(cfg.Routes))
+	}
+	fix := cfg.Routes[1]
+	if !fix.Gate.Handoff.Required {
+		t.Fatal("handoff gate required = false, want true")
+	}
+	if got := strings.Join(fix.Gate.Handoff.From, ","); got != "bug-triage" {
+		t.Fatalf("handoff from = %q", got)
+	}
+	if got := strings.Join(fix.Gate.Handoff.Decisions, ","); got != "bug_fix_candidate,reproducible" {
+		t.Fatalf("handoff decisions = %q", got)
+	}
+	if fix.Gate.Handoff.NextRoute.Mode != HandoffNextRouteCurrent {
+		t.Fatalf("next_route mode = %q, want current", fix.Gate.Handoff.NextRoute.Mode)
+	}
+	if fix.Gate.Handoff.Freshness != HandoffFreshnessSourceUnchanged {
+		t.Fatalf("freshness = %q", fix.Gate.Handoff.Freshness)
+	}
+	if fix.Job.AttemptScope != AttemptScopeHandoff {
+		t.Fatalf("attempt_scope = %q", fix.Job.AttemptScope)
+	}
+}
+
+func TestHandoffNextRouteStringLoads(t *testing.T) {
+	cfgText := strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        next_route: bug-fix-pr\n    job:\n", 1)
+	cfg, err := LoadBytes([]byte(cfgText))
+	if err != nil {
+		t.Fatalf("LoadBytes() error = %v", err)
+	}
+	got := cfg.Routes[0].Gate.Handoff.NextRoute
+	if got.Mode != HandoffNextRouteExact || got.Value != "bug-fix-pr" {
+		t.Fatalf("next route = %#v, want exact bug-fix-pr", got)
+	}
+}
+
+func TestHandoffNextRouteUppercaseBoolLoads(t *testing.T) {
+	cfgText := strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        next_route: TRUE\n    job:\n", 1)
+	cfg, err := LoadBytes([]byte(cfgText))
+	if err != nil {
+		t.Fatalf("LoadBytes() error = %v", err)
+	}
+	if cfg.Routes[0].Gate.Handoff.NextRoute.Mode != HandoffNextRouteCurrent {
+		t.Fatalf("next_route mode = %q, want current", cfg.Routes[0].Gate.Handoff.NextRoute.Mode)
+	}
+}
+
 func TestLoadFileResolvesRelativePathsFromConfigDir(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "issueq.yaml")
@@ -254,6 +306,42 @@ func TestValidationFailures(t *testing.T) {
 			name:    "unsupported queue backend",
 			yaml:    strings.Replace(minimalConfig(), "queue:\n", "queue:\n  backend: postgres\n", 1),
 			wantErr: `queue.backend "postgres" is not supported in v1`,
+		},
+		{
+			name:    "unknown handoff freshness",
+			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        freshness: staleish\n    job:\n", 1),
+			wantErr: `routes[0].gate.handoff.freshness "staleish" is not supported`,
+		},
+		{
+			name:    "required handoff missing from",
+			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        required: true\n    job:\n", 1),
+			wantErr: "routes[0].gate.handoff.from is required when handoff.required is true",
+		},
+		{
+			name:    "unknown handoff from route",
+			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        from: [missing-route]\n    job:\n", 1),
+			wantErr: `routes[0].gate.handoff.from references unknown route "missing-route"`,
+		},
+		{
+			name:    "empty handoff decision",
+			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        decisions: ['']\n    job:\n", 1),
+			wantErr: "routes[0].gate.handoff.decisions[0] must not be empty",
+		},
+
+		{
+			name:    "invalid handoff next_route type",
+			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        next_route: [bug-fix-pr]\n    job:\n", 1),
+			wantErr: "next_route must be a boolean or string",
+		},
+		{
+			name:    "unknown attempt scope",
+			yaml:    strings.Replace(minimalConfig(), "      max_attempts: 2\n", "      max_attempts: 2\n      attempt_scope: moon\n", 1),
+			wantErr: `routes[0].job.attempt_scope "moon" is not supported`,
+		},
+		{
+			name:    "gate on_block action conflict",
+			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      on_block:\n        labels_add: [agent-needs-human]\n        labels_remove: [agent-needs-human]\n    job:\n", 1),
+			wantErr: `routes[0].gate.on_block adds and removes label "agent-needs-human"`,
 		},
 	}
 

@@ -44,7 +44,7 @@ func onceWithSupervisor(ctx context.Context, cfg config.Config, queue store.Queu
 		}
 		result.Poll = pollResult
 	}
-	routeResult, err := router.Route(ctx, cfg, queue)
+	routeResult, err := router.RouteWithGitHub(ctx, cfg, queue, gh)
 	if err != nil {
 		return result, err
 	}
@@ -345,7 +345,7 @@ func (l *loop) pollRoute(ctx context.Context) {
 		}
 		pollResult = result
 	}
-	routeResult, err := router.Route(ctx, l.cfg, l.queue)
+	routeResult, err := router.RouteWithGitHub(ctx, l.cfg, l.queue, l.gh)
 	if err != nil {
 		l.logger.Error("daemon route failed", "error", err)
 		return
