@@ -2,6 +2,7 @@ package workflow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -9,6 +10,7 @@ import (
 	"issueq/internal/config"
 	issuegithub "issueq/internal/github"
 	"issueq/internal/model"
+	"issueq/internal/router"
 	"issueq/internal/store"
 	"issueq/internal/supervisor"
 )
@@ -70,7 +72,14 @@ func PrepareClaimedWrapperLaunch(ctx context.Context, in PrepareClaimedWrapperIn
 	if err != nil {
 		return finalizePrepared(ctx, in, result, model.JobStatusFailed, fmt.Sprintf("load issue state: %v", err))
 	}
-	attempts, err := in.Queue.IncrementAttemptsForJob(ctx, in.Job.ID, in.Identity.InstanceID, issue.IssueKey, generation, in.Route.Name)
+	scopeHash, err := router.AttemptScopeHash(ctx, in.Queue, in.Route, issue)
+	if err != nil {
+		if errors.Is(err, router.ErrAttemptScopeBlocked) {
+			return finalizePrepared(ctx, in, result, model.JobStatusSkipped, err.Error())
+		}
+		return finalizePrepared(ctx, in, result, model.JobStatusFailed, fmt.Sprintf("derive attempt scope: %v", err))
+	}
+	attempts, err := in.Queue.IncrementAttemptsForJob(ctx, in.Job.ID, in.Identity.InstanceID, issue.IssueKey, generation, in.Route.Name, scopeHash)
 	if err != nil {
 		if IsOwnershipLoss(err) {
 			result.Outcome = PrepareDropped
@@ -174,28 +183,39 @@ func FinalizeOwnedObservationWithLifecycle(ctx context.Context, in FinalizeObser
 		return result, nil
 	}
 	lastErr := LastErrorForObservation(in.Obs)
+	var resultAction actions.ResultAction
+	resultActionFound := false
+	if in.Obs.ResultPath != "" {
+		if in.GitHub == nil {
+			if workStarted, _, parseErr := actions.ParseWorkStartedFile(in.Obs.ResultPath); parseErr == nil {
+				resultAction.WorkStarted = workStarted
+			}
+		} else {
+			parsed, found, parseErr := actions.ParseResultFile(in.Obs.ResultPath)
+			if parseErr != nil {
+				status = model.JobStatusFailed
+				lastErr = parseErr.Error()
+			} else if found {
+				resultAction = parsed
+				resultActionFound = true
+			}
+		}
+	}
 	if in.GitHub != nil && status != model.JobStatusCancelled {
 		route, ok := RouteByName(in.Config, in.Job.RouteName)
 		if !ok {
-			return finalizeObservedTerminal(ctx, in, result, status, lastErr)
+			return finalizeObservedTerminal(ctx, in, result, status, lastErr, resultAction.WorkStarted)
 		}
 		issue, err := in.Queue.GetIssue(ctx, in.Job.IssueKey)
 		if err != nil {
-			return finalizeObservedTerminal(ctx, in, result, model.JobStatusFailed, fmt.Sprintf("load issue: %v", err))
+			return finalizeObservedTerminal(ctx, in, result, model.JobStatusFailed, fmt.Sprintf("load issue: %v", err), resultAction.WorkStarted)
 		}
 		finalAction := route.Job.OnSuccess
 		if status != model.JobStatusSucceeded {
 			finalAction = route.Job.OnFailure
 		}
-		if in.Obs.ResultPath != "" {
-			resultAction, found, parseErr := actions.ParseResultFile(in.Obs.ResultPath)
-			if parseErr != nil {
-				status = model.JobStatusFailed
-				lastErr = parseErr.Error()
-				finalAction = route.Job.OnFailure
-			} else if found {
-				finalAction = actions.Merge(finalAction, resultAction)
-			}
+		if resultActionFound {
+			finalAction = actions.Merge(finalAction, resultAction)
 		}
 		if err := in.Queue.RenewJobLease(ctx, in.Job.ID, in.Identity.InstanceID, in.Lease); err != nil {
 			dropped, err := DropOnOwnershipLoss(err)
@@ -220,7 +240,7 @@ func FinalizeOwnedObservationWithLifecycle(ctx context.Context, in FinalizeObser
 					result.OwnershipLost = true
 					return result, nil
 				}
-				return finalizeObservedTerminal(ctx, in, result, model.JobStatusFailed, fmt.Sprintf("check transition limit: %v", err))
+				return finalizeObservedTerminal(ctx, in, result, model.JobStatusFailed, fmt.Sprintf("check transition limit: %v", err), resultAction.WorkStarted)
 			}
 			if dead {
 				status = model.JobStatusDead
@@ -228,15 +248,15 @@ func FinalizeOwnedObservationWithLifecycle(ctx context.Context, in FinalizeObser
 			}
 		}
 	}
-	return finalizeObservedTerminal(ctx, in, result, status, lastErr)
+	return finalizeObservedTerminal(ctx, in, result, status, lastErr, resultAction.WorkStarted)
 }
 
-func finalizeObservedTerminal(ctx context.Context, in FinalizeObservationLifecycleInput, result ObservationFinalization, status, lastErr string) (ObservationFinalization, error) {
+func finalizeObservedTerminal(ctx context.Context, in FinalizeObservationLifecycleInput, result ObservationFinalization, status, lastErr string, workStarted *bool) (ObservationFinalization, error) {
 	finishedAt := in.Obs.FinishedAt
 	if finishedAt.IsZero() {
 		finishedAt = in.Now.UTC()
 	}
-	dropped, err := DropOnOwnershipLoss(in.Queue.FinalizeJobOwned(ctx, in.Job.ID, in.Identity.InstanceID, model.JobFinalize{Status: status, LastError: lastErr, ResultPath: in.Obs.ResultPath, StdoutPath: in.Obs.StdoutPath, StderrPath: in.Obs.StderrPath, FinishedAt: finishedAt}))
+	dropped, err := DropOnOwnershipLoss(in.Queue.FinalizeJobOwned(ctx, in.Job.ID, in.Identity.InstanceID, model.JobFinalize{Status: status, LastError: lastErr, ResultPath: in.Obs.ResultPath, StdoutPath: in.Obs.StdoutPath, StderrPath: in.Obs.StderrPath, FinishedAt: finishedAt, WorkStarted: workStarted}))
 	if err != nil {
 		return result, err
 	}

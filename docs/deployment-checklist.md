@@ -177,6 +177,39 @@ Use this checklist for a first production install or wrapper-only upgrade.
 - [ ] Inspect `jobs --json` and artifact files for the first job.
 - [ ] Confirm no unexpected `running`, `failed`, or `launch_state='unknown'` rows remain.
 
+## Handoff-gates rollout
+
+- [ ] Confirm the deployed binary supports `gate.handoff` and `job.attempt_scope`.
+- [ ] Back up the live SQLite DB and current `issueq.yaml`.
+- [ ] Add the handoff gate only after the new binary is installed.
+- [ ] Keep the gated write route's real-work cap conservative, for example `max_attempts: 1`.
+- [ ] Set the gated write route to `attempt_scope: handoff`.
+- [ ] Run `config-check` as the service user.
+- [ ] Run the deterministic local smoke:
+
+  ```sh
+  GOCACHE=/tmp/issueq-go-build go test -count=1 ./internal/daemon -run 'TestLocal(HandoffGatesSmoke|WorkStartedFallbackSmoke)'
+  ```
+
+- [ ] Run offline preflight against the live config:
+
+  ```sh
+  ./scripts/handoff-gates-live-preflight.sh \
+    --bin /srv/issueq/bin/issueq \
+    --config /srv/issueq/instances/<owner-repo>/issueq.yaml \
+    --db /srv/issueq/instances/<owner-repo>/issueq.db \
+    --issue OWNER/REPO#123
+  ```
+
+- [ ] Before applying smoke labels or handoff comments, pause intake if applicable, stop the production `issueq` service, and confirm no daemon is polling the smoke config/DB.
+- [ ] Run the live smoke from `docs/operator-runbook.md` on a scratch or explicitly approved issue.
+- [ ] Verify missing handoff blocks did not create jobs or consume route attempts.
+- [ ] Verify a fresh accepted handoff allows exactly one scoped work attempt.
+- [ ] Verify re-arming the same handoff/scope hits max attempts without launching work again.
+- [ ] Clean up smoke labels/comments before restarting the service unless the issue is intentionally retained as evidence.
+- [ ] Restart the service after the controlled smoke window and tail logs for config, migration, polling, routing, and dispatch errors.
+- [ ] Document rollback and cleanup notes in the instance-local `runbook.md`.
+
 ## Ongoing operations
 
 - [ ] Schedule SQLite backups.

@@ -21,6 +21,8 @@ CREATE TABLE IF NOT EXISTS jobs (
   status text not null,
   priority integer not null default 0,
   attempts integer not null default 0,
+  attempt_generation integer not null default 0,
+  attempt_scope_hash text,
   dedupe_key text not null unique,
   available_at text not null,
   locked_by text,
@@ -56,9 +58,10 @@ CREATE TABLE IF NOT EXISTS route_attempts (
   issue_key text not null,
   generation integer not null,
   route_name text not null,
+  scope_hash text not null default 'legacy',
   attempts integer not null default 0,
   updated_at text not null,
-  primary key (issue_key, generation, route_name)
+  primary key (issue_key, generation, route_name, scope_hash)
 );
 
 CREATE TABLE IF NOT EXISTS runner_heartbeats (

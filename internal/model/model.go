@@ -17,6 +17,14 @@ const (
 )
 
 const (
+	GateBlockReasonMissingHandoff     = "missing_handoff"
+	GateBlockReasonDecisionNotAllowed = "decision_not_allowed"
+	GateBlockReasonNextRouteMismatch  = "next_route_mismatch"
+	GateBlockReasonSourceStale        = "source_stale"
+	GateBlockReasonTargetStale        = "target_stale"
+)
+
+const (
 	LaunchStatePreparing = "preparing"
 	LaunchStateLaunching = "launching"
 	LaunchStateRunning   = "running"
@@ -70,6 +78,18 @@ type IssueComment struct {
 	UpdatedAt time.Time
 }
 
+type GateBlock struct {
+	IssueKey        string
+	Generation      int
+	RouteName       string
+	Reason          string
+	ScopeHash       string
+	Count           int
+	ActionAppliedAt *time.Time
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
 type JobCreate struct {
 	IssueKey    string
 	RouteName   string
@@ -80,37 +100,39 @@ type JobCreate struct {
 }
 
 type Job struct {
-	ID               string
-	IssueKey         string
-	RouteName        string
-	Kind             string
-	Status           string
-	Priority         int
-	Attempts         int
-	DedupeKey        string
-	AvailableAt      time.Time
-	LockedBy         string
-	RunnerInstanceID string
-	LeaseUntil       *time.Time
-	PID              int
-	PGID             int
-	SupervisorKind   string
-	SupervisorID     string
-	LaunchToken      string
-	LaunchState      string
-	ProcessStartedAt *time.Time
-	RunMetadataPath  string
-	LaunchSpecPath   string
-	ContextPath      string
-	ResultPath       string
-	StdoutPath       string
-	StderrPath       string
-	TimeoutAt        *time.Time
-	CreatedAt        time.Time
-	UpdatedAt        time.Time
-	StartedAt        *time.Time
-	FinishedAt       *time.Time
-	LastError        string
+	ID                string
+	IssueKey          string
+	RouteName         string
+	Kind              string
+	Status            string
+	Priority          int
+	Attempts          int
+	AttemptGeneration int
+	AttemptScopeHash  string
+	DedupeKey         string
+	AvailableAt       time.Time
+	LockedBy          string
+	RunnerInstanceID  string
+	LeaseUntil        *time.Time
+	PID               int
+	PGID              int
+	SupervisorKind    string
+	SupervisorID      string
+	LaunchToken       string
+	LaunchState       string
+	ProcessStartedAt  *time.Time
+	RunMetadataPath   string
+	LaunchSpecPath    string
+	ContextPath       string
+	ResultPath        string
+	StdoutPath        string
+	StderrPath        string
+	TimeoutAt         *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	StartedAt         *time.Time
+	FinishedAt        *time.Time
+	LastError         string
 }
 
 type JobEvent struct {
@@ -164,12 +186,13 @@ type LaunchRecord struct {
 }
 
 type JobFinalize struct {
-	Status     string
-	LastError  string
-	ResultPath string
-	StdoutPath string
-	StderrPath string
-	FinishedAt time.Time
+	Status      string
+	LastError   string
+	ResultPath  string
+	StdoutPath  string
+	StderrPath  string
+	FinishedAt  time.Time
+	WorkStarted *bool
 }
 
 func IssueKey(host, owner, repo string, number int) string {

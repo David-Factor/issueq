@@ -107,6 +107,8 @@ func (s *Store) Migrate(ctx context.Context) error {
 		{"run_metadata_path", "text"},
 		{"launch_spec_path", "text"},
 		{"timeout_at", "text"},
+		{"attempt_generation", "integer not null default 0"},
+		{"attempt_scope_hash", "text"},
 	} {
 		if err := s.ensureColumn(ctx, "jobs", column.name, column.typ); err != nil {
 			return err
@@ -138,6 +140,58 @@ CREATE TABLE IF NOT EXISTS runner_heartbeats (
 	}
 	if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_runner_heartbeats_instance_heartbeat ON runner_heartbeats(runner_instance_id, heartbeat_at)`); err != nil {
 		return fmt.Errorf("create runner heartbeats index: %w", err)
+	}
+	if err := s.ensureColumn(ctx, "gate_blocks", "action_applied_at", "text"); err != nil {
+		return err
+	}
+	if err := s.ensureRouteAttemptsScope(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *Store) ensureRouteAttemptsScope(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `PRAGMA table_info(route_attempts)`)
+	if err != nil {
+		return fmt.Errorf("inspect route_attempts columns: %w", err)
+	}
+	hasScope := false
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull int
+		var defaultValue any
+		var pk int
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("scan route_attempts column: %w", err)
+		}
+		if name == "scope_hash" {
+			hasScope = true
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("close route_attempts columns: %w", err)
+	}
+	if hasScope {
+		return nil
+	}
+	_, err = s.db.ExecContext(ctx, `
+CREATE TABLE route_attempts_scoped (
+  issue_key text not null,
+  generation integer not null,
+  route_name text not null,
+  scope_hash text not null default 'legacy',
+  attempts integer not null default 0,
+  updated_at text not null,
+  primary key (issue_key, generation, route_name, scope_hash)
+);
+INSERT INTO route_attempts_scoped (issue_key, generation, route_name, scope_hash, attempts, updated_at)
+  SELECT issue_key, generation, route_name, 'legacy', attempts, updated_at FROM route_attempts;
+DROP TABLE route_attempts;
+ALTER TABLE route_attempts_scoped RENAME TO route_attempts;`)
+	if err != nil {
+		return fmt.Errorf("migrate route_attempts scope: %w", err)
 	}
 	return nil
 }
@@ -254,7 +308,7 @@ func (s *Store) claimNextJob(ctx context.Context, identity model.RunnerIdentity,
 	}
 
 	rows, err := tx.QueryContext(ctx, `
-SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
+SELECT id, issue_key, route_name, kind, status, priority, attempts, attempt_generation, attempt_scope_hash, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
        supervisor_kind, supervisor_id, launch_token, launch_state, process_started_at, run_metadata_path, launch_spec_path,
        context_path, result_path, stdout_path, stderr_path, timeout_at, created_at, updated_at, started_at, finished_at, last_error
 FROM jobs
@@ -461,7 +515,7 @@ WHERE id = ? AND runner_instance_id = ? AND status = ? AND launch_token = ? AND 
 
 func (s *Store) ListOwnedRunningJobs(ctx context.Context, runnerInstanceID string) ([]model.Job, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
+SELECT id, issue_key, route_name, kind, status, priority, attempts, attempt_generation, attempt_scope_hash, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
        supervisor_kind, supervisor_id, launch_token, launch_state, process_started_at, run_metadata_path, launch_spec_path,
        context_path, result_path, stdout_path, stderr_path, timeout_at, created_at, updated_at, started_at, finished_at, last_error
 FROM jobs
@@ -495,7 +549,21 @@ func (s *Store) FinalizeJobOwned(ctx context.Context, jobID string, runnerInstan
 	if finished.IsZero() {
 		finished = time.Now().UTC()
 	}
-	return s.execOwned(ctx, jobID, runnerInstanceID, `
+	tx, err := s.beginImmediate(ctx)
+	if err != nil {
+		return fmt.Errorf("begin job finalize: %w", err)
+	}
+	defer tx.Rollback()
+	if err := assertJobOwnedTx(ctx, tx, jobID, runnerInstanceID); err != nil {
+		return err
+	}
+	if result.WorkStarted != nil && !*result.WorkStarted {
+		if err := reverseAttemptTx(ctx, tx, jobID); err != nil {
+			return err
+		}
+	}
+	now := time.Now().UTC()
+	res, err := tx.ExecContext(ctx, `
 UPDATE jobs
 SET status = ?, locked_by = NULL, runner_instance_id = NULL, lease_until = NULL, pid = NULL, pgid = NULL,
     supervisor_kind = NULL, supervisor_id = NULL, launch_token = NULL, launch_state = NULL, process_started_at = NULL,
@@ -503,10 +571,27 @@ SET status = ?, locked_by = NULL, runner_instance_id = NULL, lease_until = NULL,
     result_path = COALESCE(NULLIF(?, ''), result_path),
     stdout_path = COALESCE(NULLIF(?, ''), stdout_path), stderr_path = COALESCE(NULLIF(?, ''), stderr_path),
     finished_at = ?, updated_at = ?, last_error = ?
-WHERE id = ? AND runner_instance_id = ? AND status = ? AND (lease_until IS NULL OR lease_until >= ?)`, result.Status, result.ResultPath, result.StdoutPath, result.StderrPath, formatTime(finished), formatTime(finished), nullString(result.LastError), jobID, runnerInstanceID, model.JobStatusRunning, formatTime(time.Now().UTC()))
+WHERE id = ? AND runner_instance_id = ? AND status = ? AND (lease_until IS NULL OR lease_until >= ?)`, result.Status, result.ResultPath, result.StdoutPath, result.StderrPath, formatTime(finished), formatTime(finished), nullString(result.LastError), jobID, runnerInstanceID, model.JobStatusRunning, formatTime(now))
+	if err != nil {
+		return fmt.Errorf("finalize owned job: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("finalize owned job rows affected: %w", err)
+	}
+	if affected == 0 {
+		return store.ErrNotOwner
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit job finalize: %w", err)
+	}
+	return nil
 }
 
-func (s *Store) IncrementAttemptsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string, generation int, routeName string) (int, error) {
+func (s *Store) IncrementAttemptsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string, generation int, routeName, scopeHash string) (int, error) {
+	if strings.TrimSpace(scopeHash) == "" {
+		scopeHash = "legacy"
+	}
 	tx, err := s.beginImmediate(ctx)
 	if err != nil {
 		return 0, fmt.Errorf("begin job attempt increment: %w", err)
@@ -515,14 +600,14 @@ func (s *Store) IncrementAttemptsForJob(ctx context.Context, jobID, runnerInstan
 	if err := assertJobOwnedTx(ctx, tx, jobID, runnerInstanceID); err != nil {
 		return 0, err
 	}
-	attempts, err := incrementAttemptsTx(ctx, tx, issueKey, generation, routeName)
+	attempts, err := incrementAttemptsTx(ctx, tx, issueKey, generation, routeName, scopeHash)
 	if err != nil {
 		return 0, err
 	}
 	now := time.Now().UTC()
 	res, err := tx.ExecContext(ctx, `
-UPDATE jobs SET attempts = ?, updated_at = ?
-WHERE id = ? AND runner_instance_id = ? AND status = ? AND (lease_until IS NULL OR lease_until >= ?)`, attempts, formatTime(now), jobID, runnerInstanceID, model.JobStatusRunning, formatTime(now))
+UPDATE jobs SET attempts = ?, attempt_generation = ?, attempt_scope_hash = ?, updated_at = ?
+WHERE id = ? AND runner_instance_id = ? AND status = ? AND (lease_until IS NULL OR lease_until >= ?)`, attempts, generation, scopeHash, formatTime(now), jobID, runnerInstanceID, model.JobStatusRunning, formatTime(now))
 	if err != nil {
 		return 0, fmt.Errorf("update owned job attempts: %w", err)
 	}
@@ -539,23 +624,56 @@ WHERE id = ? AND runner_instance_id = ? AND status = ? AND (lease_until IS NULL 
 	return attempts, nil
 }
 
-func incrementAttemptsTx(ctx context.Context, tx *immediateTx, issueKey string, generation int, routeName string) (int, error) {
+func reverseAttemptTx(ctx context.Context, tx *immediateTx, jobID string) error {
+	var issueKey, routeName string
+	var attempts, generation int
+	var scopeHash sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT issue_key, route_name, attempts, attempt_generation, attempt_scope_hash FROM jobs WHERE id = ?`, jobID).Scan(&issueKey, &routeName, &attempts, &generation, &scopeHash); err != nil {
+		return fmt.Errorf("load job attempt provenance: %w", err)
+	}
+	if attempts <= 0 || !scopeHash.Valid || strings.TrimSpace(scopeHash.String) == "" {
+		return nil
+	}
+	now := formatTime(time.Now().UTC())
+	res, err := tx.ExecContext(ctx, `
+UPDATE route_attempts SET attempts = attempts - 1, updated_at = ?
+WHERE issue_key = ? AND generation = ? AND route_name = ? AND scope_hash = ? AND attempts > 0`, now, issueKey, generation, routeName, scopeHash.String)
+	if err != nil {
+		return fmt.Errorf("reverse route attempt: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("reverse route attempt rows affected: %w", err)
+	}
+	if affected == 0 {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE jobs SET attempts = attempts - 1, updated_at = ? WHERE id = ? AND attempts > 0`, now, jobID); err != nil {
+		return fmt.Errorf("reverse job attempt: %w", err)
+	}
+	return nil
+}
+
+func incrementAttemptsTx(ctx context.Context, tx *immediateTx, issueKey string, generation int, routeName, scopeHash string) (int, error) {
+	if strings.TrimSpace(scopeHash) == "" {
+		scopeHash = "legacy"
+	}
 	now := formatTime(time.Now().UTC())
 	_, err := tx.ExecContext(ctx, `
-INSERT INTO route_attempts (issue_key, generation, route_name, attempts, updated_at)
-VALUES (?, ?, ?, 0, ?)
-ON CONFLICT(issue_key, generation, route_name) DO NOTHING`, issueKey, generation, routeName, now)
+INSERT INTO route_attempts (issue_key, generation, route_name, scope_hash, attempts, updated_at)
+VALUES (?, ?, ?, ?, 0, ?)
+ON CONFLICT(issue_key, generation, route_name, scope_hash) DO NOTHING`, issueKey, generation, routeName, scopeHash, now)
 	if err != nil {
 		return 0, fmt.Errorf("insert route attempts: %w", err)
 	}
 	_, err = tx.ExecContext(ctx, `
 UPDATE route_attempts SET attempts = attempts + 1, updated_at = ?
-WHERE issue_key = ? AND generation = ? AND route_name = ?`, now, issueKey, generation, routeName)
+WHERE issue_key = ? AND generation = ? AND route_name = ? AND scope_hash = ?`, now, issueKey, generation, routeName, scopeHash)
 	if err != nil {
 		return 0, fmt.Errorf("update route attempts: %w", err)
 	}
 	var attempts int
-	if err := tx.QueryRowContext(ctx, `SELECT attempts FROM route_attempts WHERE issue_key = ? AND generation = ? AND route_name = ?`, issueKey, generation, routeName).Scan(&attempts); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT attempts FROM route_attempts WHERE issue_key = ? AND generation = ? AND route_name = ? AND scope_hash = ?`, issueKey, generation, routeName, scopeHash).Scan(&attempts); err != nil {
 		return 0, fmt.Errorf("select route attempts: %w", err)
 	}
 	return attempts, nil
@@ -791,7 +909,7 @@ ORDER BY priority DESC, created_at ASC, id ASC`, model.JobStatusPending, formatT
 
 func (s *Store) jobByID(ctx context.Context, id string) (model.Job, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
+SELECT id, issue_key, route_name, kind, status, priority, attempts, attempt_generation, attempt_scope_hash, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
        supervisor_kind, supervisor_id, launch_token, launch_state, process_started_at, run_metadata_path, launch_spec_path,
        context_path, result_path, stdout_path, stderr_path, timeout_at, created_at, updated_at, started_at, finished_at, last_error
 FROM jobs WHERE id = ?`, id)
@@ -808,7 +926,7 @@ func stringSet(values []string) map[string]struct{} {
 
 func (s *Store) ListStaleDurableRunningJobs(ctx context.Context, now, staleHeartbeatBefore time.Time) ([]model.Job, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT j.id, j.issue_key, j.route_name, j.kind, j.status, j.priority, j.attempts, j.dedupe_key, j.available_at, j.locked_by, j.runner_instance_id, j.lease_until, j.pid, j.pgid,
+SELECT j.id, j.issue_key, j.route_name, j.kind, j.status, j.priority, j.attempts, j.attempt_generation, j.attempt_scope_hash, j.dedupe_key, j.available_at, j.locked_by, j.runner_instance_id, j.lease_until, j.pid, j.pgid,
        j.supervisor_kind, j.supervisor_id, j.launch_token, j.launch_state, j.process_started_at, j.run_metadata_path, j.launch_spec_path,
        j.context_path, j.result_path, j.stdout_path, j.stderr_path, j.timeout_at, j.created_at, j.updated_at, j.started_at, j.finished_at, j.last_error
 FROM jobs j
@@ -1041,6 +1159,75 @@ LIMIT 1`, args...)
 	return &handoff, nil
 }
 
+func (s *Store) RecordGateBlock(ctx context.Context, block model.GateBlock) (bool, int, bool, error) {
+	if strings.TrimSpace(block.IssueKey) == "" {
+		return false, 0, false, errors.New("gate block issue key is required")
+	}
+	if strings.TrimSpace(block.RouteName) == "" {
+		return false, 0, false, errors.New("gate block route name is required")
+	}
+	if strings.TrimSpace(block.Reason) == "" {
+		return false, 0, false, errors.New("gate block reason is required")
+	}
+	if strings.TrimSpace(block.ScopeHash) == "" {
+		return false, 0, false, errors.New("gate block scope hash is required")
+	}
+	now := time.Now().UTC()
+	if block.CreatedAt.IsZero() {
+		block.CreatedAt = now
+	}
+	if block.UpdatedAt.IsZero() {
+		block.UpdatedAt = now
+	}
+	tx, err := s.beginImmediate(ctx)
+	if err != nil {
+		return false, 0, false, fmt.Errorf("begin gate block record: %w", err)
+	}
+	defer tx.Rollback()
+	var existing int
+	var actionAppliedAt sql.NullString
+	err = tx.QueryRowContext(ctx, `
+SELECT count, action_applied_at FROM gate_blocks
+WHERE issue_key = ? AND generation = ? AND route_name = ? AND reason = ? AND scope_hash = ?`, block.IssueKey, block.Generation, block.RouteName, block.Reason, block.ScopeHash).Scan(&existing, &actionAppliedAt)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, 0, false, fmt.Errorf("check gate block: %w", err)
+	}
+	inserted := errors.Is(err, sql.ErrNoRows)
+	actionApplied := actionAppliedAt.Valid && strings.TrimSpace(actionAppliedAt.String) != ""
+	count := 1
+	if inserted {
+		_, err = tx.ExecContext(ctx, `
+INSERT INTO gate_blocks (issue_key, generation, route_name, reason, scope_hash, count, action_applied_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, block.IssueKey, block.Generation, block.RouteName, block.Reason, block.ScopeHash, count, nil, formatTime(block.CreatedAt), formatTime(block.UpdatedAt))
+	} else {
+		count = existing + 1
+		_, err = tx.ExecContext(ctx, `
+UPDATE gate_blocks
+SET count = ?, updated_at = ?
+WHERE issue_key = ? AND generation = ? AND route_name = ? AND reason = ? AND scope_hash = ?`, count, formatTime(block.UpdatedAt), block.IssueKey, block.Generation, block.RouteName, block.Reason, block.ScopeHash)
+	}
+	if err != nil {
+		return false, 0, false, fmt.Errorf("record gate block: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return false, 0, false, fmt.Errorf("commit gate block record: %w", err)
+	}
+	return inserted, count, actionApplied, nil
+}
+
+func (s *Store) MarkGateBlockActionApplied(ctx context.Context, block model.GateBlock) error {
+	now := time.Now().UTC()
+	_, err := s.db.ExecContext(ctx, `
+UPDATE gate_blocks
+SET action_applied_at = COALESCE(action_applied_at, ?), updated_at = ?
+WHERE issue_key = ? AND generation = ? AND route_name = ? AND reason = ? AND scope_hash = ?`,
+		formatTime(now), formatTime(now), block.IssueKey, block.Generation, block.RouteName, block.Reason, block.ScopeHash)
+	if err != nil {
+		return fmt.Errorf("mark gate block action applied: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) EnqueueJob(ctx context.Context, create model.JobCreate) (model.Job, bool, error) {
 	now := time.Now().UTC()
 	if create.AvailableAt.IsZero() {
@@ -1059,8 +1246,8 @@ func (s *Store) EnqueueJob(ctx context.Context, create model.JobCreate) (model.J
 		UpdatedAt:   now,
 	}
 	res, err := s.db.ExecContext(ctx, `
-INSERT OR IGNORE INTO jobs (id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+INSERT OR IGNORE INTO jobs (id, issue_key, route_name, kind, status, priority, attempts, attempt_generation, attempt_scope_hash, dedupe_key, available_at, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, 0, 0, NULL, ?, ?, ?, ?)
 `, job.ID, job.IssueKey, job.RouteName, job.Kind, job.Status, job.Priority, job.DedupeKey, formatTime(job.AvailableAt), formatTime(job.CreatedAt), formatTime(job.UpdatedAt))
 	if err != nil {
 		return model.Job{}, false, fmt.Errorf("enqueue job: %w", err)
@@ -1081,7 +1268,7 @@ VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
 
 func (s *Store) ListJobs(ctx context.Context) ([]model.Job, error) {
 	rows, err := s.db.QueryContext(ctx, `
-SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
+SELECT id, issue_key, route_name, kind, status, priority, attempts, attempt_generation, attempt_scope_hash, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
        supervisor_kind, supervisor_id, launch_token, launch_state, process_started_at, run_metadata_path, launch_spec_path,
        context_path, result_path, stdout_path, stderr_path, timeout_at, created_at, updated_at, started_at, finished_at, last_error
 FROM jobs
@@ -1159,7 +1346,7 @@ ORDER BY created_at ASC, id ASC`, jobID, jobID)
 
 func (s *Store) jobByDedupeKey(ctx context.Context, key string) (model.Job, error) {
 	row := s.db.QueryRowContext(ctx, `
-SELECT id, issue_key, route_name, kind, status, priority, attempts, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
+SELECT id, issue_key, route_name, kind, status, priority, attempts, attempt_generation, attempt_scope_hash, dedupe_key, available_at, locked_by, runner_instance_id, lease_until, pid, pgid,
        supervisor_kind, supervisor_id, launch_token, launch_state, process_started_at, run_metadata_path, launch_spec_path,
        context_path, result_path, stdout_path, stderr_path, timeout_at, created_at, updated_at, started_at, finished_at, last_error
 FROM jobs WHERE dedupe_key = ?`, key)
@@ -1221,10 +1408,11 @@ func scanJob(row scanner) (model.Job, error) {
 	var job model.Job
 	var lockedBy, runnerInstanceID, leaseUntil sql.NullString
 	var supervisorKind, supervisorID, launchToken, launchState, processStartedAt, runMetadataPath, launchSpecPath sql.NullString
-	var contextPath, resultPath, stdoutPath, stderrPath, timeoutAt, startedAt, finishedAt, lastError sql.NullString
+	var attemptScopeHash, contextPath, resultPath, stdoutPath, stderrPath, timeoutAt, startedAt, finishedAt, lastError sql.NullString
 	var pid, pgid sql.NullInt64
+	var attemptGeneration sql.NullInt64
 	var availableAt, createdAt, updatedAt string
-	if err := row.Scan(&job.ID, &job.IssueKey, &job.RouteName, &job.Kind, &job.Status, &job.Priority, &job.Attempts, &job.DedupeKey, &availableAt, &lockedBy, &runnerInstanceID, &leaseUntil, &pid, &pgid, &supervisorKind, &supervisorID, &launchToken, &launchState, &processStartedAt, &runMetadataPath, &launchSpecPath, &contextPath, &resultPath, &stdoutPath, &stderrPath, &timeoutAt, &createdAt, &updatedAt, &startedAt, &finishedAt, &lastError); err != nil {
+	if err := row.Scan(&job.ID, &job.IssueKey, &job.RouteName, &job.Kind, &job.Status, &job.Priority, &job.Attempts, &attemptGeneration, &attemptScopeHash, &job.DedupeKey, &availableAt, &lockedBy, &runnerInstanceID, &leaseUntil, &pid, &pgid, &supervisorKind, &supervisorID, &launchToken, &launchState, &processStartedAt, &runMetadataPath, &launchSpecPath, &contextPath, &resultPath, &stdoutPath, &stderrPath, &timeoutAt, &createdAt, &updatedAt, &startedAt, &finishedAt, &lastError); err != nil {
 		return model.Job{}, fmt.Errorf("scan job: %w", err)
 	}
 	job.AvailableAt = parseTime(availableAt)
@@ -1232,6 +1420,8 @@ func scanJob(row scanner) (model.Job, error) {
 	job.UpdatedAt = parseTime(updatedAt)
 	job.LockedBy = lockedBy.String
 	job.RunnerInstanceID = runnerInstanceID.String
+	job.AttemptGeneration = int(attemptGeneration.Int64)
+	job.AttemptScopeHash = attemptScopeHash.String
 	if leaseUntil.Valid {
 		t := parseTime(leaseUntil.String)
 		job.LeaseUntil = &t

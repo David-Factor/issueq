@@ -32,7 +32,7 @@ type QueueStore interface {
 	ListStaleDurableRunningJobs(ctx context.Context, now, staleHeartbeatBefore time.Time) ([]model.Job, error)
 	AdoptStaleRunningJob(ctx context.Context, jobID, oldRunnerInstanceID string, newIdentity model.RunnerIdentity, leaseDuration time.Duration, now, staleHeartbeatBefore time.Time) (*model.Job, error)
 	MarkStaleRunningJobUnknown(ctx context.Context, jobID, oldRunnerInstanceID string, now, staleHeartbeatBefore time.Time) error
-	IncrementAttemptsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string, generation int, routeName string) (int, error)
+	IncrementAttemptsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string, generation int, routeName, scopeHash string) (int, error)
 	IncrementTransitionsForJob(ctx context.Context, jobID, runnerInstanceID, issueKey string) (int, error)
 	GetIssueState(ctx context.Context, issueKey string) (generation int, transitions int, err error)
 	HeartbeatRunner(ctx context.Context, identity model.RunnerIdentity, pid int, now time.Time) error
@@ -46,6 +46,8 @@ type QueueStore interface {
 	UpsertHandoff(ctx context.Context, handoff model.Handoff) (bool, error)
 	ListHandoffsForIssue(ctx context.Context, issueKey string) ([]model.Handoff, error)
 	LatestMatchingHandoff(ctx context.Context, query model.HandoffQuery) (*model.Handoff, error)
+	RecordGateBlock(ctx context.Context, block model.GateBlock) (bool, int, bool, error)
+	MarkGateBlockActionApplied(ctx context.Context, block model.GateBlock) error
 	InsertJobEvent(ctx context.Context, event model.JobEvent) (model.JobEvent, error)
 	ListJobEvents(ctx context.Context, jobID string) ([]model.JobEvent, error)
 	Close() error

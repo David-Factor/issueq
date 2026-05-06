@@ -177,3 +177,33 @@ func TestParseResultFileErrors(t *testing.T) {
 		t.Fatalf("found=%v err=%v", found, err)
 	}
 }
+
+func TestParseResultFileAcceptsWorkStarted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "result.json")
+	if err := os.WriteFile(path, []byte(`{"comment":"blocked","work_started":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, found, err := ParseResultFile(path)
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	if result.WorkStarted == nil || *result.WorkStarted {
+		t.Fatalf("WorkStarted = %#v, want false", result.WorkStarted)
+	}
+}
+
+func TestParseWorkStartedFileIgnoresOtherFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "result.json")
+	if err := os.WriteFile(path, []byte(`{"enqueue":[],"work_started":false}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	workStarted, found, err := ParseWorkStartedFile(path)
+	if err != nil || !found {
+		t.Fatalf("found=%v err=%v", found, err)
+	}
+	if workStarted == nil || *workStarted {
+		t.Fatalf("workStarted = %#v, want false", workStarted)
+	}
+}

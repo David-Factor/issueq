@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"issueq/internal/actions"
 	"issueq/internal/model"
 	"issueq/internal/supervisor"
 )
@@ -75,6 +76,11 @@ func FinalizeOwnedObservation(ctx context.Context, queue ObservationFinalizer, i
 		StdoutPath: obs.StdoutPath,
 		StderrPath: obs.StderrPath,
 		FinishedAt: finishedAt,
+	}
+	if obs.ResultPath != "" {
+		if workStarted, _, parseErr := actions.ParseWorkStartedFile(obs.ResultPath); parseErr == nil {
+			finalize.WorkStarted = workStarted
+		}
 	}
 	dropped, err := DropOnOwnershipLoss(queue.FinalizeJobOwned(ctx, job.ID, identity.InstanceID, finalize))
 	if err != nil {
