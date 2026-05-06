@@ -274,14 +274,15 @@ func issueAttemptScopeHash(issue model.IssueSnapshot) string {
 }
 
 func targetAttemptScopeHash(descriptor attemptScopeDescriptor, decision gateDecision) string {
-	if decision.Handoff == nil || strings.TrimSpace(decision.Handoff.TargetKey) == "" {
+	if decision.Handoff == nil {
 		return config.AttemptScopeLegacy
 	}
 	targetKind := strings.TrimSpace(decision.Handoff.TargetKind)
-	if targetKind != "" && !containsString(descriptor.targetKinds, targetKind) {
+	targetKey := strings.TrimSpace(decision.Handoff.TargetKey)
+	if targetKind == "" || targetKey == "" || !containsString(descriptor.targetKinds, targetKind) {
 		return config.AttemptScopeLegacy
 	}
-	return hashScope(descriptor.namespace, decision.Handoff.TargetKind, decision.Handoff.TargetKey)
+	return hashScope(descriptor.namespace, targetKind, targetKey)
 }
 
 type attemptScopeDescriptor struct {

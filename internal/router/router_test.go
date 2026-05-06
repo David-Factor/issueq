@@ -437,6 +437,16 @@ func TestAttemptScopeHashReservedTargetsFallbackToLegacyWhenGateAllowed(t *testi
 				return h
 			}(),
 		},
+		{
+			name:         "pr head missing target kind",
+			attemptScope: config.AttemptScopePRHead,
+			handoff: func() model.Handoff {
+				h := gateHandoff("h1", "accepted", "code", bodySHA("current body"))
+				h.TargetKind = ""
+				h.TargetKey = "pulls/1/head"
+				return h
+			}(),
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -461,6 +471,33 @@ func TestAttemptScopeHashReservedTargetsFallbackToLegacyWhenGateAllowed(t *testi
 				t.Fatalf("scope = %q, want legacy fallback", scope)
 			}
 		})
+	}
+}
+
+func TestAttemptScopeHashReservedTargetsHashTrimmedMetadata(t *testing.T) {
+	ctx := context.Background()
+	store := openStore(t, ctx)
+	defer store.Close()
+	cfg := gatedTestConfig()
+	cfg.Routes[0].Job.AttemptScope = config.AttemptScopePRHead
+	issue := testIssue([]string{"agent-ready"}, "open")
+	issue.Body = "current body"
+	if err := store.UpsertIssue(ctx, issue); err != nil {
+		t.Fatal(err)
+	}
+	handoff := gateHandoff("h1", "accepted", "code", bodySHA(issue.Body))
+	handoff.TargetKind = " github_pr "
+	handoff.TargetKey = " pulls/1/head "
+	if _, err := store.UpsertHandoff(ctx, handoff); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := AttemptScopeHash(ctx, store, cfg.Routes[0], issue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := hashScope(config.AttemptScopePRHead, "github_pr", "pulls/1/head")
+	if scope != want {
+		t.Fatalf("scope = %q, want trimmed metadata hash %q", scope, want)
 	}
 }
 
