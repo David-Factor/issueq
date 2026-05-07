@@ -96,10 +96,23 @@ type WorkflowConfig struct {
 }
 
 type RouteConfig struct {
-	Name string          `yaml:"name"`
-	When PredicateConfig `yaml:"when"`
-	Gate GateConfig      `yaml:"gate"`
-	Job  JobConfig       `yaml:"job"`
+	Name      string          `yaml:"name"`
+	EventKind string          `yaml:"event_kind"`
+	When      PredicateConfig `yaml:"when"`
+	Gate      GateConfig      `yaml:"gate"`
+	Requires  RequiresConfig  `yaml:"requires"`
+	Job       JobConfig       `yaml:"job"`
+}
+
+type RequiresConfig struct {
+	Handoff EventHandoffGateConfig `yaml:"handoff"`
+}
+
+type EventHandoffGateConfig struct {
+	From         string   `yaml:"from"`
+	Decisions    []string `yaml:"decisions"`
+	SameTarget   bool     `yaml:"same_target"`
+	ExpectedNext bool     `yaml:"expected_next"`
 }
 
 type GateConfig struct {
@@ -161,18 +174,25 @@ type PredicateConfig struct {
 }
 
 type JobConfig struct {
-	Kind               string        `yaml:"kind"`
-	Command            Command       `yaml:"command"`
-	Timeout            Duration      `yaml:"timeout"`
-	Concurrency        int           `yaml:"concurrency"`
-	MaxAttempts        int           `yaml:"max_attempts"`
-	Priority           int           `yaml:"priority"`
-	AttemptScope       string        `yaml:"attempt_scope"`
-	Env                EnvPassConfig `yaml:"env"`
-	OnStart            ActionConfig  `yaml:"on_start"`
-	OnSuccess          ActionConfig  `yaml:"on_success"`
-	OnFailure          ActionConfig  `yaml:"on_failure"`
-	OnAttemptsExceeded ActionConfig  `yaml:"on_attempts_exceeded"`
+	Kind               string           `yaml:"kind"`
+	Command            Command          `yaml:"command"`
+	Timeout            Duration         `yaml:"timeout"`
+	Concurrency        int              `yaml:"concurrency"`
+	MaxAttempts        int              `yaml:"max_attempts"`
+	Priority           int              `yaml:"priority"`
+	AttemptScope       string           `yaml:"attempt_scope"`
+	Env                EnvPassConfig    `yaml:"env"`
+	OnStart            ActionConfig     `yaml:"on_start"`
+	OnSuccess          ActionConfig     `yaml:"on_success"`
+	OnFailure          ActionConfig     `yaml:"on_failure"`
+	OnAttemptsExceeded ActionConfig     `yaml:"on_attempts_exceeded"`
+	FollowUps          []FollowUpConfig `yaml:"follow_ups"`
+}
+
+type FollowUpConfig struct {
+	Decision string `yaml:"decision"`
+	Kind     string `yaml:"kind"`
+	Route    string `yaml:"route"`
 }
 
 type ActionConfig struct {
@@ -396,8 +416,19 @@ func (c Config) Validate(opts ValidateOptions) error {
 			validatedRoutes[name] = struct{}{}
 		}
 
+		if strings.TrimSpace(route.EventKind) == "" {
+			// Legacy bridge/label routes are still accepted for existing commands/tests.
+		} else {
+			if len(route.When.LabelsInclude) > 0 || len(route.When.LabelsExclude) > 0 {
+				errs = append(errs, prefix+".when label predicates are not allowed on event_kind routes")
+			}
+			if len(route.Gate.OnBlock.LabelsAdd) > 0 || len(route.Gate.OnBlock.LabelsRemove) > 0 || route.Gate.OnBlock.Comment != "" {
+				errs = append(errs, prefix+".gate.on_block legacy label/comment actions are not allowed on event_kind routes")
+			}
+		}
 		errs = append(errs, validatePredicate(prefix+".when", route.When)...)
 		errs = append(errs, validateGate(prefix+".gate", route.Gate, seenRoutes)...)
+		errs = append(errs, validateEventRequires(prefix+".requires", route.Requires, seenRoutes)...)
 
 		jobPrefix := prefix + ".job"
 		if strings.TrimSpace(route.Job.Kind) == "" {
@@ -429,6 +460,19 @@ func (c Config) Validate(opts ValidateOptions) error {
 		errs = append(errs, validateAction(jobPrefix+".on_success", route.Job.OnSuccess)...)
 		errs = append(errs, validateAction(jobPrefix+".on_failure", route.Job.OnFailure)...)
 		errs = append(errs, validateAction(jobPrefix+".on_attempts_exceeded", route.Job.OnAttemptsExceeded)...)
+		for _, follow := range route.Job.FollowUps {
+			if strings.TrimSpace(follow.Decision) == "" {
+				errs = append(errs, jobPrefix+".follow_ups.decision is required")
+			}
+			if strings.TrimSpace(follow.Kind) == "" {
+				errs = append(errs, jobPrefix+".follow_ups.kind is required")
+			}
+			if strings.TrimSpace(follow.Route) == "" {
+				errs = append(errs, jobPrefix+".follow_ups.route is required")
+			} else if _, ok := seenRoutes[follow.Route]; !ok {
+				errs = append(errs, fmt.Sprintf("%s.follow_ups.route references unknown route %q", jobPrefix, follow.Route))
+			}
+		}
 	}
 
 	if len(errs) > 0 {
@@ -523,6 +567,21 @@ func validateGate(path string, gate GateConfig, routeNames map[string]struct{}) 
 	if handoff.NextRoute.Mode == HandoffNextRouteExact && strings.TrimSpace(handoff.NextRoute.Value) == "" {
 		errs = append(errs, path+".handoff.next_route must not be empty")
 	}
+	return errs
+}
+
+func validateEventRequires(path string, requires RequiresConfig, routeNames map[string]struct{}) []string {
+	var errs []string
+	handoff := requires.Handoff
+	if strings.TrimSpace(handoff.From) != "" {
+		if _, ok := routeNames[handoff.From]; !ok {
+			errs = append(errs, fmt.Sprintf("%s.handoff.from references unknown route %q", path, handoff.From))
+		}
+		if len(handoff.Decisions) == 0 {
+			errs = append(errs, path+".handoff.decisions is required when handoff.from is set")
+		}
+	}
+	errs = append(errs, validateStringList(path+".handoff.decisions", handoff.Decisions)...)
 	return errs
 }
 

@@ -17,6 +17,83 @@ const (
 )
 
 const (
+	AutomationEventStatusReady      = "ready"
+	AutomationEventStatusRunning    = "running"
+	AutomationEventStatusSucceeded  = "succeeded"
+	AutomationEventStatusFailed     = "failed"
+	AutomationEventStatusStale      = "stale"
+	AutomationEventStatusNeedsHuman = "needs_human"
+	AutomationEventStatusCancelled  = "cancelled"
+)
+
+func IsTerminalAutomationEventStatus(status string) bool {
+	switch status {
+	case AutomationEventStatusSucceeded, AutomationEventStatusFailed, AutomationEventStatusStale, AutomationEventStatusNeedsHuman, AutomationEventStatusCancelled:
+		return true
+	default:
+		return false
+	}
+}
+
+type EventRepoRef struct {
+	Host  string `json:"host"`
+	Owner string `json:"owner"`
+	Name  string `json:"name"`
+}
+
+type EventSourceRef struct {
+	Kind string `json:"kind,omitempty"`
+	Key  string `json:"key,omitempty"`
+	URL  string `json:"url,omitempty"`
+}
+
+type EventTargetRef struct {
+	Kind        string `json:"kind"`
+	Key         string `json:"key"`
+	Fingerprint string `json:"fingerprint"`
+}
+
+type AutomationEvent struct {
+	EventKey          string
+	Kind              string
+	RouteName         string
+	Status            string
+	Priority          int
+	RepoHost          string
+	Owner             string
+	Repo              string
+	SourceKind        string
+	SourceKey         string
+	SourceURL         string
+	TargetKind        string
+	TargetKey         string
+	TargetFingerprint string
+	Subscope          string
+	PayloadJSON       string
+	ResultJSON        string
+	AttemptCount      int
+	LeaseOwner        string
+	LeaseExpiresAt    *time.Time
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+}
+
+type EventHandoff struct {
+	ID                string
+	ProducerEventKey  string
+	ProducerRoute     string
+	Decision          string
+	NextEventKind     string
+	NextRoute         string
+	TargetKind        string
+	TargetKey         string
+	TargetFingerprint string
+	Subscope          string
+	PayloadJSON       string
+	CreatedAt         time.Time
+}
+
+const (
 	GateBlockReasonMissingHandoff     = "missing_handoff"
 	GateBlockReasonDecisionNotAllowed = "decision_not_allowed"
 	GateBlockReasonNextRouteMismatch  = "next_route_mismatch"

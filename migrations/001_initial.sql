@@ -1,4 +1,55 @@
-CREATE TABLE IF NOT EXISTS issues (
+CREATE TABLE IF NOT EXISTS automation_events (
+  event_key text primary key,
+  kind text not null,
+  route_name text not null,
+  status text not null,
+  priority integer not null default 0,
+  repo_host text not null,
+  owner text not null,
+  repo text not null,
+  source_kind text,
+  source_key text,
+  source_url text,
+  target_kind text not null,
+  target_key text not null,
+  target_fingerprint text not null,
+  subscope text,
+  payload_json text not null,
+  result_json text,
+  attempt_count integer not null default 0,
+  lease_owner text,
+  lease_expires_at text,
+  created_at text not null,
+  updated_at text not null
+);
+
+CREATE INDEX IF NOT EXISTS automation_events_status_priority_idx
+  ON automation_events(status, priority, updated_at);
+
+CREATE INDEX IF NOT EXISTS automation_events_target_idx
+  ON automation_events(repo_host, owner, repo, target_kind, target_key, target_fingerprint, subscope);
+
+CREATE TABLE IF NOT EXISTS event_handoffs (
+  id text primary key,
+  producer_event_key text not null,
+  producer_route text not null,
+  decision text not null,
+  next_event_kind text,
+  next_route text,
+  target_kind text not null,
+  target_key text not null,
+  target_fingerprint text not null,
+  subscope text,
+  payload_json text not null,
+  created_at text not null
+);
+
+CREATE INDEX IF NOT EXISTS event_handoffs_target_idx
+  ON event_handoffs(target_kind, target_key, target_fingerprint, subscope, created_at);
+
+CREATE INDEX IF NOT EXISTS event_handoffs_next_idx
+  ON event_handoffs(next_route, next_event_kind, created_at);
+
   issue_key text primary key,
   node_id text,
   host text not null,

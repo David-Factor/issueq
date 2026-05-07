@@ -4,16 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 
 	"issueq/internal/config"
 	"issueq/internal/daemon"
 	"issueq/internal/dispatcher"
+	"issueq/internal/eventcore"
 	issuegithub "issueq/internal/github"
 	"issueq/internal/jobwrapper"
 	"issueq/internal/logging"
+	"issueq/internal/model"
 	"issueq/internal/poller"
 	"issueq/internal/router"
 	sqlitestore "issueq/internal/store/sqlite"
@@ -42,6 +46,9 @@ func newRootCommand() *cobra.Command {
 	}
 	cmd.PersistentFlags().StringVar(&configPath, "config", config.DefaultConfigPath, "path to issueq YAML config")
 	cmd.AddCommand(
+		eventCommand(&configPath),
+		eventsCommand(&configPath),
+		eventRunCommand(&configPath),
 		daemonCommand(&configPath),
 		onceCommand(&configPath),
 		pollCommand(&configPath),
@@ -262,4 +269,150 @@ func openConfiguredStoreWithOptions(ctx context.Context, configPath string, opts
 		return nil, nil, err
 	}
 	return cfg, store, nil
+}
+
+func eventCommand(configPath *string) *cobra.Command {
+	cmd := &cobra.Command{Use: "event", Short: "Manage automation events"}
+	var jsonPath string
+	upsert := &cobra.Command{Use: "upsert", Short: "Upsert an automation event", RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, store, err := openConfiguredStore(cmd.Context(), *configPath)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		var data []byte
+		if jsonPath == "" || jsonPath == "-" {
+			data, err = io.ReadAll(cmd.InOrStdin())
+		} else {
+			data, err = os.ReadFile(jsonPath)
+		}
+		if err != nil {
+			return err
+		}
+		var in eventcore.EventUpsert
+		if err := json.Unmarshal(data, &in); err != nil {
+			return err
+		}
+		ev, inserted, protected, err := eventcore.Upsert(cmd.Context(), *cfg, store, in)
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "event upsert OK: key=%s inserted=%t terminal_protected=%t status=%s\n", ev.EventKey, inserted, protected, ev.Status)
+		return nil
+	}}
+	upsert.Flags().StringVar(&jsonPath, "json", "-", "event JSON file path, or -/empty for stdin")
+	cmd.AddCommand(upsert)
+	return cmd
+}
+
+func eventsCommand(configPath *string) *cobra.Command {
+	cmd := &cobra.Command{Use: "events", Short: "Inspect automation events"}
+	var jsonOut bool
+	list := &cobra.Command{Use: "list", Short: "List automation events", RunE: func(cmd *cobra.Command, args []string) error {
+		_, store, err := openConfiguredStore(cmd.Context(), *configPath)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		events, err := store.ListAutomationEvents(cmd.Context())
+		if err != nil {
+			return err
+		}
+		if jsonOut {
+			return json.NewEncoder(cmd.OutOrStdout()).Encode(events)
+		}
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "KEY\tSTATUS\tROUTE\tKIND\tATTEMPTS")
+		for _, ev := range events {
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s\t%s\t%s\t%s\t%d\n", ev.EventKey, ev.Status, ev.RouteName, ev.Kind, ev.AttemptCount)
+		}
+		return nil
+	}}
+	list.Flags().BoolVar(&jsonOut, "json", false, "emit JSON")
+	show := &cobra.Command{Use: "show <event-key>", Args: cobra.ExactArgs(1), Short: "Show automation event", RunE: func(cmd *cobra.Command, args []string) error {
+		_, store, err := openConfiguredStore(cmd.Context(), *configPath)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		ev, err := store.GetAutomationEvent(cmd.Context(), args[0])
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(cmd.OutOrStdout()).Encode(ev)
+	}}
+	cancel := &cobra.Command{Use: "cancel <event-key>", Args: cobra.ExactArgs(1), Short: "Cancel automation event", RunE: func(cmd *cobra.Command, args []string) error {
+		_, store, err := openConfiguredStore(cmd.Context(), *configPath)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		if err := store.CancelAutomationEvent(cmd.Context(), args[0]); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "event cancelled: %s\n", args[0])
+		return nil
+	}}
+	retry := &cobra.Command{Use: "retry <event-key>", Args: cobra.ExactArgs(1), Short: "Retry failed/cancelled automation event", RunE: func(cmd *cobra.Command, args []string) error {
+		_, store, err := openConfiguredStore(cmd.Context(), *configPath)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		if err := store.RetryAutomationEvent(cmd.Context(), args[0]); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "event retry requested: %s\n", args[0])
+		return nil
+	}}
+	cmd.AddCommand(list, show, cancel, retry)
+	return cmd
+}
+
+func eventRunCommand(configPath *string) *cobra.Command {
+	var leaseOwner string
+	c := &cobra.Command{Use: "event-run-once", Hidden: true, Short: "Claim and run one automation event", RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, store, err := openConfiguredStore(cmd.Context(), *configPath)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		if leaseOwner == "" {
+			leaseOwner = fmt.Sprintf("issueq-%d", os.Getpid())
+		}
+		runnerInfo := model.RunnerInfo{ID: leaseOwner, Name: cfg.Runner.Name}
+		ev, route, handoff, err := eventcore.ClaimOne(cmd.Context(), *cfg, store, leaseOwner, cfg.Queue.LeaseDuration.Duration, cfg.Workdir.Path, runnerInfo)
+		if err != nil {
+			return err
+		}
+		if ev == nil {
+			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "event-run-once: no event claimed")
+			return nil
+		}
+		paths, err := eventcore.WriteContext(cfg.Workdir.Path, *ev, *route, handoff, runnerInfo, leaseOwner)
+		if err != nil {
+			return err
+		}
+		command := append([]string(nil), route.Job.Command...)
+		command = append(command, paths["context"], paths["result"])
+		proc := exec.CommandContext(cmd.Context(), command[0], command[1:]...)
+		proc.Env = eventcore.EnvFor(*cfg, *route, *ev, paths)
+		out, _ := os.Create(paths["stdout"])
+		defer out.Close()
+		errOut, _ := os.Create(paths["stderr"])
+		defer errOut.Close()
+		proc.Stdout = out
+		proc.Stderr = errOut
+		if err := proc.Run(); err != nil {
+			fallback := fmt.Sprintf(`{"schema":"%s","event_key":%q,"route":%q,"status":"failed","decision":"command_failed","summary_markdown":%q}`, eventcore.ResultSchema, ev.EventKey, route.Name, err.Error())
+			_ = os.WriteFile(paths["result"], []byte(fallback), 0600)
+		}
+		ok, err := eventcore.FinalizeFromResult(cmd.Context(), *cfg, store, *ev, *route, leaseOwner, paths["result"])
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "event-run-once OK: key=%s finalized=%t\n", ev.EventKey, ok)
+		return nil
+	}}
+	c.Flags().StringVar(&leaseOwner, "lease-owner", "", "lease owner id")
+	return c
 }
