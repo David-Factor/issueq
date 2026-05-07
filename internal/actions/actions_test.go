@@ -60,7 +60,27 @@ func TestApplyRefreshesAfterMutationsAndDetectsRealLabelChange(t *testing.T) {
 	if strings.Join(stored.Labels, ",") != "agent-running" || !stored.GitHubUpdatedAt.Equal(final.GitHubUpdatedAt) {
 		t.Fatalf("stored issue = %#v", stored)
 	}
-	if got := strings.Join(gh.calls, "|"); got != "get|remove:agent-ready|add:agent-running|comment|get" {
+	if got := strings.Join(gh.calls, "|"); got != "get|set:agent-running|comment|get" {
+		t.Fatalf("calls = %s", got)
+	}
+}
+
+func TestApplySetsLabelsAtomically(t *testing.T) {
+	ctx := context.Background()
+	queue, err := sqlitestore.Open(ctx, filepath.Join(t.TempDir(), "issueq.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer queue.Close()
+	issue := testIssue([]string{"agent-ready", "agent-route-pr-review", "agent-result"})
+	final := testIssue([]string{"agent-ready", "agent-route-pr-fix", "agent-result"})
+	gh := &fakeClient{issues: []model.IssueSnapshot{issue, final}}
+
+	_, err = Apply(ctx, testConfig(), gh, queue, issue, config.ActionConfig{LabelsRemove: []string{"agent-route-pr-review"}, LabelsAdd: []string{"agent-route-pr-fix", "agent-ready"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(gh.calls, "|"); got != "get|set:agent-ready,agent-result,agent-route-pr-fix|get" {
 		t.Fatalf("calls = %s", got)
 	}
 }
@@ -82,7 +102,7 @@ func TestApplyNoOpLabelsAndCommentsDoNotCountAsChanged(t *testing.T) {
 	if result.Changed {
 		t.Fatal("Changed = true, want false")
 	}
-	if got := strings.Join(gh.calls, "|"); got != "get|remove:missing|add:agent-ready|comment|get" {
+	if got := strings.Join(gh.calls, "|"); got != "get|set:agent-ready|comment|get" {
 		t.Fatalf("calls = %s", got)
 	}
 }
@@ -107,7 +127,7 @@ func TestApplyWithHooksChecksBeforeEverySideEffect(t *testing.T) {
 	if err == nil || err.Error() != "lost" {
 		t.Fatalf("err = %v, want lost", err)
 	}
-	if got := strings.Join(gh.calls, "|"); got != "get|remove:agent-ready" {
+	if got := strings.Join(gh.calls, "|"); got != "get|set:agent-running" {
 		t.Fatalf("calls = %s", got)
 	}
 }
@@ -145,6 +165,11 @@ func (f *fakeClient) GetIssue(ctx context.Context, owner, repo string, number in
 
 func (f *fakeClient) AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
 	f.calls = append(f.calls, "add:"+strings.Join(labels, ","))
+	return nil
+}
+
+func (f *fakeClient) SetLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	f.calls = append(f.calls, "set:"+strings.Join(labels, ","))
 	return nil
 }
 

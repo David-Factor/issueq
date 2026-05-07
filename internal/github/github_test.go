@@ -163,6 +163,35 @@ func TestRESTClientEscapesPathSegmentsOnce(t *testing.T) {
 	}
 }
 
+func TestRESTClientSetsLabelsWithEscapedPath(t *testing.T) {
+	var gotPath string
+	var gotBody map[string][]string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.EscapedPath()
+		if r.Method != http.MethodPut {
+			t.Fatalf("method = %s", r.Method)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	client, err := NewRESTClientWithBaseURL("github.com", server.URL, "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.SetLabels(context.Background(), "o/r", "repo name", 12, []string{"agent-ready", "agent-route-pr-fix"}); err != nil {
+		t.Fatal(err)
+	}
+	if gotPath != "/repos/o%2Fr/repo%20name/issues/12/labels" {
+		t.Fatalf("path = %q", gotPath)
+	}
+	if strings.Join(gotBody["labels"], ",") != "agent-ready,agent-route-pr-fix" {
+		t.Fatalf("body = %#v", gotBody)
+	}
+}
+
 func TestNewRESTClientUsesDefaultHTTPTimeout(t *testing.T) {
 	client, err := NewRESTClient("github.com", "")
 	if err != nil {

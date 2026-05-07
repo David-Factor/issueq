@@ -180,6 +180,12 @@ func (f *fakeRouterGitHub) AddLabels(ctx context.Context, owner, repo string, nu
 	f.issue.Labels = append(f.issue.Labels, labels...)
 	return nil
 }
+func (f *fakeRouterGitHub) SetLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	f.calls = append(f.calls, "set:"+strings.Join(labels, ","))
+	f.issue.Labels = append([]string(nil), labels...)
+	return nil
+}
+
 func (f *fakeRouterGitHub) RemoveLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
 	f.calls = append(f.calls, "remove:"+strings.Join(labels, ","))
 	blocked := map[string]struct{}{}
@@ -222,7 +228,7 @@ func TestGateMissingHandoffBlocksAndBlockLabelStopsLaterMatch(t *testing.T) {
 	if result.GateBlocked != 1 || result.GateBlocksRecorded != 1 || result.JobsCreated != 0 {
 		t.Fatalf("result = %#v", result)
 	}
-	if strings.Join(gh.comments, "|") != "blocked: missing_handoff" || !containsString(gh.calls, "add:agent-needs-human") {
+	if strings.Join(gh.comments, "|") != "blocked: missing_handoff" || !containsString(gh.calls, "set:agent-ready,agent-needs-human") {
 		t.Fatalf("calls=%#v comments=%#v", gh.calls, gh.comments)
 	}
 	if jobs, _ := store.ListJobs(ctx); len(jobs) != 0 {

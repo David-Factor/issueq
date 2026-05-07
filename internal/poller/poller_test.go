@@ -33,6 +33,10 @@ func (f fakeGitHub) GetIssue(ctx context.Context, owner, repo string, number int
 func (f fakeGitHub) AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
 	return nil
 }
+func (f fakeGitHub) SetLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	return nil
+}
+
 func (f fakeGitHub) RemoveLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
 	return nil
 }

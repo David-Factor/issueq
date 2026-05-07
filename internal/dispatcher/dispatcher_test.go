@@ -210,6 +210,11 @@ func (f *fakeDispatchGitHub) AddLabels(ctx context.Context, owner, repo string, 
 	f.issue.Labels = append(f.issue.Labels, labels...)
 	return nil
 }
+func (f *fakeDispatchGitHub) SetLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	f.issue.Labels = append([]string(nil), labels...)
+	return nil
+}
+
 func (f *fakeDispatchGitHub) RemoveLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
 	return nil
 }

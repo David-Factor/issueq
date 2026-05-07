@@ -144,21 +144,13 @@ func ApplyWithHooks(ctx context.Context, cfg config.Config, client issuegithub.C
 	}
 	beforeLabels := append([]string{}, latest.Labels...)
 	mutated := false
-	if len(action.LabelsRemove) > 0 {
+	if len(action.LabelsRemove) > 0 || len(action.LabelsAdd) > 0 {
 		if err := hooks.beforeSideEffect(); err != nil {
 			return ApplyResult{}, err
 		}
-		if err := client.RemoveLabels(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number, action.LabelsRemove); err != nil && !isAbsentLabelError(err) {
-			return ApplyResult{}, fmt.Errorf("remove labels: %w", err)
-		}
-		mutated = true
-	}
-	if len(action.LabelsAdd) > 0 {
-		if err := hooks.beforeSideEffect(); err != nil {
-			return ApplyResult{}, err
-		}
-		if err := client.AddLabels(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number, action.LabelsAdd); err != nil {
-			return ApplyResult{}, fmt.Errorf("add labels: %w", err)
+		labels := applyLabelDelta(latest.Labels, action.LabelsRemove, action.LabelsAdd)
+		if err := client.SetLabels(ctx, cfg.GitHub.Owner, cfg.GitHub.Repo, issue.Number, labels); err != nil {
+			return ApplyResult{}, fmt.Errorf("set labels: %w", err)
 		}
 		mutated = true
 	}
@@ -188,6 +180,24 @@ func ApplyWithHooks(ctx context.Context, cfg config.Config, client issuegithub.C
 		return ApplyResult{}, fmt.Errorf("update local issue snapshot: %w", err)
 	}
 	return ApplyResult{UpdatedIssue: latest, Changed: !sameLabelSet(beforeLabels, latest.Labels)}, nil
+}
+
+func applyLabelDelta(current, remove, add []string) []string {
+	blocked := map[string]struct{}{}
+	for _, label := range remove {
+		blocked[label] = struct{}{}
+	}
+	set := orderedSet(nil)
+	for _, label := range current {
+		if _, ok := blocked[label]; ok {
+			continue
+		}
+		set.add(label)
+	}
+	for _, label := range add {
+		set.add(label)
+	}
+	return set.values
 }
 
 func sameLabelSet(a, b []string) bool {

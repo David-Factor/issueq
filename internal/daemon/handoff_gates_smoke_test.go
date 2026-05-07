@@ -318,6 +318,14 @@ func (f *smokeGitHub) AddLabels(ctx context.Context, owner, repo string, number 
 	return nil
 }
 
+func (f *smokeGitHub) SetLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.issue.Labels = append([]string(nil), labels...)
+	f.touch()
+	return nil
+}
+
 func (f *smokeGitHub) RemoveLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

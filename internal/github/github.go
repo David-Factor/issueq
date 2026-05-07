@@ -27,7 +27,7 @@ type Client interface {
 	ListIssueComments(ctx context.Context, owner, repo string, number int) ([]model.IssueComment, error)
 	GetIssue(ctx context.Context, owner, repo string, number int) (model.IssueSnapshot, error)
 	AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error
-	RemoveLabels(ctx context.Context, owner, repo string, number int, labels []string) error
+	SetLabels(ctx context.Context, owner, repo string, number int, labels []string) error
 	CreateComment(ctx context.Context, owner, repo string, number int, body string) error
 }
 
@@ -124,6 +124,11 @@ func (c *RESTClient) ListIssueComments(ctx context.Context, owner, repo string, 
 func (c *RESTClient) AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
 	path := githubPath("/repos/%s/%s/issues/%d/labels", owner, repo, number)
 	return c.do(ctx, http.MethodPost, path, map[string][]string{"labels": labels}, nil)
+}
+
+func (c *RESTClient) SetLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	path := githubPath("/repos/%s/%s/issues/%d/labels", owner, repo, number)
+	return c.do(ctx, http.MethodPut, path, map[string][]string{"labels": labels}, nil)
 }
 
 func (c *RESTClient) RemoveLabels(ctx context.Context, owner, repo string, number int, labels []string) error {

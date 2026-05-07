@@ -34,6 +34,11 @@ func (f *fakeLifecycleGitHub) AddLabels(ctx context.Context, owner, repo string,
 	f.issue.Labels = append(f.issue.Labels, labels...)
 	return nil
 }
+func (f *fakeLifecycleGitHub) SetLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	f.issue.Labels = append([]string(nil), labels...)
+	return nil
+}
+
 func (f *fakeLifecycleGitHub) RemoveLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
 	return nil
 }

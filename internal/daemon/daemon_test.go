@@ -154,7 +154,7 @@ func TestRunAppliesGitHubLifecycleAroundWrapperJob(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runWithSupervisor(ctx, cfg, store, gh, nil, backend) }()
 	waitFor(t, time.Second, func() bool { return backend.launchCount() == 1 })
-	if got := strings.Join(gh.calls, "|"); !strings.Contains(got, "remove:agent-ready") || !strings.Contains(got, "add:agent-running") {
+	if got := strings.Join(gh.calls, "|"); !strings.Contains(got, "set:agent-running") {
 		t.Fatalf("pre-launch calls = %v", gh.calls)
 	}
 	var jobID string
@@ -173,7 +173,7 @@ func TestRunAppliesGitHubLifecycleAroundWrapperJob(t *testing.T) {
 		return false
 	})
 	calls := strings.Join(gh.calls, "|")
-	if !strings.Contains(calls, "remove:agent-running") || !strings.Contains(calls, "add:agent-done") || !strings.Contains(calls, "comment") {
+	if !strings.Contains(calls, "set:agent-done") || !strings.Contains(calls, "comment") {
 		t.Fatalf("calls = %v", gh.calls)
 	}
 	events, err := store.ListJobEvents(ctx, jobID)
@@ -259,7 +259,7 @@ func TestRunAppliesResultJSONActionsOnWrapperCompletion(t *testing.T) {
 		return false
 	})
 	calls := strings.Join(gh.calls, "|")
-	if !strings.Contains(calls, "add:base,from-result") || !strings.Contains(calls, "comment") {
+	if !strings.Contains(calls, "set:agent-ready,base,from-result") || !strings.Contains(calls, "comment") {
 		t.Fatalf("calls = %v", gh.calls)
 	}
 	cancel()
@@ -751,6 +751,12 @@ func (f *fakeDaemonGitHub) GetIssue(ctx context.Context, owner, repo string, num
 func (f *fakeDaemonGitHub) AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
 	f.calls = append(f.calls, "add:"+strings.Join(labels, ","))
 	f.issue.Labels = append(f.issue.Labels, labels...)
+	return nil
+}
+
+func (f *fakeDaemonGitHub) SetLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	f.calls = append(f.calls, "set:"+strings.Join(labels, ","))
+	f.issue.Labels = append([]string(nil), labels...)
 	return nil
 }
 
