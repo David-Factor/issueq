@@ -23,10 +23,8 @@ const (
 )
 
 type Client interface {
-	ListOpenIssues(ctx context.Context, owner, repo string) ([]model.IssueSnapshot, error)
 	ListIssueComments(ctx context.Context, owner, repo string, number int) ([]model.IssueComment, error)
 	GetIssue(ctx context.Context, owner, repo string, number int) (model.IssueSnapshot, error)
-	AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error
 	SetLabels(ctx context.Context, owner, repo string, number int, labels []string) error
 	CreateComment(ctx context.Context, owner, repo string, number int, body string) error
 	UpdateComment(ctx context.Context, owner, repo string, commentID string, body string) error
@@ -74,27 +72,6 @@ func githubPath(path string, args ...any) string {
 	return fmt.Sprintf(path, values...)
 }
 
-func (c *RESTClient) ListOpenIssues(ctx context.Context, owner, repo string) ([]model.IssueSnapshot, error) {
-	var all []model.IssueSnapshot
-	for page := 1; ; page++ {
-		path := githubPath("/repos/%s/%s/issues?state=open&per_page=100&page=%d", owner, repo, page)
-		var raw []restIssue
-		if err := c.do(ctx, http.MethodGet, path, nil, &raw); err != nil {
-			return nil, err
-		}
-		for _, issue := range raw {
-			if issue.PullRequest != nil {
-				continue
-			}
-			all = append(all, issue.snapshot(c.host, owner, repo))
-		}
-		if len(raw) < 100 {
-			break
-		}
-	}
-	return all, nil
-}
-
 func (c *RESTClient) GetIssue(ctx context.Context, owner, repo string, number int) (model.IssueSnapshot, error) {
 	path := githubPath("/repos/%s/%s/issues/%d", owner, repo, number)
 	var raw restIssue
@@ -122,24 +99,9 @@ func (c *RESTClient) ListIssueComments(ctx context.Context, owner, repo string, 
 	return all, nil
 }
 
-func (c *RESTClient) AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
-	path := githubPath("/repos/%s/%s/issues/%d/labels", owner, repo, number)
-	return c.do(ctx, http.MethodPost, path, map[string][]string{"labels": labels}, nil)
-}
-
 func (c *RESTClient) SetLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
 	path := githubPath("/repos/%s/%s/issues/%d/labels", owner, repo, number)
 	return c.do(ctx, http.MethodPut, path, map[string][]string{"labels": labels}, nil)
-}
-
-func (c *RESTClient) RemoveLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
-	for _, label := range labels {
-		path := githubPath("/repos/%s/%s/issues/%d/labels/%s", owner, repo, number, label)
-		if err := c.do(ctx, http.MethodDelete, path, nil, nil); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (c *RESTClient) CreateComment(ctx context.Context, owner, repo string, number int, body string) error {

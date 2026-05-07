@@ -8,78 +8,16 @@ import (
 	"time"
 )
 
-func TestValidSampleConfigLoads(t *testing.T) {
-	configPath := filepath.Join("..", "..", "testdata", "valid-config.yaml")
-	cfg, err := LoadFile(configPath)
+func TestValidEventConfigLoads(t *testing.T) {
+	cfg, err := LoadBytes([]byte(minimalConfig()))
 	if err != nil {
-		t.Fatalf("LoadFile() error = %v", err)
+		t.Fatalf("LoadBytes() error = %v", err)
 	}
-
 	if cfg.GitHub.Owner != "example-org" || cfg.GitHub.Repo != "example-repo" {
 		t.Fatalf("unexpected github config: %#v", cfg.GitHub)
 	}
-	if len(cfg.Routes) != 3 {
-		t.Fatalf("routes len = %d, want 3", len(cfg.Routes))
-	}
-	absConfigPath, err := filepath.Abs(configPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wantCommand := filepath.Join(filepath.Dir(absConfigPath), "tasks", "code.sh")
-	if cfg.Routes[1].Job.Command[0] != wantCommand {
-		t.Fatalf("code command = %#v, want %q", cfg.Routes[1].Job.Command, wantCommand)
-	}
-}
-
-func TestGatedConfigLoads(t *testing.T) {
-	cfg, err := LoadFile(filepath.Join("..", "..", "testdata", "gated-config.yaml"))
-	if err != nil {
-		t.Fatalf("LoadFile() error = %v", err)
-	}
-	if len(cfg.Routes) != 2 {
-		t.Fatalf("routes len = %d, want 2", len(cfg.Routes))
-	}
-	fix := cfg.Routes[1]
-	if !fix.Gate.Handoff.Required {
-		t.Fatal("handoff gate required = false, want true")
-	}
-	if got := strings.Join(fix.Gate.Handoff.From, ","); got != "bug-triage" {
-		t.Fatalf("handoff from = %q", got)
-	}
-	if got := strings.Join(fix.Gate.Handoff.Decisions, ","); got != "bug_fix_candidate,reproducible" {
-		t.Fatalf("handoff decisions = %q", got)
-	}
-	if fix.Gate.Handoff.NextRoute.Mode != HandoffNextRouteCurrent {
-		t.Fatalf("next_route mode = %q, want current", fix.Gate.Handoff.NextRoute.Mode)
-	}
-	if fix.Gate.Handoff.Freshness != HandoffFreshnessSourceUnchanged {
-		t.Fatalf("freshness = %q", fix.Gate.Handoff.Freshness)
-	}
-	if fix.Job.AttemptScope != AttemptScopeHandoff {
-		t.Fatalf("attempt_scope = %q", fix.Job.AttemptScope)
-	}
-}
-
-func TestHandoffNextRouteStringLoads(t *testing.T) {
-	cfgText := strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        next_route: bug-fix-pr\n    job:\n", 1)
-	cfg, err := LoadBytes([]byte(cfgText))
-	if err != nil {
-		t.Fatalf("LoadBytes() error = %v", err)
-	}
-	got := cfg.Routes[0].Gate.Handoff.NextRoute
-	if got.Mode != HandoffNextRouteExact || got.Value != "bug-fix-pr" {
-		t.Fatalf("next route = %#v, want exact bug-fix-pr", got)
-	}
-}
-
-func TestHandoffNextRouteUppercaseBoolLoads(t *testing.T) {
-	cfgText := strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        next_route: TRUE\n    job:\n", 1)
-	cfg, err := LoadBytes([]byte(cfgText))
-	if err != nil {
-		t.Fatalf("LoadBytes() error = %v", err)
-	}
-	if cfg.Routes[0].Gate.Handoff.NextRoute.Mode != HandoffNextRouteCurrent {
-		t.Fatalf("next_route mode = %q, want current", cfg.Routes[0].Gate.Handoff.NextRoute.Mode)
+	if len(cfg.Routes) != 1 || cfg.Routes[0].EventKind != "triage" {
+		t.Fatalf("routes = %#v", cfg.Routes)
 	}
 }
 
@@ -96,6 +34,7 @@ workdir:
   path: ./.issueq
 routes:
   - name: explicit-current
+    event_kind: explicit-current
     job:
       kind: code
       command: ["./tasks/code.sh", "./unchanged-arg"]
@@ -103,6 +42,7 @@ routes:
       concurrency: 1
       max_attempts: 2
   - name: explicit-parent
+    event_kind: explicit-parent
     job:
       kind: code
       command: ["../bin/code.sh"]
@@ -110,6 +50,7 @@ routes:
       concurrency: 1
       max_attempts: 2
   - name: bare-command
+    event_kind: bare-command
     job:
       kind: code
       command: ["bash", "-lc", "./tasks/code.sh"]
@@ -189,9 +130,6 @@ func TestDefaults(t *testing.T) {
 	if got := strings.Join(cfg.Runner.Env.Pass, ","); got != "PATH,HOME" {
 		t.Fatalf("runner.env.pass = %q", got)
 	}
-	if cfg.Workflow.MaxTransitionsPerIssue != 10 {
-		t.Fatalf("workflow max transitions = %d", cfg.Workflow.MaxTransitionsPerIssue)
-	}
 }
 
 func TestValidationFailures(t *testing.T) {
@@ -214,8 +152,9 @@ func TestValidationFailures(t *testing.T) {
 			name: "duplicate route names",
 			yaml: minimalConfig() + `
   - name: triage
+    event_kind: triage-again
     job:
-      kind: code
+      kind: event
       command: ["./tasks/code.sh"]
       timeout: 10m
       concurrency: 1
@@ -229,8 +168,23 @@ func TestValidationFailures(t *testing.T) {
 			wantErr: "routes[0].name is required",
 		},
 		{
+			name:    "missing event kind rejects label scheduler route",
+			yaml:    strings.Replace(minimalConfig(), "    event_kind: triage\n", "", 1),
+			wantErr: "routes[0].event_kind is required; bridge/label routes are not supported",
+		},
+		{
+			name:    "legacy when label predicates are unknown",
+			yaml:    strings.Replace(minimalConfig(), "    event_kind: triage\n", "    when:\n      labels_include: [agent-triage]\n", 1),
+			wantErr: "field when not found",
+		},
+		{
+			name:    "legacy label actions are unknown",
+			yaml:    strings.Replace(minimalConfig(), "      max_attempts: 2\n", "      max_attempts: 2\n      on_success:\n        labels_add: [agent-running]\n", 1),
+			wantErr: "field on_success not found",
+		},
+		{
 			name:    "empty kind",
-			yaml:    replaceOnce("      kind: triage", "      kind: ''"),
+			yaml:    replaceOnce("      kind: event", "      kind: ''"),
 			wantErr: "routes[0].job.kind is required",
 		},
 		{
@@ -264,20 +218,6 @@ func TestValidationFailures(t *testing.T) {
 			wantErr: "routes[0].job.max_attempts must be positive",
 		},
 		{
-			name: "action conflict",
-			yaml: strings.Replace(minimalConfig(), "      max_attempts: 2\n", `      max_attempts: 2
-      on_success:
-        labels_add: [agent-running]
-        labels_remove: [agent-running]
-`, 1),
-			wantErr: `routes[0].job.on_success adds and removes label "agent-running"`,
-		},
-		{
-			name:    "predicate conflict",
-			yaml:    strings.Replace(minimalConfig(), "      labels_exclude: [agent-running]", "      labels_exclude: [agent-triage]", 1),
-			wantErr: `routes[0].when includes and excludes label "agent-triage"`,
-		},
-		{
 			name:    "invalid runner env name",
 			yaml:    strings.Replace(minimalConfig(), "github:\n", "runner:\n  env:\n    pass: [BAD-NAME]\n\ngithub:\n", 1),
 			wantErr: `runner.env.pass[0] "BAD-NAME" is not a valid environment variable name`,
@@ -308,40 +248,19 @@ func TestValidationFailures(t *testing.T) {
 			wantErr: `queue.backend "postgres" is not supported in v1`,
 		},
 		{
-			name:    "unknown handoff freshness",
-			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        freshness: staleish\n    job:\n", 1),
-			wantErr: `routes[0].gate.handoff.freshness "staleish" is not supported`,
+			name:    "unknown required handoff from route",
+			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    requires:\n      handoff:\n        from: missing-route\n        decisions: [fix_candidate]\n    job:\n", 1),
+			wantErr: `routes[0].requires.handoff.from references unknown route "missing-route"`,
 		},
 		{
-			name:    "required handoff missing from",
-			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        required: true\n    job:\n", 1),
-			wantErr: "routes[0].gate.handoff.from is required when handoff.required is true",
+			name:    "required handoff missing decisions",
+			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    requires:\n      handoff:\n        from: triage\n    job:\n", 1),
+			wantErr: "routes[0].requires.handoff.decisions is required when handoff.from is set",
 		},
 		{
-			name:    "unknown handoff from route",
-			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        from: [missing-route]\n    job:\n", 1),
-			wantErr: `routes[0].gate.handoff.from references unknown route "missing-route"`,
-		},
-		{
-			name:    "empty handoff decision",
-			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        decisions: ['']\n    job:\n", 1),
-			wantErr: "routes[0].gate.handoff.decisions[0] must not be empty",
-		},
-
-		{
-			name:    "invalid handoff next_route type",
-			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      handoff:\n        next_route: [bug-fix-pr]\n    job:\n", 1),
-			wantErr: "next_route must be a boolean or string",
-		},
-		{
-			name:    "unknown attempt scope",
-			yaml:    strings.Replace(minimalConfig(), "      max_attempts: 2\n", "      max_attempts: 2\n      attempt_scope: moon\n", 1),
-			wantErr: `routes[0].job.attempt_scope "moon" is not supported`,
-		},
-		{
-			name:    "gate on_block action conflict",
-			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    gate:\n      on_block:\n        labels_add: [agent-needs-human]\n        labels_remove: [agent-needs-human]\n    job:\n", 1),
-			wantErr: `routes[0].gate.on_block adds and removes label "agent-needs-human"`,
+			name:    "empty required handoff decision",
+			yaml:    strings.Replace(minimalConfig(), "    job:\n", "    requires:\n      handoff:\n        decisions: ['']\n    job:\n", 1),
+			wantErr: "routes[0].requires.handoff.decisions[0] must not be empty",
 		},
 	}
 
@@ -422,11 +341,9 @@ queue:
     path: ./issueq.db
 routes:
   - name: triage
-    when:
-      labels_include: [agent-triage]
-      labels_exclude: [agent-running]
+    event_kind: triage
     job:
-      kind: triage
+      kind: event
       command: ["./tasks/triage.sh"]
       timeout: 10m
       concurrency: 1

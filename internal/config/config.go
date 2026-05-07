@@ -7,8 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -23,30 +21,18 @@ const (
 	DefaultWorkdir        = "./.issueq"
 	DefaultGitHubHost     = "github.com"
 	DefaultGitHubTokenEnv = "GITHUB_TOKEN"
-
-	HandoffFreshnessNone                = "none"
-	HandoffFreshnessSourceUnchanged     = "source_unchanged"
-	HandoffFreshnessTargetHeadUnchanged = "target_head_unchanged"
-
-	AttemptScopeLegacy  = "legacy"
-	AttemptScopeHandoff = "handoff"
-	AttemptScopeIssue   = "issue"
-	AttemptScopePRHead  = "pr_head"
-	AttemptScopeCIHead  = "ci_head"
 )
 
 var defaultEnvPass = []string{"PATH", "HOME"}
 
 // Config is the root issueq YAML configuration.
 type Config struct {
-	Runner         RunnerConfig   `yaml:"runner"`
-	Queue          QueueConfig    `yaml:"queue"`
-	Workdir        WorkdirConfig  `yaml:"workdir"`
-	Polling        PollingConfig  `yaml:"polling"`
-	GitHub         GitHubConfig   `yaml:"github"`
-	TerminalLabels []string       `yaml:"terminal_labels"`
-	Workflow       WorkflowConfig `yaml:"workflow"`
-	Routes         []RouteConfig  `yaml:"routes"`
+	Runner  RunnerConfig  `yaml:"runner"`
+	Queue   QueueConfig   `yaml:"queue"`
+	Workdir WorkdirConfig `yaml:"workdir"`
+	Polling PollingConfig `yaml:"polling"`
+	GitHub  GitHubConfig  `yaml:"github"`
+	Routes  []RouteConfig `yaml:"routes"`
 }
 
 type RunnerConfig struct {
@@ -90,18 +76,11 @@ type GitHubConfig struct {
 	TokenEnv string `yaml:"token_env"`
 }
 
-type WorkflowConfig struct {
-	MaxTransitionsPerIssue int          `yaml:"max_transitions_per_issue"`
-	OnTransitionsExceeded  ActionConfig `yaml:"on_transitions_exceeded"`
-}
-
 type RouteConfig struct {
-	Name      string          `yaml:"name"`
-	EventKind string          `yaml:"event_kind"`
-	When      PredicateConfig `yaml:"when"`
-	Gate      GateConfig      `yaml:"gate"`
-	Requires  RequiresConfig  `yaml:"requires"`
-	Job       JobConfig       `yaml:"job"`
+	Name      string         `yaml:"name"`
+	EventKind string         `yaml:"event_kind"`
+	Requires  RequiresConfig `yaml:"requires"`
+	Job       JobConfig      `yaml:"job"`
 }
 
 type RequiresConfig struct {
@@ -115,90 +94,21 @@ type EventHandoffGateConfig struct {
 	ExpectedNext bool     `yaml:"expected_next"`
 }
 
-type GateConfig struct {
-	Handoff HandoffGateConfig `yaml:"handoff"`
-	OnBlock ActionConfig      `yaml:"on_block"`
-}
-
-type HandoffGateConfig struct {
-	Required  bool                   `yaml:"required"`
-	From      []string               `yaml:"from"`
-	Decisions []string               `yaml:"decisions"`
-	NextRoute HandoffNextRouteConfig `yaml:"next_route"`
-	Freshness string                 `yaml:"freshness"`
-}
-
-type HandoffNextRouteMode string
-
-const (
-	HandoffNextRouteDisabled HandoffNextRouteMode = ""
-	HandoffNextRouteCurrent  HandoffNextRouteMode = "current"
-	HandoffNextRouteExact    HandoffNextRouteMode = "exact"
-)
-
-type HandoffNextRouteConfig struct {
-	Mode  HandoffNextRouteMode
-	Value string
-}
-
-func (c *HandoffNextRouteConfig) UnmarshalYAML(value *yaml.Node) error {
-	if value.Kind != yaml.ScalarNode {
-		return fmt.Errorf("next_route must be a boolean or string")
-	}
-	switch value.Tag {
-	case "!!bool":
-		parsed, err := strconv.ParseBool(value.Value)
-		if err != nil {
-			return fmt.Errorf("next_route boolean must be true or false")
-		}
-		if parsed {
-			*c = HandoffNextRouteConfig{Mode: HandoffNextRouteCurrent}
-		} else {
-			*c = HandoffNextRouteConfig{}
-		}
-		return nil
-	case "!!str":
-		if strings.TrimSpace(value.Value) == "" {
-			return fmt.Errorf("next_route string must not be empty")
-		}
-		*c = HandoffNextRouteConfig{Mode: HandoffNextRouteExact, Value: value.Value}
-		return nil
-	default:
-		return fmt.Errorf("next_route must be a boolean or string")
-	}
-}
-
-type PredicateConfig struct {
-	LabelsInclude []string `yaml:"labels_include"`
-	LabelsExclude []string `yaml:"labels_exclude"`
-}
-
 type JobConfig struct {
-	Kind               string           `yaml:"kind"`
-	Command            Command          `yaml:"command"`
-	Timeout            Duration         `yaml:"timeout"`
-	Concurrency        int              `yaml:"concurrency"`
-	MaxAttempts        int              `yaml:"max_attempts"`
-	Priority           int              `yaml:"priority"`
-	AttemptScope       string           `yaml:"attempt_scope"`
-	Env                EnvPassConfig    `yaml:"env"`
-	OnStart            ActionConfig     `yaml:"on_start"`
-	OnSuccess          ActionConfig     `yaml:"on_success"`
-	OnFailure          ActionConfig     `yaml:"on_failure"`
-	OnAttemptsExceeded ActionConfig     `yaml:"on_attempts_exceeded"`
-	FollowUps          []FollowUpConfig `yaml:"follow_ups"`
+	Kind        string           `yaml:"kind"`
+	Command     Command          `yaml:"command"`
+	Timeout     Duration         `yaml:"timeout"`
+	Concurrency int              `yaml:"concurrency"`
+	MaxAttempts int              `yaml:"max_attempts"`
+	Priority    int              `yaml:"priority"`
+	Env         EnvPassConfig    `yaml:"env"`
+	FollowUps   []FollowUpConfig `yaml:"follow_ups"`
 }
 
 type FollowUpConfig struct {
 	Decision string `yaml:"decision"`
 	Kind     string `yaml:"kind"`
 	Route    string `yaml:"route"`
-}
-
-type ActionConfig struct {
-	LabelsAdd    []string `yaml:"labels_add"`
-	LabelsRemove []string `yaml:"labels_remove"`
-	Comment      string   `yaml:"comment"`
 }
 
 // Duration wraps time.Duration with YAML string parsing, e.g. "3m".
@@ -339,9 +249,6 @@ func (c *Config) ApplyDefaults() {
 	if c.Runner.Env.Pass == nil {
 		c.Runner.Env.Pass = append([]string(nil), defaultEnvPass...)
 	}
-	if c.Workflow.MaxTransitionsPerIssue == 0 {
-		c.Workflow.MaxTransitionsPerIssue = 10
-	}
 }
 
 // Validate checks config rules from the v1 spec.
@@ -385,12 +292,7 @@ func (c Config) Validate(opts ValidateOptions) error {
 	if strings.TrimSpace(c.Workdir.Path) == "" {
 		errs = append(errs, "workdir.path is required")
 	}
-	if c.Workflow.MaxTransitionsPerIssue < 0 {
-		errs = append(errs, "workflow.max_transitions_per_issue must be non-negative")
-	}
-
 	errs = append(errs, validateEnvPass("runner.env.pass", c.Runner.Env.Pass, c.GitHub.TokenEnv)...)
-	errs = append(errs, validateAction("workflow.on_transitions_exceeded", c.Workflow.OnTransitionsExceeded)...)
 
 	seenRoutes := map[string]struct{}{}
 	for _, route := range c.Routes {
@@ -417,17 +319,8 @@ func (c Config) Validate(opts ValidateOptions) error {
 		}
 
 		if strings.TrimSpace(route.EventKind) == "" {
-			// Legacy bridge/label routes are still accepted for existing commands/tests.
-		} else {
-			if len(route.When.LabelsInclude) > 0 || len(route.When.LabelsExclude) > 0 {
-				errs = append(errs, prefix+".when label predicates are not allowed on event_kind routes")
-			}
-			if len(route.Gate.OnBlock.LabelsAdd) > 0 || len(route.Gate.OnBlock.LabelsRemove) > 0 || route.Gate.OnBlock.Comment != "" {
-				errs = append(errs, prefix+".gate.on_block legacy label/comment actions are not allowed on event_kind routes")
-			}
+			errs = append(errs, prefix+".event_kind is required; bridge/label routes are not supported")
 		}
-		errs = append(errs, validatePredicate(prefix+".when", route.When)...)
-		errs = append(errs, validateGate(prefix+".gate", route.Gate, seenRoutes)...)
 		errs = append(errs, validateEventRequires(prefix+".requires", route.Requires, seenRoutes)...)
 
 		jobPrefix := prefix + ".job"
@@ -452,14 +345,7 @@ func (c Config) Validate(opts ValidateOptions) error {
 		if route.Job.MaxAttempts <= 0 {
 			errs = append(errs, jobPrefix+".max_attempts must be positive")
 		}
-		if scope := strings.TrimSpace(route.Job.AttemptScope); scope != "" && !validAttemptScope(scope) {
-			errs = append(errs, fmt.Sprintf("%s.attempt_scope %q is not supported", jobPrefix, route.Job.AttemptScope))
-		}
 		errs = append(errs, validateEnvPass(jobPrefix+".env.pass", route.Job.Env.Pass, c.GitHub.TokenEnv)...)
-		errs = append(errs, validateAction(jobPrefix+".on_start", route.Job.OnStart)...)
-		errs = append(errs, validateAction(jobPrefix+".on_success", route.Job.OnSuccess)...)
-		errs = append(errs, validateAction(jobPrefix+".on_failure", route.Job.OnFailure)...)
-		errs = append(errs, validateAction(jobPrefix+".on_attempts_exceeded", route.Job.OnAttemptsExceeded)...)
 		for _, follow := range route.Job.FollowUps {
 			if strings.TrimSpace(follow.Decision) == "" {
 				errs = append(errs, jobPrefix+".follow_ups.decision is required")
@@ -512,64 +398,6 @@ func validateEnvPass(path string, names []string, tokenEnv string) []string {
 	return errs
 }
 
-func validatePredicate(path string, predicate PredicateConfig) []string {
-	var errs []string
-	include := map[string]struct{}{}
-	for _, label := range predicate.LabelsInclude {
-		if _, exists := include[label]; exists {
-			errs = append(errs, fmt.Sprintf("%s.labels_include contains duplicate %q", path, label))
-		}
-		include[label] = struct{}{}
-	}
-	exclude := map[string]struct{}{}
-	for _, label := range predicate.LabelsExclude {
-		if _, exists := exclude[label]; exists {
-			errs = append(errs, fmt.Sprintf("%s.labels_exclude contains duplicate %q", path, label))
-		}
-		exclude[label] = struct{}{}
-	}
-
-	var conflicts []string
-	for label := range include {
-		if _, exists := exclude[label]; exists {
-			conflicts = append(conflicts, label)
-		}
-	}
-	sort.Strings(conflicts)
-	for _, label := range conflicts {
-		errs = append(errs, fmt.Sprintf("%s includes and excludes label %q", path, label))
-	}
-	return errs
-}
-
-func validateGate(path string, gate GateConfig, routeNames map[string]struct{}) []string {
-	var errs []string
-	errs = append(errs, validateAction(path+".on_block", gate.OnBlock)...)
-
-	handoff := gate.Handoff
-	if strings.TrimSpace(handoff.Freshness) != "" && !validHandoffFreshness(handoff.Freshness) {
-		errs = append(errs, fmt.Sprintf("%s.handoff.freshness %q is not supported", path, handoff.Freshness))
-	}
-	if handoff.Required && len(handoff.From) == 0 {
-		errs = append(errs, path+".handoff.from is required when handoff.required is true")
-	}
-	errs = append(errs, validateStringList(path+".handoff.from", handoff.From)...)
-	errs = append(errs, validateStringList(path+".handoff.decisions", handoff.Decisions)...)
-	for _, from := range handoff.From {
-		trimmed := strings.TrimSpace(from)
-		if trimmed == "" {
-			continue
-		}
-		if _, ok := routeNames[trimmed]; !ok {
-			errs = append(errs, fmt.Sprintf("%s.handoff.from references unknown route %q", path, from))
-		}
-	}
-	if handoff.NextRoute.Mode == HandoffNextRouteExact && strings.TrimSpace(handoff.NextRoute.Value) == "" {
-		errs = append(errs, path+".handoff.next_route must not be empty")
-	}
-	return errs
-}
-
 func validateEventRequires(path string, requires RequiresConfig, routeNames map[string]struct{}) []string {
 	var errs []string
 	handoff := requires.Handoff
@@ -585,24 +413,6 @@ func validateEventRequires(path string, requires RequiresConfig, routeNames map[
 	return errs
 }
 
-func validHandoffFreshness(value string) bool {
-	switch value {
-	case HandoffFreshnessNone, HandoffFreshnessSourceUnchanged, HandoffFreshnessTargetHeadUnchanged:
-		return true
-	default:
-		return false
-	}
-}
-
-func validAttemptScope(value string) bool {
-	switch value {
-	case AttemptScopeLegacy, AttemptScopeHandoff, AttemptScopeIssue, AttemptScopePRHead, AttemptScopeCIHead:
-		return true
-	default:
-		return false
-	}
-}
-
 func validateStringList(path string, values []string) []string {
 	var errs []string
 	seen := map[string]struct{}{}
@@ -615,36 +425,6 @@ func validateStringList(path string, values []string) []string {
 			errs = append(errs, fmt.Sprintf("%s contains duplicate %q", path, value))
 		}
 		seen[trimmed] = struct{}{}
-	}
-	return errs
-}
-
-func validateAction(path string, action ActionConfig) []string {
-	var errs []string
-	add := map[string]struct{}{}
-	for _, label := range action.LabelsAdd {
-		if _, exists := add[label]; exists {
-			errs = append(errs, fmt.Sprintf("%s.labels_add contains duplicate %q", path, label))
-		}
-		add[label] = struct{}{}
-	}
-	remove := map[string]struct{}{}
-	for _, label := range action.LabelsRemove {
-		if _, exists := remove[label]; exists {
-			errs = append(errs, fmt.Sprintf("%s.labels_remove contains duplicate %q", path, label))
-		}
-		remove[label] = struct{}{}
-	}
-
-	var conflicts []string
-	for label := range add {
-		if _, exists := remove[label]; exists {
-			conflicts = append(conflicts, label)
-		}
-	}
-	sort.Strings(conflicts)
-	for _, label := range conflicts {
-		errs = append(errs, fmt.Sprintf("%s adds and removes label %q", path, label))
 	}
 	return errs
 }

@@ -1,439 +1,57 @@
-# issueq operator runbook
+# IssueQ event operator runbook
 
-This runbook is for operating a production `issueq` daemon instance.
-
-`issueq` is a local runner: it polls one GitHub repository, claims matching issues by label, records queue state in SQLite, and runs configured local subprocess jobs through the durable job wrapper.
-
-## Trust boundary
-
-issueq executes commands on the host where the daemon runs. Treat configured job commands and any repository content they execute as trusted code unless you have added your own sandboxing.
-
-For public repositories, do not run untrusted fork/PR code with write tokens or host secrets. Use least-privilege GitHub tokens and separate instances for different trust levels.
-
-## Production layout
-
-Recommended host layout:
-
-```text
-/srv/issueq/
-  bin/
-    issueq
-  instances/
-    <owner-repo>/
-      issueq.yaml
-      env
-      issueq.db
-      work/
-      agents/
-      logs/
-      runbook.md
-```
-
-Use a filesystem/systemd-safe instance name such as `david-factor-issueq-smoke`; do not use `owner/repo` because `/` has path meaning.
-
-The recommended systemd template uses:
-
-```text
-/srv/issueq/bin/issueq --config /srv/issueq/instances/%i/issueq.yaml daemon
-```
-
-Config files are location-aware: when loaded from a file, relative `queue.sqlite.path`, `workdir.path`, and explicit relative job executables such as `./agents/code.sh` are resolved relative to the config file directory. Bare commands such as `bash` and `python3` still resolve through `PATH`.
-
-## GitHub setup
-
-Create a least-privilege token for the target repository.
-
-Minimum practical permissions for issue-label workflows:
-
-- read repository issues
-- read issue labels
-- write issue labels
-- write issue comments
-
-Store the token in the instance env file, not in Git:
+## Validate configuration
 
 ```sh
-# /srv/issueq/instances/<owner-repo>/env
-GITHUB_TOKEN=replace_me
+issueq --config /srv/issueq/instances/<instance>/issueq.yaml config-check
 ```
 
-Lock it down:
+## Start event daemon
 
 ```sh
-sudo chown issueq:issueq /srv/issueq/instances/<owner-repo>/env
-sudo chmod 0600 /srv/issueq/instances/<owner-repo>/env
+systemctl start issueq@<instance>.service
+systemctl status issueq@<instance>.service
 ```
 
-## Common commands
+The service runs `issueq ... daemon`. Event mode is the only daemon mode in this
+hard-cutover build.
 
-Set an instance variable in your shell examples:
+## Ingest events locally
+
+Use the trusted local reconciler/timer to emit `issueq-event/v1` JSON and upsert
+via the local CLI:
 
 ```sh
-INSTANCE=david-factor-issueq-smoke
-CONFIG=/srv/issueq/instances/$INSTANCE/issueq.yaml
-DB=/srv/issueq/instances/$INSTANCE/issueq.db
+reconciler-command | while IFS= read -r event; do
+  [ -n "$event" ] && printf '%s\n' "$event" | issueq --config issueq.yaml event upsert --json -
+done
 ```
 
-Validate config:
+## Inspect events
 
 ```sh
-sudo -u issueq /srv/issueq/bin/issueq --config "$CONFIG" config-check
+issueq --config issueq.yaml events list
+issueq --config issueq.yaml events show <event-key>
 ```
 
-Run one foreground reconciliation cycle:
+Statuses are `ready`, `running`, `blocked`, `succeeded`, `failed`, `stale`,
+`needs_human`, and `cancelled`.
+
+## Manual actions
 
 ```sh
-sudo -u issueq /srv/issueq/bin/issueq --config "$CONFIG" once
+issueq --config issueq.yaml events retry <event-key>
+issueq --config issueq.yaml events cancel <event-key>
+issueq --config issueq.yaml events approve <event-key> --decision <decision> --next-kind <kind>
 ```
 
-Start/stop/restart the daemon:
+Approval is policy limited. It is not represented by labels or comments.
+
+## Projection
 
 ```sh
-sudo systemctl start issueq@$INSTANCE
-sudo systemctl stop issueq@$INSTANCE
-sudo systemctl restart issueq@$INSTANCE
+issueq --config issueq.yaml project <event-key>
 ```
 
-Inspect service state and logs:
-
-```sh
-systemctl status issueq@$INSTANCE
-journalctl -u issueq@$INSTANCE -n 200 --no-pager
-journalctl -u issueq@$INSTANCE -f
-```
-
-List jobs and issues:
-
-```sh
-sudo -u issueq /srv/issueq/bin/issueq --config "$CONFIG" jobs
-sudo -u issueq /srv/issueq/bin/issueq --config "$CONFIG" jobs --json
-sudo -u issueq /srv/issueq/bin/issueq --config "$CONFIG" issues
-```
-
-## Inspecting job artifacts
-
-Job rows include artifact paths:
-
-- `context_path`: JSON context passed to the job
-- `result_path`: JSON result produced by the job
-- `stdout_path`: captured stdout
-- `stderr_path`: captured stderr
-- `launch_spec_path`: durable wrapper launch spec
-- `run_metadata_path`: wrapper runtime metadata
-
-Use JSON output to find paths:
-
-```sh
-sudo -u issueq /srv/issueq/bin/issueq --config "$CONFIG" jobs --json \
-  | jq '.[] | {id, status, issue_key: .IssueKey, stdout: .StdoutPath, stderr: .StderrPath, result: .ResultPath, error: .LastError}'
-```
-
-Then inspect files directly:
-
-```sh
-sudo -u issueq sed -n '1,200p' /srv/issueq/instances/$INSTANCE/work/path/to/job/stderr.log
-sudo -u issueq jq . /srv/issueq/instances/$INSTANCE/work/path/to/job/result.json
-```
-
-Exact artifact locations are generated by the wrapper and recorded in SQLite; prefer the DB fields over guessing paths.
-
-
-## Isolated agent worktrees
-
-For code-changing agent routes, prefer per-job worktrees owned by the issueq instance instead of editing a human checkout directly.
-
-Recommended layout:
-
-```text
-/srv/issueq/instances/<owner-repo>/
-  repos/
-    <repo>.git/      # bare repo cache
-    worktrees/
-      issue-<n>-job-<id>/
-```
-
-A route-specific wrapper can call shared instance scripts such as:
-
-```text
-agents/lib/prepare-worktree.sh
-agents/lib/collect-worktree-result.sh
-```
-
-The setup script should:
-
-- fetch the configured base branch into a local bare cache
-- create a unique local branch/worktree for the issue/job
-- emit metadata such as base commit, branch name, and worktree path
-- avoid passing GitHub tokens to the agent process
-
-The agent should then run with write access limited to that worktree. Initially, keep code-changing routes local-only: no commits, pushes, or pull requests. The result comment should include the worktree path, changed files, `git diff --stat`, verification attempted, and review commands.
-
-When using a bare cache, fetch remote branches under `refs/remotes/origin/*`. Avoid a mirror-style refspec that writes remote heads into local `refs/heads/*`, because later fetches can prune local `issueq/...` worktree branches that do not exist on the remote.
-
-## SQLite access and backups
-
-Always back up SQLite before manual inspection or repair.
-
-Online backup using SQLite's backup command:
-
-```sh
-sudo -u issueq sqlite3 "$DB" ".backup '$DB.backup-$(date -u +%Y%m%dT%H%M%SZ)'"
-```
-
-For risky manual repair, stop the daemon first:
-
-```sh
-sudo systemctl stop issueq@$INSTANCE
-sudo -u issueq sqlite3 "$DB" ".backup '$DB.before-repair-$(date -u +%Y%m%dT%H%M%SZ)'"
-```
-
-Useful read-only queries:
-
-```sql
-SELECT id, status, issue_key, route_name, attempts, launch_state, runner_instance_id,
-       lease_until, pid, last_error
-FROM jobs
-ORDER BY created_at DESC
-LIMIT 20;
-
-SELECT id, event_type, message, created_at
-FROM job_events
-WHERE job_id = '<job-id>'
-ORDER BY created_at ASC;
-
-SELECT runner_instance_id, runner_id, pid, heartbeat_at
-FROM runner_heartbeats
-ORDER BY heartbeat_at DESC;
-```
-
-## Handling failed jobs
-
-A failed job normally has:
-
-- `status='failed'`
-- `last_error` explaining process exit, timeout, wrapper failure, or result validation failure
-- `agent-failed` or your configured failure label on GitHub
-- captured stdout/stderr/result artifacts
-
-Procedure:
-
-1. Inspect `journalctl` around the failure time.
-2. Inspect the job row with `jobs --json`.
-3. Read stderr/stdout/result artifacts.
-4. Decide whether the issue should be retried or handled manually.
-5. To retry through normal routing, adjust GitHub labels according to your route rules, for example remove `agent-failed` and re-add `agent-ready` if your config allows it.
-6. If max attempts were exceeded, prefer a new issue generation/label workflow over direct DB edits.
-
-## Handoff-gates live smoke
-
-Run this after the deterministic local smoke passes and before relying on a new
-handoff-gated write route in production. Use a scratch issue in the configured
-repository or an explicitly approved live issue. Do not run this against normal
-intake labels unless you intend the daemon to pick up the issue.
-
-Primary safety rule: the preflight helper is offline. The live steps below are
-manual because they mutate GitHub labels/comments and may launch configured job
-commands.
-
-Prerequisites:
-
-```sh
-INSTANCE=david-factor-issueq-smoke
-SERVICE=issueq@$INSTANCE
-CONFIG=/srv/issueq/instances/$INSTANCE/issueq.yaml
-DB=/srv/issueq/instances/$INSTANCE/issueq.db
-ISSUEQ_BIN=/srv/issueq/bin/issueq
-```
-
-Run local deterministic verification from the source checkout:
-
-```sh
-GOCACHE=/tmp/issueq-go-build go test -count=1 ./internal/daemon -run 'TestLocal(HandoffGatesSmoke|WorkStartedFallbackSmoke)'
-```
-
-Run offline preflight against the live config:
-
-```sh
-./scripts/handoff-gates-live-preflight.sh \
-  --bin "$ISSUEQ_BIN" \
-  --config "$CONFIG" \
-  --db "$DB" \
-  --issue OWNER/REPO#123
-```
-
-Back up state before live mutation:
-
-```sh
-sudo -u issueq sqlite3 "$DB" ".backup '$DB.before-handoff-gates-smoke-$(date -u +%Y%m%dT%H%M%SZ)'"
-sudo cp "$CONFIG" "$CONFIG.before-handoff-gates-smoke-$(date -u +%Y%m%dT%H%M%SZ)"
-```
-
-The smoke route should match this shape:
-
-```yaml
-gate:
-  handoff:
-    required: true
-    from: [bug-triage]
-    decisions: [bug_fix_candidate]
-    next_route: true
-    freshness: source_unchanged
-job:
-  max_attempts: 1
-  attempt_scope: handoff
-```
-
-Live smoke procedure:
-
-1. Create or choose a scratch issue.
-2. Open a controlled smoke window: pause external intake if applicable, then stop the production service before applying labels or comments that match the gated route.
-
-   ```sh
-   sudo systemctl stop "$SERVICE"
-   if systemctl is-active --quiet "$SERVICE"; then
-     echo "service still active" >&2
-     exit 1
-   fi
-   ```
-
-   If the instance is not managed by systemd, stop the observed daemon process with the local service manager and confirm no `issueq daemon` process is polling this config/DB before continuing.
-
-3. Apply only the labels needed for the gated write route, for example `agent-ready`, `agent-route-bug-fix-pr`, and `agent-write-approved`.
-4. Confirm the issue has no accepted canonical `issueq-handoff` fenced comment from `bug-triage`.
-5. Run one foreground cycle:
-
-   ```sh
-   sudo -u issueq "$ISSUEQ_BIN" --config "$CONFIG" once
-   ```
-
-6. Verify GitHub received the configured block label/comment, such as `agent-needs-human` or `issueq route blocked: missing_handoff`.
-7. Verify no work launched and no work attempt was consumed:
-
-   ```sh
-   sudo -u issueq sqlite3 "$DB" \
-     "SELECT route_name, reason, count FROM gate_blocks ORDER BY updated_at DESC LIMIT 5;"
-   sudo -u issueq sqlite3 "$DB" \
-     "SELECT route_name, scope_hash, attempts FROM route_attempts WHERE issue_key = 'github.com/OWNER/REPO#123';"
-   sudo -u issueq "$ISSUEQ_BIN" --config "$CONFIG" jobs --json | jq '.[] | {id, status, route: .RouteName, attempts: .Attempts}'
-   ```
-
-8. Add or trigger a fresh `bug-triage` handoff comment whose top-level canonical `issueq-handoff` fenced JSON block has `schema: issueq-handoff/v1`, `next_route` set to the gated route, and a source fingerprint that still matches the issue.
-9. Restore the route labels if the block action removed them, then run `once` again.
-10. Verify the gated work route launched exactly once and its scoped attempt count is `1`, not `2`.
-11. Re-arm the same route labels for the same handoff/scope and run `once` once more.
-12. Verify max attempts stops the repeated route and applies the configured human/failure action without a second work launch.
-13. Clean up smoke-only labels/comments or leave an explicit closing comment if the issue is retained as evidence.
-14. Restart the service and tail logs before closing the smoke window:
-
-    ```sh
-    sudo systemctl start "$SERVICE"
-    journalctl -u "$SERVICE" -f
-    ```
-
-Rollback and cleanup:
-
-- Keep the service stopped until smoke labels/comments are cleaned up or intentionally documented.
-- If the config caused unexpected routing, stop the service, restore the previous config and binary, run `config-check`, then restart.
-- If SQLite needs repair, stop the daemon first, restore from the pre-smoke backup when possible, and keep the changed DB as evidence until the incident is understood.
-- If a job command launched unexpectedly, inspect artifacts and process state before editing labels or DB rows.
-
-## Handling cancelled jobs
-
-Jobs become `cancelled` when the daemon shuts down while supervising work. A clean SIGTERM/SIGINT should mark owned running jobs cancelled with `last_error='runner shutting down'`.
-
-Procedure:
-
-1. Check whether the service was intentionally stopped or restarted.
-2. Confirm no child process is still running.
-3. Inspect artifacts; cancellation may leave partial output.
-4. Retry by applying the appropriate ready label if safe.
-
-## Handling stuck `running` jobs
-
-A healthy running job should have a current runner heartbeat and a valid lease.
-
-Check running jobs:
-
-```sh
-sudo -u issueq sqlite3 "$DB" \
-  "SELECT id, issue_key, route_name, launch_state, runner_instance_id, lease_until, pid, last_error FROM jobs WHERE status='running';"
-```
-
-Check runner heartbeats:
-
-```sh
-sudo -u issueq sqlite3 "$DB" \
-  "SELECT runner_instance_id, runner_id, pid, heartbeat_at FROM runner_heartbeats ORDER BY heartbeat_at DESC;"
-```
-
-If the daemon is alive, first inspect logs and wait for the configured timeout/lease behavior. Do not edit a live running row unless you have stopped the daemon and backed up the database.
-
-If the daemon crashed or host rebooted, restart it and let issueq reconcile durable running state:
-
-```sh
-sudo systemctl restart issueq@$INSTANCE
-journalctl -u issueq@$INSTANCE -f
-```
-
-issueq may adopt recoverable stale durable jobs, cancel jobs owned by a shutting-down runner, or mark unrecoverable launched work as `launch_state='unknown'` for human review.
-
-## Handling `launch_state=unknown`
-
-`launch_state='unknown'` means issueq cannot safely prove whether a previously launched subprocess is still running or what result it produced. Treat it as a human-intervention state.
-
-Procedure:
-
-1. Stop the daemon if you plan to repair DB state.
-2. Back up the DB.
-3. Inspect the job row, event history, launch spec, run metadata, stdout/stderr, and result file.
-4. Check whether the recorded `pid`/`pgid` still exists and whether it belongs to the expected command.
-5. Decide one of:
-   - preserve as evidence and handle the GitHub issue manually;
-   - mark failed/cancelled in the DB after confirming no subprocess remains;
-   - create a fresh retry by using GitHub labels and route rules.
-
-Manual DB edits are intentionally not the normal control plane. If you must repair a row, do it with the daemon stopped, a fresh backup, and a written operator note in the instance runbook.
-
-Example conservative repair after confirming no subprocess remains:
-
-```sql
-UPDATE jobs
-SET status = 'failed',
-    finished_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'),
-    last_error = 'operator marked failed after unknown launch state'
-WHERE id = '<job-id>' AND status = 'running' AND launch_state = 'unknown';
-```
-
-Then update GitHub labels/comments manually to match your workflow.
-
-## Updating the binary
-
-Recommended safe update:
-
-```sh
-INSTANCE=david-factor-issueq-smoke
-sudo systemctl stop issueq@$INSTANCE
-sudo -u issueq sqlite3 /srv/issueq/instances/$INSTANCE/issueq.db \
-  ".backup '/srv/issueq/instances/$INSTANCE/issueq.db.before-upgrade-$(date -u +%Y%m%dT%H%M%SZ)'"
-sudo install -o root -g root -m 0755 ./issueq /srv/issueq/bin/issueq
-sudo -u issueq /srv/issueq/bin/issueq --config /srv/issueq/instances/$INSTANCE/issueq.yaml config-check
-sudo systemctl start issueq@$INSTANCE
-journalctl -u issueq@$INSTANCE -f
-```
-
-If the new binary misbehaves, stop the service, restore the previous binary, and restart. Keep old release binaries until the first real job succeeds.
-
-## Label workflow notes
-
-Your route configuration determines labels, but a common pattern is:
-
-- ready/intake: `agent-ready`
-- claimed/running: `agent-running`
-- completed awaiting human review: `agent-review`
-- terminal success: `agent-done`
-- terminal failure: `agent-failed`
-- human intervention needed: `agent-needs-human`
-- opt-out/manual-only: `manual-only`
-
-Avoid using the same ready label for multiple live smoke scenarios unless you intend any issueq instance to pick them up. Scenario-specific ready labels prevent accidental cross-pickup.
+Projection writes managed comments and optional UI-only status labels. These are
+not scheduler inputs.
