@@ -59,6 +59,8 @@ def result(status, decision, summary, *, next_kind=None, handoff=True, patch=Non
 
 if kind == "pr-review" and scenario == "wrong-handoff":
     result("succeeded", "merge_ready", "wrong decision handoff must not satisfy pr-fix gate", next_kind=None, handoff=True)
+elif kind == "pr-review" and scenario == "retry-cancelled":
+    result("succeeded", "merge_ready", "retried cancelled event", handoff=False)
 elif kind == "pr-review" and scenario == "stale-review":
     result("stale", "stale_noop", "stale target; no write follow-up", handoff=False)
 elif kind == "pr-review":
@@ -248,6 +250,22 @@ PY
   issueq --config "$WORK/issueq.yaml" event upsert --json "$WORK/stale.json" >/dev/null
   issueq --config "$WORK/issueq.yaml" once >/dev/null
 
+  # Explicit operator retry is the only path that reopens terminal events.  It
+  # clears stale leases and resets attempt_count so max_attempts: 1 routes get
+  # one fresh claim, while preserving the previous result until finalization.
+  make_event "$WORK/retry-cancelled.json" pr-review 306 0000000000000000000000000000000000000306 retry-cancelled
+  issueq --config "$WORK/issueq.yaml" event upsert --json "$WORK/retry-cancelled.json" >/dev/null
+  retry_cancelled_key=pr-review:gleg.int.exe.xyz/example-org/example-repo:pr-306:head-0000000000000000000000000000000000000306
+  issueq --config "$WORK/issueq.yaml" events cancel "$retry_cancelled_key" >/dev/null
+  issueq --config "$WORK/issueq.yaml" events retry "$retry_cancelled_key" >/dev/null
+  issueq --config "$WORK/issueq.yaml" events show "$retry_cancelled_key" > "$WORK/retry-cancelled-ready.json"
+  python3 - <<'PY'
+import json
+item=json.load(open('retry-cancelled-ready.json'))
+assert item['status']=='ready' and item['attempt_count']==0, item
+PY
+  issueq --config "$WORK/issueq.yaml" once >/dev/null
+
   # CI diagnose -> CI fix gated follow-up.
   make_event "$WORK/ci.json" ci-diagnose 304 0000000000000000000000000000000000000304 ci-failure workflow-ci
   issueq --config "$WORK/issueq.yaml" event upsert --json "$WORK/ci.json" >/dev/null
@@ -315,6 +333,9 @@ assert wrong_fix['status']=='blocked' and wrong_fix['attempt_count']==1, wrong_f
 stale=by_key[key('pr-review',303,sha(303))]
 assert stale['status']=='stale' and stale['attempt_count']==1, stale
 assert key('pr-fix',303,sha(303)) not in by_key, by_key.get(key('pr-fix',303,sha(303)))
+# Cancelled events are claimable again after explicit operator retry, even on max_attempts: 1 routes.
+retry_cancelled=by_key[key('pr-review',306,sha(306))]
+assert retry_cancelled['status']=='succeeded' and retry_cancelled['attempt_count']==1, retry_cancelled
 # CI diagnose creates exactly the gated ci-fix follow-up, preserving workflow subscope.
 ci=by_key[key('ci-diagnose',304,sha(304),'workflow-ci')]
 ci_fix=by_key[key('ci-fix',304,sha(304),'workflow-ci')]

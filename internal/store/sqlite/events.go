@@ -105,7 +105,13 @@ func (s *Store) CancelAutomationEvent(ctx context.Context, key string) error {
 
 func (s *Store) RetryAutomationEvent(ctx context.Context, key string) error {
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `UPDATE automation_events SET status = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE event_key = ? AND status IN (?, ?, ?)`, model.AutomationEventStatusReady, formatTime(now), key, model.AutomationEventStatusBlocked, model.AutomationEventStatusFailed, model.AutomationEventStatusCancelled)
+	// Operator retry is the only path that deliberately reopens a terminal
+	// automation event.  attempt_count is an execution budget guard (the
+	// claimer only accepts rows with attempt_count < max_attempts), so reset it
+	// to zero to make one fresh run claimable even for routes with
+	// max_attempts: 1.  Keep result_json intact until the next finalization so
+	// the previous terminal result/block reason remains available for audit.
+	_, err := s.db.ExecContext(ctx, `UPDATE automation_events SET status = ?, attempt_count = 0, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE event_key = ? AND status IN (?, ?, ?, ?)`, model.AutomationEventStatusReady, formatTime(now), key, model.AutomationEventStatusBlocked, model.AutomationEventStatusFailed, model.AutomationEventStatusStale, model.AutomationEventStatusCancelled)
 	if err != nil {
 		return fmt.Errorf("retry automation event: %w", err)
 	}

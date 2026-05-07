@@ -14,6 +14,125 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func sampleAutomationEvent(key string) model.AutomationEvent {
+	return model.AutomationEvent{EventKey: key, Kind: "pr-review", RouteName: "pr-review", Status: model.AutomationEventStatusReady, Priority: 1, RepoHost: "github.com", Owner: "example-org", Repo: "example-repo", TargetKind: "pull_request", TargetKey: "pr-1", TargetFingerprint: "head-abcdef", PayloadJSON: `{"x":1}`}
+}
+
+func TestRetryAutomationEventResetsAttemptBudgetForTerminalStatuses(t *testing.T) {
+	ctx := context.Background()
+	terminalStatuses := []string{
+		model.AutomationEventStatusCancelled,
+		model.AutomationEventStatusFailed,
+		model.AutomationEventStatusBlocked,
+		model.AutomationEventStatusStale,
+	}
+	for _, status := range terminalStatuses {
+		t.Run(status, func(t *testing.T) {
+			store := openTempStore(t, ctx)
+			defer store.Close()
+
+			ev := sampleAutomationEvent("event-" + status)
+			if _, _, _, err := store.UpsertAutomationEvent(ctx, ev); err != nil {
+				t.Fatal(err)
+			}
+			claimed, err := store.ClaimAutomationEvent(ctx, storepkg.EventClaimOptions{RouteName: ev.RouteName, LeaseOwner: "owner", LeaseDuration: time.Minute, MaxAttempts: 1, Now: time.Now()})
+			if err != nil || claimed == nil {
+				t.Fatalf("claim before retry claimed=%#v err=%v", claimed, err)
+			}
+			_, err = store.db.ExecContext(ctx, `UPDATE automation_events SET status = ?, result_json = ?, lease_owner = 'old-owner', lease_expires_at = ? WHERE event_key = ?`, status, `{"previous":true}`, formatTime(time.Now().Add(time.Hour)), ev.EventKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if err := store.RetryAutomationEvent(ctx, ev.EventKey); err != nil {
+				t.Fatal(err)
+			}
+			got, err := store.GetAutomationEvent(ctx, ev.EventKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != model.AutomationEventStatusReady || got.AttemptCount != 0 || got.LeaseOwner != "" || got.LeaseExpiresAt != nil {
+				t.Fatalf("retried event = %#v, want ready with reset attempts and no lease", got)
+			}
+			if got.ResultJSON != `{"previous":true}` {
+				t.Fatalf("result_json = %q, want previous result preserved for audit", got.ResultJSON)
+			}
+			claimed, err = store.ClaimAutomationEvent(ctx, storepkg.EventClaimOptions{RouteName: ev.RouteName, LeaseOwner: "retry-owner", LeaseDuration: time.Minute, MaxAttempts: 1, Now: time.Now()})
+			if err != nil || claimed == nil {
+				t.Fatalf("claim after retry claimed=%#v err=%v", claimed, err)
+			}
+			if claimed.EventKey != ev.EventKey || claimed.AttemptCount != 1 {
+				t.Fatalf("claimed after retry = %#v", claimed)
+			}
+		})
+	}
+}
+
+func TestRetryAutomationEventDoesNotReopenSucceededOrNeedsHuman(t *testing.T) {
+	ctx := context.Background()
+	for _, status := range []string{model.AutomationEventStatusSucceeded, model.AutomationEventStatusNeedsHuman} {
+		t.Run(status, func(t *testing.T) {
+			store := openTempStore(t, ctx)
+			defer store.Close()
+			ev := sampleAutomationEvent("event-" + status)
+			if _, _, _, err := store.UpsertAutomationEvent(ctx, ev); err != nil {
+				t.Fatal(err)
+			}
+			_, err := store.db.ExecContext(ctx, `UPDATE automation_events SET status = ?, attempt_count = 1, result_json = ? WHERE event_key = ?`, status, `{"previous":true}`, ev.EventKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := store.RetryAutomationEvent(ctx, ev.EventKey); err != nil {
+				t.Fatal(err)
+			}
+			got, err := store.GetAutomationEvent(ctx, ev.EventKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.Status != status || got.AttemptCount != 1 || got.ResultJSON != `{"previous":true}` {
+				t.Fatalf("retry should not change %s event: %#v", status, got)
+			}
+		})
+	}
+}
+
+func TestTerminalUpsertProtectionDoesNotResetAttemptsStatusOrResult(t *testing.T) {
+	ctx := context.Background()
+	store := openTempStore(t, ctx)
+	defer store.Close()
+	ev := sampleAutomationEvent("terminal-upsert")
+	if _, _, _, err := store.UpsertAutomationEvent(ctx, ev); err != nil {
+		t.Fatal(err)
+	}
+	_, err := store.db.ExecContext(ctx, `UPDATE automation_events SET status = ?, attempt_count = 1, result_json = ?, lease_owner = 'old-owner', lease_expires_at = ? WHERE event_key = ?`, model.AutomationEventStatusFailed, `{"previous":true}`, formatTime(time.Now().Add(time.Hour)), ev.EventKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := ev
+	replacement.Priority = 99
+	replacement.PayloadJSON = `{"changed":true}`
+	got, inserted, protected, err := store.UpsertAutomationEvent(ctx, replacement)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inserted || !protected {
+		t.Fatalf("inserted=%v protected=%v, want false/true", inserted, protected)
+	}
+	if got.Status != model.AutomationEventStatusFailed || got.AttemptCount != 1 || got.ResultJSON != `{"previous":true}` || got.LeaseOwner != "old-owner" || got.LeaseExpiresAt == nil {
+		t.Fatalf("terminal upsert reset protected fields: %#v", got)
+	}
+	if got.Priority != 99 || got.PayloadJSON != `{"changed":true}` {
+		t.Fatalf("terminal upsert did not refresh allowed metadata: %#v", got)
+	}
+	claimed, err := store.ClaimAutomationEvent(ctx, storepkg.EventClaimOptions{RouteName: ev.RouteName, LeaseOwner: "owner", LeaseDuration: time.Minute, MaxAttempts: 1, Now: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed != nil {
+		t.Fatalf("terminal upsert made event claimable: %#v", claimed)
+	}
+}
+
 func TestMigrationsCreateTablesAndAreIdempotent(t *testing.T) {
 	ctx := context.Background()
 	store := openTempStore(t, ctx)

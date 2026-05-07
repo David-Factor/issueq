@@ -217,7 +217,7 @@ func eventsCommand(configPath *string) *cobra.Command {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "event cancelled: %s\n", args[0])
 		return nil
 	}}
-	retry := &cobra.Command{Use: "retry <event-key>", Args: cobra.ExactArgs(1), Short: "Retry failed/cancelled/blocked automation event", RunE: func(cmd *cobra.Command, args []string) error {
+	retry := &cobra.Command{Use: "retry <event-key>", Args: cobra.ExactArgs(1), Short: "Retry failed/cancelled/blocked/stale automation event", RunE: func(cmd *cobra.Command, args []string) error {
 		_, store, err := openConfiguredStore(cmd.Context(), *configPath)
 		if err != nil {
 			return err
