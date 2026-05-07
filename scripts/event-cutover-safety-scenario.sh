@@ -69,6 +69,10 @@ elif kind == "ci-diagnose":
     result("succeeded", "fix_candidate", "diagnosed straightforward CI failure", next_kind="ci-fix")
 elif kind == "ci-fix":
     result("succeeded", "fix_applied", "ci fix applied", handoff=False)
+elif kind == "bug-triage":
+    result("needs_human", "fix_recommended", "bug triage recommends a draft fix PR", next_kind=None, handoff=True)
+elif kind == "bug-fix-pr":
+    result("succeeded", "draft_pr_created", "bug fix draft PR created", handoff=False)
 else:
     raise SystemExit(f"unexpected kind {kind}")
 PY
@@ -139,21 +143,54 @@ routes:
     timeout: 30s
     concurrency: 1
     max_attempts: 1
+- name: bug-triage
+  event_kind: bug-triage
+  job:
+    kind: event
+    command: ["./fake-agent.sh"]
+    timeout: 30s
+    concurrency: 1
+    max_attempts: 1
+    follow_ups:
+    - decision: fix_recommended
+      kind: bug-fix-pr
+      route: bug-fix-pr
+- name: bug-fix-pr
+  event_kind: bug-fix-pr
+  requires:
+    handoff:
+      from: bug-triage
+      decisions: [fix_recommended]
+      same_target: true
+      expected_next: true
+  job:
+    kind: event
+    command: ["./fake-agent.sh"]
+    timeout: 30s
+    concurrency: 1
+    max_attempts: 1
 YAML
 make_event() {
-  local path=$1 kind=$2 pr=$3 sha=$4 scenario=${5:-} subscope=${6:-}
-  python3 - "$path" "$kind" "$pr" "$sha" "$scenario" "$subscope" <<'PY'
+  local path=$1 kind=$2 pr=$3 sha=$4 scenario=${5:-} subscope=${6:-} target_kind=${7:-pull_request}
+  python3 - "$path" "$kind" "$pr" "$sha" "$scenario" "$subscope" "$target_kind" <<'PY'
 import json, sys
-path, kind, pr, sha, scenario, subscope = sys.argv[1:]
-fingerprint = f"head-{sha}"
+path, kind, num, sha, scenario, subscope, target_kind = sys.argv[1:]
+if target_kind == "issue":
+    fingerprint = f"body-{sha}"
+    target_key = f"issue-{num}"
+    payload = {"issue_number": int(num), "issue_body_sha256": sha, "scenario": scenario}
+else:
+    fingerprint = f"head-{sha}"
+    target_key = f"pr-{num}"
+    payload = {"pr_number": int(num), "head_sha": sha, "scenario": scenario}
 event = {
   "schema": "issueq-event/v1",
   "kind": kind,
-  "event_key": f"{kind}:gleg.int.exe.xyz/example-org/example-repo:pr-{pr}:{fingerprint}" + (f":{subscope}" if subscope else ""),
+  "event_key": f"{kind}:gleg.int.exe.xyz/example-org/example-repo:{target_key}:{fingerprint}" + (f":{subscope}" if subscope else ""),
   "repo": {"host": "gleg.int.exe.xyz", "owner": "example-org", "name": "example-repo"},
-  "source": {"kind": "local_scenario", "key": f"{kind}-{pr}", "url": "https://example.invalid/run"},
-  "target": {"kind": "pull_request", "key": f"pr-{pr}", "fingerprint": fingerprint},
-  "payload": {"pr_number": int(pr), "head_sha": sha, "scenario": scenario},
+  "source": {"kind": "local_scenario", "key": f"{kind}-{num}", "url": "https://example.invalid/run"},
+  "target": {"kind": target_kind, "key": target_key, "fingerprint": fingerprint},
+  "payload": payload,
 }
 if subscope:
     event["subscope"] = subscope
@@ -217,6 +254,40 @@ PY
   issueq --config "$WORK/issueq.yaml" once >/dev/null
   issueq --config "$WORK/issueq.yaml" once >/dev/null
 
+  # Projection command failure must not mutate event status/result or enqueue work.
+  issueq --config "$WORK/issueq.yaml" events show "$(python3 - <<'PY'
+import json
+items=json.load(open('events.json'))
+print(items[0]['event_key'])
+PY
+)" > "$WORK/projection-before.json"
+  env -u GITHUB_TOKEN issueq --config "$WORK/issueq.yaml" project "$(python3 - <<'PY'
+import json
+items=json.load(open('events.json'))
+print(items[0]['event_key'])
+PY
+)" >"$WORK/issueq-projection.out" 2>"$WORK/issueq-projection.err" && { echo "projection unexpectedly succeeded" >&2; exit 1; }
+  issueq --config "$WORK/issueq.yaml" events show "$(python3 - <<'PY'
+import json
+items=json.load(open('events.json'))
+print(items[0]['event_key'])
+PY
+)" > "$WORK/projection-after.json"
+  python3 - <<'PY'
+import json
+before=json.load(open('projection-before.json'))
+after=json.load(open('projection-after.json'))
+for field in ('status', 'result_json', 'attempt_count'):
+    assert before[field] == after[field], (field, before, after)
+PY
+
+  # CLI bug path: triage stays needs_human until explicit approval creates the gated fix event.
+  make_event "$WORK/bug.json" bug-triage 305 abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789 bug-triage "" issue
+  issueq --config "$WORK/issueq.yaml" event upsert --json "$WORK/bug.json" >/dev/null
+  issueq --config "$WORK/issueq.yaml" once >/dev/null
+  issueq --config "$WORK/issueq.yaml" events approve "bug-triage:gleg.int.exe.xyz/example-org/example-repo:issue-305:body-abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789" --decision fix_recommended --next-kind bug-fix-pr >/dev/null
+  issueq --config "$WORK/issueq.yaml" once >/dev/null
+
   issueq --config "$WORK/issueq.yaml" events list --json > final-events.json
   python3 - <<'PY'
 import json
@@ -224,9 +295,9 @@ from pathlib import Path
 items=json.load(open('final-events.json'))
 by_key={i['event_key']:i for i in items}
 
-def key(kind, pr, sha, subscope=''):
+def key(kind, pr, sha, subscope='', target='pr', fp='head'):
     suffix=f':{subscope}' if subscope else ''
-    return f'{kind}:gleg.int.exe.xyz/example-org/example-repo:pr-{pr}:head-{sha}{suffix}'
+    return f'{kind}:gleg.int.exe.xyz/example-org/example-repo:{target}-{pr}:{fp}-{sha}{suffix}'
 sha=lambda n: '0'*37+str(n)
 # Duplicate/terminal non-reset path: exactly one review and one policy fix; review was not re-run.
 dup=by_key[key('pr-review',300,sha(300))]
@@ -254,6 +325,12 @@ assert fix_contexts, 'ci-fix context missing'
 ctx=json.load(open(fix_contexts[0]))
 assert ctx['handoff']['producer_route']=='ci-diagnose', ctx['handoff']
 assert ctx['event']['subscope']=='workflow-ci', ctx['event']
+# Bug triage/fix is CLI approval driven: no automatic next_event, then approved next event runs.
+bug_sha='abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789'
+bug=by_key[key('bug-triage',305,bug_sha,target='issue',fp='body')]
+bug_fix=by_key[key('bug-fix-pr',305,bug_sha,target='issue',fp='body')]
+assert bug['status']=='needs_human' and bug['attempt_count']==1, bug
+assert bug_fix['status']=='succeeded' and bug_fix['attempt_count']==1, bug_fix
 print('event cutover safety scenario OK')
 PY
 )
