@@ -82,13 +82,15 @@ func daemonCommand(configPath *string) *cobra.Command {
 
 func onceCommand(configPath *string) *cobra.Command {
 	return &cobra.Command{Use: "once", Short: "Run one event claim/run/finalize cycle", RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, store, err := openConfiguredStore(cmd.Context(), *configPath)
+		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		cfg, store, err := openConfiguredStore(ctx, *configPath)
 		if err != nil {
 			return err
 		}
 		defer store.Close()
 		leaseOwner := fmt.Sprintf("%s-%d", runnerID(*cfg), os.Getpid())
-		result, key, err := eventcore.RunOnce(cmd.Context(), *cfg, store, eventcore.RunOptions{LeaseOwner: leaseOwner, Lease: cfg.Queue.LeaseDuration.Duration, Workdir: cfg.Workdir.Path, Runner: model.RunnerInfo{ID: leaseOwner, Name: cfg.Runner.Name}})
+		result, key, err := eventcore.RunOnce(ctx, *cfg, store, eventcore.RunOptions{LeaseOwner: leaseOwner, Lease: cfg.Queue.LeaseDuration.Duration, Workdir: cfg.Workdir.Path, Runner: model.RunnerInfo{ID: leaseOwner, Name: cfg.Runner.Name}})
 		if err != nil {
 			return err
 		}
@@ -272,7 +274,9 @@ func projectCommand(configPath *string) *cobra.Command {
 func eventRunCommand(configPath *string) *cobra.Command {
 	var leaseOwner string
 	c := &cobra.Command{Use: "event-run-once", Short: "Claim and run one automation event", RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, store, err := openConfiguredStore(cmd.Context(), *configPath)
+		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		cfg, store, err := openConfiguredStore(ctx, *configPath)
 		if err != nil {
 			return err
 		}
@@ -281,7 +285,7 @@ func eventRunCommand(configPath *string) *cobra.Command {
 			leaseOwner = fmt.Sprintf("%s-%d", runnerID(*cfg), os.Getpid())
 		}
 		runnerInfo := model.RunnerInfo{ID: leaseOwner, Name: cfg.Runner.Name}
-		result, key, err := eventcore.RunOnce(cmd.Context(), *cfg, store, eventcore.RunOptions{LeaseOwner: leaseOwner, Lease: cfg.Queue.LeaseDuration.Duration, Workdir: cfg.Workdir.Path, Runner: runnerInfo})
+		result, key, err := eventcore.RunOnce(ctx, *cfg, store, eventcore.RunOptions{LeaseOwner: leaseOwner, Lease: cfg.Queue.LeaseDuration.Duration, Workdir: cfg.Workdir.Path, Runner: runnerInfo})
 		if err != nil {
 			return err
 		}

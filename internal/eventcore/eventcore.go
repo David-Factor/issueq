@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -424,11 +423,12 @@ func normalizeSubscope(value string) string {
 func FinalizeFromResult(ctx context.Context, cfg config.Config, st *sqlitestore.Store, ev model.AutomationEvent, route config.RouteConfig, leaseOwner string, resultPath string) (bool, error) {
 	b, err := os.ReadFile(resultPath)
 	if err != nil {
-		b = []byte(fmt.Sprintf(`{"schema":"%s","event_key":%q,"route":%q,"status":"failed","decision":"result_missing","summary_markdown":%q}`, ResultSchema, ev.EventKey, route.Name, err.Error()))
+		b = []byte(fmt.Sprintf(`{"schema":"%s","event_key":%q,"route":%q,"status":"failed","decision":"result_missing","summary_markdown":%q,"work_started":false}`, ResultSchema, ev.EventKey, route.Name, err.Error()))
 	}
 	res, err := ValidateResult(ev, route, b)
 	if err != nil {
-		res = AgentResult{Schema: ResultSchema, EventKey: ev.EventKey, Route: route.Name, Status: model.AutomationEventStatusFailed, Decision: "invalid_result", SummaryMarkdown: err.Error()}
+		workStarted := false
+		res = AgentResult{Schema: ResultSchema, EventKey: ev.EventKey, Route: route.Name, Status: model.AutomationEventStatusFailed, Decision: "invalid_result", SummaryMarkdown: err.Error(), WorkStarted: &workStarted}
 		b, _ = json.Marshal(res)
 	}
 	ok, err := st.FinalizeAutomationEvent(ctx, ev.EventKey, store.EventFinalize{Status: res.Status, ResultJSON: string(b), LeaseOwner: leaseOwner, Now: time.Now().UTC()})
@@ -518,8 +518,6 @@ func RunOnce(ctx context.Context, cfg config.Config, st *sqlitestore.Store, opts
 	}
 	command := append([]string(nil), route.Job.Command...)
 	command = append(command, paths["context"], paths["result"])
-	proc := exec.CommandContext(ctx, command[0], command[1:]...)
-	proc.Env = EnvFor(cfg, *route, *ev, paths)
 	out, err := os.Create(paths["stdout"])
 	if err != nil {
 		return RunResult{Claimed: 1}, ev.EventKey, err
@@ -530,13 +528,17 @@ func RunOnce(ctx context.Context, cfg config.Config, st *sqlitestore.Store, opts
 		return RunResult{Claimed: 1}, ev.EventKey, err
 	}
 	defer errOut.Close()
-	proc.Stdout = out
-	proc.Stderr = errOut
-	if err := proc.Run(); err != nil {
-		fallback := fmt.Sprintf(`{"schema":"%s","event_key":%q,"route":%q,"status":"failed","decision":"command_failed","summary_markdown":%q}`, ResultSchema, ev.EventKey, route.Name, err.Error())
+	runCtx := ctx
+	var cancel context.CancelFunc
+	if route.Job.Timeout.Duration > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, route.Job.Timeout.Duration)
+		defer cancel()
+	}
+	if err := runCommand(runCtx, command, EnvFor(cfg, *route, *ev, paths), out, errOut, 5*time.Second); err != nil {
+		fallback := fmt.Sprintf(`{"schema":"%s","event_key":%q,"route":%q,"status":"failed","decision":"command_failed","summary_markdown":%q,"work_started":true}`, ResultSchema, ev.EventKey, route.Name, err.Error())
 		_ = os.WriteFile(paths["result"], []byte(fallback), 0600)
 	}
-	ok, err := FinalizeFromResult(ctx, cfg, st, *ev, *route, opts.LeaseOwner, paths["result"])
+	ok, err := FinalizeFromResult(context.WithoutCancel(ctx), cfg, st, *ev, *route, opts.LeaseOwner, paths["result"])
 	if err != nil {
 		return RunResult{Claimed: 1}, ev.EventKey, err
 	}
