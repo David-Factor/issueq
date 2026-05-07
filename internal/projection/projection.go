@@ -74,7 +74,6 @@ func projectionFromEvent(ev model.AutomationEvent) Projection {
 	var raw struct {
 		Projection Projection `json:"projection"`
 		Summary    string     `json:"summary_markdown"`
-		Decision   string     `json:"decision"`
 	}
 	_ = json.Unmarshal([]byte(ev.ResultJSON), &raw)
 	p := raw.Projection
@@ -83,22 +82,6 @@ func projectionFromEvent(ev model.AutomationEvent) Projection {
 	}
 	if strings.TrimSpace(p.Comment) == "" {
 		p.Comment = fmt.Sprintf("IssueQ event `%s` is `%s`.", ev.EventKey, ev.Status)
-	}
-	if len(p.Labels) == 0 {
-		switch ev.Status {
-		case model.AutomationEventStatusRunning:
-			p.Labels = []string{"agent-active"}
-		case model.AutomationEventStatusBlocked, model.AutomationEventStatusNeedsHuman:
-			p.Labels = []string{"agent-needs-human"}
-		case model.AutomationEventStatusStale:
-			p.Labels = []string{"agent-stale"}
-		case model.AutomationEventStatusFailed:
-			p.Labels = []string{"agent-failed"}
-		case model.AutomationEventStatusSucceeded:
-			if raw.Decision == "merge_ready" {
-				p.Labels = []string{"agent-merge-ready"}
-			}
-		}
 	}
 	p.Labels = filterAllowedLabels(p.Labels)
 	return p
@@ -143,6 +126,9 @@ func filterAllowedLabels(labels []string) []string {
 }
 
 func applyLabels(ctx context.Context, gh issuegithub.Client, ev model.AutomationEvent, number int, labels []string) error {
+	if len(labels) == 0 {
+		return nil
+	}
 	latest, err := gh.GetIssue(ctx, ev.Owner, ev.Repo, number)
 	if err != nil {
 		return err

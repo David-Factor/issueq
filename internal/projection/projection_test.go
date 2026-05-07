@@ -15,6 +15,7 @@ type fakeGitHub struct {
 	updated  []string
 	labels   []string
 	set      []string
+	setCalls int
 	fail     bool
 }
 
@@ -28,6 +29,7 @@ func (f *fakeGitHub) GetIssue(ctx context.Context, owner, repo string, number in
 	return model.IssueSnapshot{Host: "github.com", Owner: owner, Repo: repo, Number: number, Labels: append([]string(nil), f.labels...)}, nil
 }
 func (f *fakeGitHub) SetLabels(ctx context.Context, owner, repo string, number int, labels []string) error {
+	f.setCalls++
 	f.set = append([]string(nil), labels...)
 	return nil
 }
@@ -54,8 +56,8 @@ func TestProjectEventCreatesOrUpdatesManagedCommentAndAllowedLabels(t *testing.T
 	if !res.Created || len(gh.created) != 1 || !strings.Contains(gh.created[0], MarkerPrefix+ev.EventKey) {
 		t.Fatalf("create result=%#v comments=%#v", res, gh.created)
 	}
-	if strings.Join(gh.set, ",") != "agent-active,agent-merge-ready" {
-		t.Fatalf("labels set=%#v", gh.set)
+	if gh.setCalls != 1 || strings.Join(gh.set, ",") != "agent-active,agent-merge-ready" {
+		t.Fatalf("label calls=%d labels set=%#v", gh.setCalls, gh.set)
 	}
 
 	gh = &fakeGitHub{comments: []model.IssueComment{{ID: "c1", Body: MarkerPrefix + ev.EventKey + " -->\nold"}}}
@@ -65,6 +67,44 @@ func TestProjectEventCreatesOrUpdatesManagedCommentAndAllowedLabels(t *testing.T
 	}
 	if !res.Updated || len(gh.updated) != 1 || !strings.HasPrefix(gh.updated[0], "c1:") {
 		t.Fatalf("update result=%#v updated=%#v", res, gh.updated)
+	}
+	if gh.setCalls != 1 || strings.Join(gh.set, ",") != "agent-active,agent-merge-ready" {
+		t.Fatalf("update label calls=%d labels set=%#v", gh.setCalls, gh.set)
+	}
+}
+
+func TestProjectEventEmptyLabelsCreatesCommentWithoutLabelUpdate(t *testing.T) {
+	ev := projectionEvent()
+	ev.ResultJSON = `{"schema":"issueq-agent-result/v1","decision":"findings_straightforward","summary_markdown":"ready","projection":{"comment":"managed","labels":[]}}`
+	gh := &fakeGitHub{}
+	res, err := ProjectEvent(context.Background(), gh, ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Created || len(gh.created) != 1 || !strings.Contains(gh.created[0], MarkerPrefix+ev.EventKey) {
+		t.Fatalf("create result=%#v comments=%#v", res, gh.created)
+	}
+	if gh.setCalls != 0 || gh.set != nil {
+		t.Fatalf("label update should be skipped, calls=%d labels=%#v", gh.setCalls, gh.set)
+	}
+	if len(res.Labels) != 0 {
+		t.Fatalf("result labels=%#v", res.Labels)
+	}
+}
+
+func TestProjectEventAbsentLabelsCreatesCommentWithoutDefaultLabelUpdate(t *testing.T) {
+	ev := projectionEvent()
+	ev.ResultJSON = `{"schema":"issueq-agent-result/v1","decision":"merge_ready","summary_markdown":"ready","projection":{"comment":"managed"}}`
+	gh := &fakeGitHub{}
+	res, err := ProjectEvent(context.Background(), gh, ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Created || len(gh.created) != 1 {
+		t.Fatalf("create result=%#v comments=%#v", res, gh.created)
+	}
+	if gh.setCalls != 0 || gh.set != nil {
+		t.Fatalf("label update should be skipped, calls=%d labels=%#v", gh.setCalls, gh.set)
 	}
 }
 

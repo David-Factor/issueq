@@ -381,6 +381,14 @@ func TestProjectionValidationAllowsOnlyUIOnlyLabels(t *testing.T) {
 	if _, err := ValidateResult(ev, cfg.Routes[0], good); err != nil {
 		t.Fatalf("good projection rejected: %v", err)
 	}
+	empty := []byte(`{"schema":"issueq-agent-result/v1","event_key":"` + ev.EventKey + `","route":"pr-review","status":"succeeded","decision":"findings_straightforward","summary_markdown":"s","work_started":true,"projection":{"comment":"ok","labels":[]}}`)
+	if _, err := ValidateResult(ev, cfg.Routes[0], empty); err != nil {
+		t.Fatalf("empty projection labels rejected: %v", err)
+	}
+	absent := []byte(`{"schema":"issueq-agent-result/v1","event_key":"` + ev.EventKey + `","route":"pr-review","status":"succeeded","decision":"findings_straightforward","summary_markdown":"s","work_started":true,"projection":{"comment":"ok"}}`)
+	if _, err := ValidateResult(ev, cfg.Routes[0], absent); err != nil {
+		t.Fatalf("absent projection labels rejected: %v", err)
+	}
 	bad := []byte(`{"schema":"issueq-agent-result/v1","event_key":"` + ev.EventKey + `","route":"pr-review","status":"succeeded","decision":"merge_ready","summary_markdown":"s","work_started":true,"projection":{"labels":["agent-route-pr-fix"]}}`)
 	if _, err := ValidateResult(ev, cfg.Routes[0], bad); err == nil {
 		t.Fatal("expected scheduling label rejection")
