@@ -18,6 +18,7 @@ import (
 	"issueq/internal/logging"
 	"issueq/internal/model"
 	"issueq/internal/poller"
+	"issueq/internal/projection"
 	"issueq/internal/router"
 	sqlitestore "issueq/internal/store/sqlite"
 
@@ -49,6 +50,7 @@ func newRootCommand() *cobra.Command {
 	cmd.AddCommand(
 		eventCommand(&configPath),
 		eventsCommand(&configPath),
+		projectCommand(&configPath),
 		eventRunCommand(&configPath),
 		daemonCommand(&configPath, &mode),
 		onceCommand(&configPath, &mode),
@@ -314,7 +316,7 @@ func openConfiguredStoreWithOptions(ctx context.Context, configPath string, opts
 func eventCommand(configPath *string) *cobra.Command {
 	cmd := &cobra.Command{Use: "event", Short: "Manage automation events"}
 	var jsonPath string
-	upsert := &cobra.Command{Use: "upsert", Short: "Upsert an automation event", RunE: func(cmd *cobra.Command, args []string) error {
+	runUpsert := func(cmd *cobra.Command, args []string) error {
 		cfg, store, err := openConfiguredStore(cmd.Context(), *configPath)
 		if err != nil {
 			return err
@@ -339,9 +341,12 @@ func eventCommand(configPath *string) *cobra.Command {
 		}
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "event upsert OK: key=%s inserted=%t terminal_protected=%t status=%s\n", ev.EventKey, inserted, protected, ev.Status)
 		return nil
-	}}
+	}
+	create := &cobra.Command{Use: "create", Short: "Create or upsert an automation event", RunE: runUpsert}
+	create.Flags().StringVar(&jsonPath, "json", "-", "event JSON file path, or -/empty for stdin")
+	upsert := &cobra.Command{Use: "upsert", Short: "Upsert an automation event", RunE: runUpsert}
 	upsert.Flags().StringVar(&jsonPath, "json", "-", "event JSON file path, or -/empty for stdin")
-	cmd.AddCommand(upsert)
+	cmd.AddCommand(create, upsert)
 	return cmd
 }
 
@@ -392,7 +397,7 @@ func eventsCommand(configPath *string) *cobra.Command {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "event cancelled: %s\n", args[0])
 		return nil
 	}}
-	retry := &cobra.Command{Use: "retry <event-key>", Args: cobra.ExactArgs(1), Short: "Retry failed/cancelled automation event", RunE: func(cmd *cobra.Command, args []string) error {
+	retry := &cobra.Command{Use: "retry <event-key>", Args: cobra.ExactArgs(1), Short: "Retry failed/cancelled/blocked automation event", RunE: func(cmd *cobra.Command, args []string) error {
 		_, store, err := openConfiguredStore(cmd.Context(), *configPath)
 		if err != nil {
 			return err
@@ -404,8 +409,46 @@ func eventsCommand(configPath *string) *cobra.Command {
 		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "event retry requested: %s\n", args[0])
 		return nil
 	}}
-	cmd.AddCommand(list, show, cancel, retry)
+	var decision, nextKind string
+	approve := &cobra.Command{Use: "approve <event-key>", Args: cobra.ExactArgs(1), Short: "Store a trusted approval handoff and create a policy-allowed next event", RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, store, err := openConfiguredStore(cmd.Context(), *configPath)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		res, err := eventcore.Approve(cmd.Context(), *cfg, store, args[0], eventcore.ApprovalInput{Decision: decision, NextKind: nextKind})
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "event approved: source=%s handoff=%s next=%s\n", args[0], res.Handoff.ID, res.Event.EventKey)
+		return nil
+	}}
+	approve.Flags().StringVar(&decision, "decision", "", "trusted approval decision")
+	approve.Flags().StringVar(&nextKind, "next-kind", "", "policy-allowed next event kind")
+	_ = approve.MarkFlagRequired("decision")
+	_ = approve.MarkFlagRequired("next-kind")
+	cmd.AddCommand(list, show, cancel, retry, approve)
 	return cmd
+}
+
+func projectCommand(configPath *string) *cobra.Command {
+	return &cobra.Command{Use: "project <event-key>", Args: cobra.ExactArgs(1), Short: "Project event state to GitHub managed comment/optional UI labels", RunE: func(cmd *cobra.Command, args []string) error {
+		_, store, gh, err := openGitHubStore(cmd.Context(), *configPath)
+		if err != nil {
+			return err
+		}
+		defer store.Close()
+		ev, err := store.GetAutomationEvent(cmd.Context(), args[0])
+		if err != nil {
+			return err
+		}
+		res, err := projection.ProjectEvent(cmd.Context(), gh, ev)
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "projection OK: event_key=%s target=%d created=%t updated=%t\n", ev.EventKey, res.TargetNumber, res.Created, res.Updated)
+		return nil
+	}}
 }
 
 func eventRunCommand(configPath *string) *cobra.Command {

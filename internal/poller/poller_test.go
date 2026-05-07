@@ -44,6 +44,10 @@ func (f fakeGitHub) CreateComment(ctx context.Context, owner, repo string, numbe
 	return nil
 }
 
+func (f fakeGitHub) UpdateComment(ctx context.Context, owner, repo string, commentID string, body string) error {
+	return nil
+}
+
 func TestPollUpsertsFakeGitHubIssues(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t, ctx)

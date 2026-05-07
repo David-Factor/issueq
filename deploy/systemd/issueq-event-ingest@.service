@@ -1,0 +1,24 @@
+[Unit]
+Description=issueq trusted local event ingestion for %i
+Documentation=https://github.com/David-Factor/issueq
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=issueq
+Group=issueq
+EnvironmentFile=-/srv/issueq/instances/%i/env
+WorkingDirectory=/srv/issueq/instances/%i
+# Set ISSUEQ_RECONCILER_CMD in the env file to a trusted local reconciler that
+# emits one issueq-event/v1 JSON object per line (or adjust this ExecStart to
+# your local reconciler path). The events are upserted through the local CLI;
+# GitHub Actions is intentionally not used as the trusted transport.
+ExecStart=/bin/sh -lc 'test -n "$ISSUEQ_RECONCILER_CMD"; $ISSUEQ_RECONCILER_CMD | while IFS= read -r event; do test -n "$event" && printf "%s\n" "$event" | /srv/issueq/bin/issueq --config /srv/issueq/instances/%i/issueq.yaml event upsert --json -; done'
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/issueq/instances/%i
+ReadOnlyPaths=/srv/issueq/bin

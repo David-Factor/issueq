@@ -352,6 +352,10 @@ func (f *smokeGitHub) CreateComment(ctx context.Context, owner, repo string, num
 	return nil
 }
 
+func (f *smokeGitHub) UpdateComment(ctx context.Context, owner, repo string, commentID string, body string) error {
+	return nil
+}
+
 func (f *smokeGitHub) addHandoffComment(body string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

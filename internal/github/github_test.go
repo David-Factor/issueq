@@ -89,8 +89,33 @@ func TestRESTClientListsIssueComments(t *testing.T) {
 	if len(comments) != 1 {
 		t.Fatalf("comments len = %d", len(comments))
 	}
-	if comments[0].ID != "comment-node-99" || comments[0].IssueKey != "github.com/example-org/example-repo#12" || comments[0].Body != "```json\n{}\n```" {
+	if comments[0].ID != "99" || comments[0].IssueKey != "github.com/example-org/example-repo#12" || comments[0].Body != "```json\n{}\n```" {
 		t.Fatalf("comment = %#v", comments[0])
+	}
+}
+
+func TestRESTClientUpdatesComment(t *testing.T) {
+	var gotMethod, gotPath, gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		gotBody = body["body"]
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	client, err := NewRESTClientWithBaseURL("github.com", server.URL, "", server.Client())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := client.UpdateComment(context.Background(), "example-org", "example-repo", "comment-node-99", "updated"); err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != http.MethodPatch || gotPath != "/repos/example-org/example-repo/issues/comments/comment-node-99" || gotBody != "updated" {
+		t.Fatalf("method=%s path=%s body=%q", gotMethod, gotPath, gotBody)
 	}
 }
 

@@ -5,8 +5,12 @@ import (
 	"time"
 )
 
-var ErrEventNotClaimable = errors.New("event is not claimable")
 var ErrEventLateFinalizer = errors.New("event finalizer lost lease")
+
+type EventBlockReason struct {
+	Code    string `json:"code"`
+	Message string `json:"message"`
+}
 
 type EventClaimOptions struct {
 	RouteName     string

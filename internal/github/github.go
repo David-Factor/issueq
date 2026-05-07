@@ -29,6 +29,7 @@ type Client interface {
 	AddLabels(ctx context.Context, owner, repo string, number int, labels []string) error
 	SetLabels(ctx context.Context, owner, repo string, number int, labels []string) error
 	CreateComment(ctx context.Context, owner, repo string, number int, body string) error
+	UpdateComment(ctx context.Context, owner, repo string, commentID string, body string) error
 }
 
 type RESTClient struct {
@@ -146,6 +147,11 @@ func (c *RESTClient) CreateComment(ctx context.Context, owner, repo string, numb
 	return c.do(ctx, http.MethodPost, path, map[string]string{"body": body}, nil)
 }
 
+func (c *RESTClient) UpdateComment(ctx context.Context, owner, repo string, commentID string, body string) error {
+	path := githubPath("/repos/%s/%s/issues/comments/%s", owner, repo, commentID)
+	return c.do(ctx, http.MethodPatch, path, map[string]string{"body": body}, nil)
+}
+
 func (c *RESTClient) do(ctx context.Context, method, path string, input, output any) error {
 	var body io.Reader
 	if input != nil {
@@ -233,9 +239,11 @@ func (c restIssueComment) comment(issueKey string) model.IssueComment {
 	if c.Body != nil {
 		body = *c.Body
 	}
-	id := c.NodeID
-	if id == "" && c.ID != 0 {
+	id := ""
+	if c.ID != 0 {
 		id = strconv.FormatInt(c.ID, 10)
+	} else {
+		id = c.NodeID
 	}
 	return model.IssueComment{ID: id, IssueKey: issueKey, Body: body, CreatedAt: c.CreatedAt, UpdatedAt: c.UpdatedAt}
 }

@@ -46,6 +46,10 @@ func (f *fakeLifecycleGitHub) CreateComment(ctx context.Context, owner, repo str
 	return nil
 }
 
+func (f *fakeLifecycleGitHub) UpdateComment(ctx context.Context, owner, repo string, commentID string, body string) error {
+	return nil
+}
+
 func TestPrepareClaimedWrapperLaunchUsesHandoffScopedAttempts(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

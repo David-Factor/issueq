@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -278,5 +279,110 @@ func TestHandoffGateAndFollowUp(t *testing.T) {
 	got, _ := st.GetAutomationEvent(ctx, "pr-fix:h/o/r:pr-1:head-abcdef")
 	if got.EventKey == "" {
 		t.Fatal("follow-up not created")
+	}
+}
+
+func TestMissingRequiredHandoffBlocksWithoutCommandAttempt(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := sqlitestore.Open(ctx, filepath.Join(dir, "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := testConfig(dir)
+	if _, _, _, err := Upsert(ctx, cfg, st, sampleUpsert("pr-fix")); err != nil {
+		t.Fatal(err)
+	}
+	result, key, err := RunOnce(ctx, cfg, st, RunOptions{LeaseOwner: "r", Lease: time.Minute, Workdir: dir, Runner: model.RunnerInfo{ID: "r", Name: "runner"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Claimed != 0 || key != "" {
+		t.Fatalf("blocked event should not launch command: result=%#v key=%q", result, key)
+	}
+	got, err := st.GetAutomationEvent(ctx, "pr-fix:h/o/r:pr-1:head-abcdef")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != model.AutomationEventStatusBlocked || got.AttemptCount != 1 {
+		t.Fatalf("got status=%s attempts=%d result=%s", got.Status, got.AttemptCount, got.ResultJSON)
+	}
+	if got.LeaseOwner != "" || !strings.Contains(got.ResultJSON, "required_handoff_not_satisfied") {
+		t.Fatalf("block not inspectable or lease retained: %#v", got)
+	}
+}
+
+func TestNoRequirementContextHasNullHandoff(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := sqlitestore.Open(ctx, filepath.Join(dir, "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := testConfig(dir)
+	ev, _, _, err := Upsert(ctx, cfg, st, sampleUpsert("pr-review"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := WriteContext(dir, ev, cfg.Routes[0], nil, model.RunnerInfo{ID: "r", Name: "runner"}, "r")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(paths["context"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := parsed["handoff"]; !ok || parsed["handoff"] != nil {
+		t.Fatalf("handoff should be present as null: %s", data)
+	}
+}
+
+func TestApprovalCreatesTrustedHandoffAndPolicyNextEvent(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	st, err := sqlitestore.Open(ctx, filepath.Join(dir, "db.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	cfg := testConfig(dir)
+	ev, _, _, err := Upsert(ctx, cfg, st, sampleUpsert("pr-review"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Approve(ctx, cfg, st, ev.EventKey, ApprovalInput{Decision: "other", NextKind: "pr-fix"}); err == nil {
+		t.Fatal("expected unconfigured approval rejection")
+	}
+	res, err := Approve(ctx, cfg, st, ev.EventKey, ApprovalInput{Decision: "fix_candidate", NextKind: "pr-fix", PayloadPatch: map[string]any{"approved": true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Handoff.ProducerRoute != "pr-review" || res.Handoff.NextRoute != "pr-fix" || !strings.Contains(res.Handoff.PayloadJSON, "trusted_approval") {
+		t.Fatalf("handoff=%#v", res.Handoff)
+	}
+	if res.Event.Kind != "pr-fix" || res.Event.RouteName != "pr-fix" || !strings.Contains(res.Event.PayloadJSON, "approved") {
+		t.Fatalf("next event=%#v", res.Event)
+	}
+}
+
+func TestProjectionValidationAllowsOnlyUIOnlyLabels(t *testing.T) {
+	cfg := testConfig(t.TempDir())
+	ev, err := ValidateUpsert(cfg, sampleUpsert("pr-review"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := []byte(`{"schema":"issueq-agent-result/v1","event_key":"` + ev.EventKey + `","route":"pr-review","status":"succeeded","decision":"merge_ready","summary_markdown":"s","work_started":true,"projection":{"comment":"ok","labels":["agent-active","agent-merge-ready"]}}`)
+	if _, err := ValidateResult(ev, cfg.Routes[0], good); err != nil {
+		t.Fatalf("good projection rejected: %v", err)
+	}
+	bad := []byte(`{"schema":"issueq-agent-result/v1","event_key":"` + ev.EventKey + `","route":"pr-review","status":"succeeded","decision":"merge_ready","summary_markdown":"s","work_started":true,"projection":{"labels":["agent-route-pr-fix"]}}`)
+	if _, err := ValidateResult(ev, cfg.Routes[0], bad); err == nil {
+		t.Fatal("expected scheduling label rejection")
 	}
 }

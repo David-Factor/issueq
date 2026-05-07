@@ -82,6 +82,18 @@ type AgentResultNextEvent struct {
 	PayloadPatch map[string]any `json:"payload_patch"`
 }
 
+type ApprovalInput struct {
+	Decision     string         `json:"decision"`
+	NextKind     string         `json:"next_kind"`
+	PayloadPatch map[string]any `json:"payload_patch"`
+}
+
+type ApprovalResult struct {
+	Handoff model.EventHandoff    `json:"handoff"`
+	Event   model.AutomationEvent `json:"event"`
+	Policy  config.FollowUpConfig `json:"policy"`
+}
+
 type EventContext struct {
 	Schema  string              `json:"schema"`
 	Event   map[string]any      `json:"event"`
@@ -159,6 +171,57 @@ func Upsert(ctx context.Context, cfg config.Config, st *sqlitestore.Store, in Ev
 	return st.UpsertAutomationEvent(ctx, ev)
 }
 
+func Approve(ctx context.Context, cfg config.Config, st *sqlitestore.Store, eventKey string, in ApprovalInput) (ApprovalResult, error) {
+	if strings.TrimSpace(in.Decision) == "" {
+		return ApprovalResult{}, errors.New("approval decision is required")
+	}
+	if strings.TrimSpace(in.NextKind) == "" {
+		return ApprovalResult{}, errors.New("approval next_kind is required")
+	}
+	ev, err := st.GetAutomationEvent(ctx, eventKey)
+	if err != nil {
+		return ApprovalResult{}, err
+	}
+	route, ok := RouteForKind(cfg, ev.Kind)
+	if !ok || route.Name != ev.RouteName {
+		return ApprovalResult{}, fmt.Errorf("event route %q for kind %q is not configured", ev.RouteName, ev.Kind)
+	}
+	var policy config.FollowUpConfig
+	for _, f := range route.Job.FollowUps {
+		if f.Decision == in.Decision && f.Kind == in.NextKind {
+			policy = f
+			break
+		}
+	}
+	if policy.Kind == "" {
+		return ApprovalResult{}, fmt.Errorf("approval decision %q next_kind %q is not allowed by route %q policy", in.Decision, in.NextKind, route.Name)
+	}
+	now := time.Now().UTC()
+	handoffPayload, _ := json.Marshal(map[string]any{"trusted_approval": true, "payload_patch": in.PayloadPatch})
+	h := model.EventHandoff{ID: ev.EventKey + ":approval:" + in.Decision + ":" + in.NextKind, ProducerEventKey: ev.EventKey, ProducerRoute: route.Name, Decision: in.Decision, NextEventKind: policy.Kind, NextRoute: policy.Route, TargetKind: ev.TargetKind, TargetKey: ev.TargetKey, TargetFingerprint: ev.TargetFingerprint, Subscope: ev.Subscope, PayloadJSON: string(handoffPayload), CreatedAt: now}
+	if _, err := st.UpsertEventHandoff(ctx, h); err != nil {
+		return ApprovalResult{}, err
+	}
+	nextPayload := mergePayload(ev.PayloadJSON, in.PayloadPatch)
+	next := model.AutomationEvent{EventKey: model.CanonicalEventKey(policy.Kind, model.EventRepoRef{Host: ev.RepoHost, Owner: ev.Owner, Name: ev.Repo}, model.EventTargetRef{Kind: ev.TargetKind, Key: ev.TargetKey, Fingerprint: ev.TargetFingerprint}, ev.Subscope), Kind: policy.Kind, RouteName: policy.Route, Status: model.AutomationEventStatusReady, Priority: ev.Priority, RepoHost: ev.RepoHost, Owner: ev.Owner, Repo: ev.Repo, SourceKind: ev.SourceKind, SourceKey: ev.SourceKey, SourceURL: ev.SourceURL, TargetKind: ev.TargetKind, TargetKey: ev.TargetKey, TargetFingerprint: ev.TargetFingerprint, Subscope: ev.Subscope, PayloadJSON: nextPayload}
+	stored, _, _, err := st.UpsertAutomationEvent(ctx, next)
+	if err != nil {
+		return ApprovalResult{}, err
+	}
+	return ApprovalResult{Handoff: h, Event: stored, Policy: policy}, nil
+}
+
+type HandoffGateError struct {
+	Reason store.EventBlockReason
+}
+
+func (e HandoffGateError) Error() string {
+	if e.Reason.Message != "" {
+		return e.Reason.Message
+	}
+	return e.Reason.Code
+}
+
 func CheckHandoffGate(ctx context.Context, st *sqlitestore.Store, route config.RouteConfig, ev model.AutomationEvent) (*model.EventHandoff, error) {
 	req := route.Requires.Handoff
 	if req.From == "" {
@@ -173,7 +236,7 @@ func CheckHandoffGate(ctx context.Context, st *sqlitestore.Store, route config.R
 		return nil, err
 	}
 	if h == nil {
-		return nil, store.ErrEventNotClaimable
+		return nil, HandoffGateError{Reason: store.EventBlockReason{Code: "required_handoff_not_satisfied", Message: fmt.Sprintf("required handoff from route %q for target %s/%s@%s is missing or mismatched", req.From, ev.TargetKind, ev.TargetKey, ev.TargetFingerprint)}}
 	}
 	return h, nil
 }
@@ -195,8 +258,12 @@ func ClaimOne(ctx context.Context, cfg config.Config, st *sqlitestore.Store, lea
 		if err == nil {
 			return ev, &route, h, nil
 		}
-		_, _ = st.FinalizeAutomationEvent(ctx, ev.EventKey, store.EventFinalize{Status: model.AutomationEventStatusNeedsHuman, ResultJSON: `{"error":"handoff gate not satisfied"}`, LeaseOwner: leaseOwner, Now: time.Now().UTC()})
-		return nil, nil, nil, nil
+		var gateErr HandoffGateError
+		if errors.As(err, &gateErr) {
+			_ = st.BlockAutomationEvent(ctx, ev.EventKey, gateErr.Reason)
+			return nil, nil, nil, nil
+		}
+		return nil, nil, nil, err
 	}
 	return nil, nil, nil, nil
 }
@@ -275,6 +342,9 @@ func ValidateResult(ev model.AutomationEvent, route config.RouteConfig, b []byte
 	if res.WorkStarted == nil {
 		return res, errors.New("work_started is required")
 	}
+	if err := validateProjection(res.Projection); err != nil {
+		return res, err
+	}
 	if res.Handoff != nil {
 		if res.Handoff.Schema != HandoffSchema {
 			return res, fmt.Errorf("handoff schema must be %s", HandoffSchema)
@@ -307,6 +377,44 @@ func ValidateResult(ev model.AutomationEvent, route config.RouteConfig, b []byte
 		}
 	}
 	return res, nil
+}
+
+func validateProjection(projection map[string]any) error {
+	if projection == nil {
+		return nil
+	}
+	allowedLabels := map[string]struct{}{
+		"agent-active":      {},
+		"agent-merge-ready": {},
+		"agent-needs-human": {},
+		"agent-stale":       {},
+		"agent-failed":      {},
+	}
+	for key, value := range projection {
+		switch key {
+		case "comment", "summary", "target_url":
+			if _, ok := value.(string); !ok {
+				return fmt.Errorf("projection.%s must be a string", key)
+			}
+		case "labels":
+			items, ok := value.([]any)
+			if !ok {
+				return errors.New("projection.labels must be an array")
+			}
+			for _, item := range items {
+				label, ok := item.(string)
+				if !ok {
+					return errors.New("projection.labels must contain strings")
+				}
+				if _, ok := allowedLabels[label]; !ok {
+					return fmt.Errorf("projection label %q is not UI-only allowlisted", label)
+				}
+			}
+		default:
+			return fmt.Errorf("unknown projection field %q", key)
+		}
+	}
+	return nil
 }
 
 func normalizeSubscope(value string) string {

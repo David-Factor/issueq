@@ -211,6 +211,10 @@ func (f *fakeRouterGitHub) CreateComment(ctx context.Context, owner, repo string
 	return nil
 }
 
+func (f *fakeRouterGitHub) UpdateComment(ctx context.Context, owner, repo string, commentID string, body string) error {
+	return nil
+}
+
 func TestGateMissingHandoffBlocksAndBlockLabelStopsLaterMatch(t *testing.T) {
 	ctx := context.Background()
 	store := openStore(t, ctx)

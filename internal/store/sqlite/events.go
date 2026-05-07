@@ -96,7 +96,7 @@ func (s *Store) ListAutomationEvents(ctx context.Context) ([]model.AutomationEve
 
 func (s *Store) CancelAutomationEvent(ctx context.Context, key string) error {
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `UPDATE automation_events SET status = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE event_key = ? AND status NOT IN (?, ?, ?, ?, ?)`, model.AutomationEventStatusCancelled, formatTime(now), key, model.AutomationEventStatusSucceeded, model.AutomationEventStatusFailed, model.AutomationEventStatusStale, model.AutomationEventStatusNeedsHuman, model.AutomationEventStatusCancelled)
+	_, err := s.db.ExecContext(ctx, `UPDATE automation_events SET status = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE event_key = ? AND status NOT IN (?, ?, ?, ?, ?, ?)`, model.AutomationEventStatusCancelled, formatTime(now), key, model.AutomationEventStatusBlocked, model.AutomationEventStatusSucceeded, model.AutomationEventStatusFailed, model.AutomationEventStatusStale, model.AutomationEventStatusNeedsHuman, model.AutomationEventStatusCancelled)
 	if err != nil {
 		return fmt.Errorf("cancel automation event: %w", err)
 	}
@@ -105,9 +105,27 @@ func (s *Store) CancelAutomationEvent(ctx context.Context, key string) error {
 
 func (s *Store) RetryAutomationEvent(ctx context.Context, key string) error {
 	now := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `UPDATE automation_events SET status = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE event_key = ? AND status IN (?, ?)`, model.AutomationEventStatusReady, formatTime(now), key, model.AutomationEventStatusFailed, model.AutomationEventStatusCancelled)
+	_, err := s.db.ExecContext(ctx, `UPDATE automation_events SET status = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE event_key = ? AND status IN (?, ?, ?)`, model.AutomationEventStatusReady, formatTime(now), key, model.AutomationEventStatusBlocked, model.AutomationEventStatusFailed, model.AutomationEventStatusCancelled)
 	if err != nil {
 		return fmt.Errorf("retry automation event: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) BlockAutomationEvent(ctx context.Context, key string, reason store.EventBlockReason) error {
+	now := time.Now().UTC()
+	code := strings.TrimSpace(reason.Code)
+	if code == "" {
+		code = "dependency_not_satisfied"
+	}
+	message := strings.TrimSpace(reason.Message)
+	if message == "" {
+		message = code
+	}
+	result := fmt.Sprintf(`{"schema":"issueq-blocked/v1","reason":{"code":%q,"message":%q}}`, code, message)
+	_, err := s.db.ExecContext(ctx, `UPDATE automation_events SET status = ?, result_json = ?, lease_owner = NULL, lease_expires_at = NULL, updated_at = ? WHERE event_key = ? AND status IN (?, ?)`, model.AutomationEventStatusBlocked, result, formatTime(now), key, model.AutomationEventStatusReady, model.AutomationEventStatusRunning)
+	if err != nil {
+		return fmt.Errorf("block automation event: %w", err)
 	}
 	return nil
 }

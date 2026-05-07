@@ -183,6 +183,10 @@ func (f *fakeClient) CreateComment(ctx context.Context, owner, repo string, numb
 	return nil
 }
 
+func (f *fakeClient) UpdateComment(ctx context.Context, owner, repo string, commentID string, body string) error {
+	return nil
+}
+
 func TestParseResultFileErrors(t *testing.T) {
 	dir := t.TempDir()
 	bad := filepath.Join(dir, "bad.json")

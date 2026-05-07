@@ -221,3 +221,6 @@ func (f *fakeDispatchGitHub) RemoveLabels(ctx context.Context, owner, repo strin
 func (f *fakeDispatchGitHub) CreateComment(ctx context.Context, owner, repo string, number int, body string) error {
 	return nil
 }
+func (f *fakeDispatchGitHub) UpdateComment(ctx context.Context, owner, repo string, commentID string, body string) error {
+	return nil
+}

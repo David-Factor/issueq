@@ -193,7 +193,7 @@ for key, item in before.items():
     assert after[key]['result_json'] == item['result_json'], (item, after[key])
 PY
 
-  # Missing handoff: direct write event is terminal needs_human and does not run command.
+  # Missing handoff: direct write event is terminal blocked and does not run command.
   make_event "$WORK/missing.json" pr-fix 301 0000000000000000000000000000000000000301 direct-write
   issueq --config "$WORK/issueq.yaml" event upsert --json "$WORK/missing.json" >/dev/null
   issueq --config "$WORK/issueq.yaml" once >/dev/null
@@ -237,9 +237,9 @@ assert dup_fix['status']=='succeeded' and dup_fix['attempt_count']==1, dup_fix
 missing=by_key[key('pr-fix',301,sha(301))]
 wrong_review=by_key[key('pr-review',302,sha(302))]
 wrong_fix=by_key[key('pr-fix',302,sha(302))]
-assert missing['status']=='needs_human' and missing['attempt_count']==1, missing
+assert missing['status']=='blocked' and missing['attempt_count']==1, missing
 assert wrong_review['status']=='succeeded' and wrong_review['attempt_count']==1, wrong_review
-assert wrong_fix['status']=='needs_human' and wrong_fix['attempt_count']==1, wrong_fix
+assert wrong_fix['status']=='blocked' and wrong_fix['attempt_count']==1, wrong_fix
 # Stale report is terminal and no pr-fix follow-up exists for that target.
 stale=by_key[key('pr-review',303,sha(303))]
 assert stale['status']=='stale' and stale['attempt_count']==1, stale

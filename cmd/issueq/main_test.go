@@ -36,6 +36,9 @@ func TestRootCommandHelpIncludesPhase0Commands(t *testing.T) {
 		"jobs",
 		"issues",
 		"doctor",
+		"event",
+		"events",
+		"project",
 		"config-check",
 	} {
 		if !strings.Contains(out, want) {
@@ -459,5 +462,63 @@ routes:
 `
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEventCreateAndApproveCommands(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "issueq.yaml")
+	dbPath := filepath.Join(dir, "issueq.db")
+	content := `github:
+  owner: example-org
+  repo: example-repo
+queue:
+  sqlite:
+    path: ` + dbPath + `
+routes:
+  - name: pr-review
+    event_kind: pr-review
+    job:
+      kind: event
+      command: ["/bin/true"]
+      timeout: 10m
+      concurrency: 1
+      max_attempts: 1
+      follow_ups:
+      - decision: fix_candidate
+        kind: pr-fix
+        route: pr-fix
+  - name: pr-fix
+    event_kind: pr-fix
+    requires:
+      handoff:
+        from: pr-review
+        decisions: [fix_candidate]
+        expected_next: true
+    job:
+      kind: event
+      command: ["/bin/true"]
+      timeout: 10m
+      concurrency: 1
+      max_attempts: 1
+`
+	if err := os.WriteFile(configPath, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eventPath := filepath.Join(dir, "event.json")
+	if err := os.WriteFile(eventPath, []byte(`{"schema":"issueq-event/v1","kind":"pr-review","repo":{"host":"github.com","owner":"example-org","name":"example-repo"},"target":{"kind":"pull_request","key":"pr-1","fingerprint":"head-a"},"payload":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := runCommand(t, "--config", configPath, "event", "create", "--json", eventPath)
+	if !strings.Contains(out, "event upsert OK") {
+		t.Fatalf("create output=%q", out)
+	}
+	out = runCommand(t, "--config", configPath, "events", "approve", "pr-review:github.com/example-org/example-repo:pr-1:head-a", "--decision", "fix_candidate", "--next-kind", "pr-fix")
+	if !strings.Contains(out, "event approved:") || !strings.Contains(out, "pr-fix:github.com/example-org/example-repo:pr-1:head-a") {
+		t.Fatalf("approve output=%q", out)
+	}
+	out = runCommand(t, "--config", configPath, "events", "list")
+	if !strings.Contains(out, "pr-fix") {
+		t.Fatalf("list output=%q", out)
 	}
 }

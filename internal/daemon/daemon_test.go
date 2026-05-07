@@ -791,6 +791,10 @@ type fakeDaemonSupervisor struct {
 	defaultRunning bool
 }
 
+func (f *fakeDaemonGitHub) UpdateComment(ctx context.Context, owner, repo string, commentID string, body string) error {
+	return nil
+}
+
 func newFakeDaemonSupervisor() *fakeDaemonSupervisor {
 	return &fakeDaemonSupervisor{observations: map[string]supervisor.Observation{}}
 }

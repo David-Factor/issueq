@@ -1,0 +1,12 @@
+[Unit]
+Description=run issueq trusted local event ingestion for %i periodically
+Documentation=https://github.com/David-Factor/issueq
+
+[Timer]
+OnBootSec=2m
+OnUnitActiveSec=2m
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

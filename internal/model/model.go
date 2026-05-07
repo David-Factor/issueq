@@ -19,6 +19,7 @@ const (
 const (
 	AutomationEventStatusReady      = "ready"
 	AutomationEventStatusRunning    = "running"
+	AutomationEventStatusBlocked    = "blocked"
 	AutomationEventStatusSucceeded  = "succeeded"
 	AutomationEventStatusFailed     = "failed"
 	AutomationEventStatusStale      = "stale"
@@ -28,7 +29,7 @@ const (
 
 func IsTerminalAutomationEventStatus(status string) bool {
 	switch status {
-	case AutomationEventStatusSucceeded, AutomationEventStatusFailed, AutomationEventStatusStale, AutomationEventStatusNeedsHuman, AutomationEventStatusCancelled:
+	case AutomationEventStatusBlocked, AutomationEventStatusSucceeded, AutomationEventStatusFailed, AutomationEventStatusStale, AutomationEventStatusNeedsHuman, AutomationEventStatusCancelled:
 		return true
 	default:
 		return false
