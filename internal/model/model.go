@@ -54,43 +54,43 @@ type EventTargetRef struct {
 }
 
 type AutomationEvent struct {
-	EventKey          string
-	Kind              string
-	RouteName         string
-	Status            string
-	Priority          int
-	RepoHost          string
-	Owner             string
-	Repo              string
-	SourceKind        string
-	SourceKey         string
-	SourceURL         string
-	TargetKind        string
-	TargetKey         string
-	TargetFingerprint string
-	Subscope          string
-	PayloadJSON       string
-	ResultJSON        string
-	AttemptCount      int
-	LeaseOwner        string
-	LeaseExpiresAt    *time.Time
-	CreatedAt         time.Time
-	UpdatedAt         time.Time
+	EventKey          string     `json:"event_key"`
+	Kind              string     `json:"kind"`
+	RouteName         string     `json:"route_name"`
+	Status            string     `json:"status"`
+	Priority          int        `json:"priority"`
+	RepoHost          string     `json:"repo_host"`
+	Owner             string     `json:"owner"`
+	Repo              string     `json:"repo"`
+	SourceKind        string     `json:"source_kind,omitempty"`
+	SourceKey         string     `json:"source_key,omitempty"`
+	SourceURL         string     `json:"source_url,omitempty"`
+	TargetKind        string     `json:"target_kind"`
+	TargetKey         string     `json:"target_key"`
+	TargetFingerprint string     `json:"target_fingerprint"`
+	Subscope          string     `json:"subscope,omitempty"`
+	PayloadJSON       string     `json:"payload_json"`
+	ResultJSON        string     `json:"result_json,omitempty"`
+	AttemptCount      int        `json:"attempt_count"`
+	LeaseOwner        string     `json:"lease_owner,omitempty"`
+	LeaseExpiresAt    *time.Time `json:"lease_expires_at,omitempty"`
+	CreatedAt         time.Time  `json:"created_at"`
+	UpdatedAt         time.Time  `json:"updated_at"`
 }
 
 type EventHandoff struct {
-	ID                string
-	ProducerEventKey  string
-	ProducerRoute     string
-	Decision          string
-	NextEventKind     string
-	NextRoute         string
-	TargetKind        string
-	TargetKey         string
-	TargetFingerprint string
-	Subscope          string
-	PayloadJSON       string
-	CreatedAt         time.Time
+	ID                string    `json:"id"`
+	ProducerEventKey  string    `json:"producer_event_key"`
+	ProducerRoute     string    `json:"producer_route"`
+	Decision          string    `json:"decision"`
+	NextEventKind     string    `json:"next_event_kind,omitempty"`
+	NextRoute         string    `json:"next_route,omitempty"`
+	TargetKind        string    `json:"target_kind"`
+	TargetKey         string    `json:"target_key"`
+	TargetFingerprint string    `json:"target_fingerprint"`
+	Subscope          string    `json:"subscope,omitempty"`
+	PayloadJSON       string    `json:"payload_json"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 const (

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/signal"
 	"syscall"
 
@@ -34,23 +33,25 @@ func main() {
 
 func newRootCommand() *cobra.Command {
 	var configPath string
+	var mode string
 
 	cmd := &cobra.Command{
 		Use:           "issueq",
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		Short:         "Local GitHub issue automation queue runner",
-		Long: "issueq polls GitHub issues, routes matching labels into a local SQLite queue, " +
-			"and dispatches bounded subprocess jobs.",
+		Short:         "Local automation queue runner",
+		Long: "issueq runs configured local automation commands from a durable SQLite queue. " +
+			"For the event hard-cutover, production daemon mode claims issueq-event/v1 automation events; legacy issue polling commands remain available only as explicit compatibility subcommands.",
 		RunE: func(cmd *cobra.Command, args []string) error { return cmd.Help() },
 	}
 	cmd.PersistentFlags().StringVar(&configPath, "config", config.DefaultConfigPath, "path to issueq YAML config")
+	cmd.PersistentFlags().StringVar(&mode, "mode", "events", "run mode for daemon/once: events (default cutover path) or legacy")
 	cmd.AddCommand(
 		eventCommand(&configPath),
 		eventsCommand(&configPath),
 		eventRunCommand(&configPath),
-		daemonCommand(&configPath),
-		onceCommand(&configPath),
+		daemonCommand(&configPath, &mode),
+		onceCommand(&configPath, &mode),
 		pollCommand(&configPath),
 		routeCommand(&configPath),
 		dispatchCommand(&configPath),
@@ -73,40 +74,79 @@ func configCheckCommand(use, short string, configPath *string) *cobra.Command {
 	}}
 }
 
-func daemonCommand(configPath *string) *cobra.Command {
-	return &cobra.Command{Use: "daemon", Short: "Run the long-lived issueq daemon", RunE: func(cmd *cobra.Command, args []string) error {
+func daemonCommand(configPath *string, mode *string) *cobra.Command {
+	return &cobra.Command{Use: "daemon", Short: "Run the long-lived issueq daemon (event mode by default)", RunE: func(cmd *cobra.Command, args []string) error {
 		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		cfg, store, gh, err := openGitHubStore(ctx, *configPath)
-		if err != nil {
+		switch *mode {
+		case "", "events", "event":
+			cfg, store, err := openConfiguredStore(ctx, *configPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			leaseOwner := fmt.Sprintf("%s-%d", runnerID(*cfg), os.Getpid())
+			err = eventcore.RunLoop(ctx, *cfg, store, logging.New(), eventcore.RunOptions{LeaseOwner: leaseOwner, Lease: cfg.Queue.LeaseDuration.Duration, Workdir: cfg.Workdir.Path, Runner: model.RunnerInfo{ID: leaseOwner, Name: cfg.Runner.Name}}, cfg.Polling.Interval.Duration)
+			if err == context.Canceled || err == context.DeadlineExceeded {
+				return nil
+			}
 			return err
+		case "legacy":
+			cfg, store, gh, err := openGitHubStore(ctx, *configPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			err = daemon.Run(ctx, *cfg, store, gh, logging.New())
+			if err == context.Canceled || err == context.DeadlineExceeded {
+				return nil
+			}
+			return err
+		default:
+			return fmt.Errorf("unsupported mode %q (use events or legacy)", *mode)
 		}
-		defer store.Close()
-		err = daemon.Run(ctx, *cfg, store, gh, logging.New())
-		if err == context.Canceled || err == context.DeadlineExceeded {
-			return nil
-		}
-		return err
 	}}
 }
 
-func onceCommand(configPath *string) *cobra.Command {
+func onceCommand(configPath *string, mode *string) *cobra.Command {
 	var noWait bool
-	c := &cobra.Command{Use: "once", Short: "Run one poll-route-dispatch reconciliation cycle", RunE: func(cmd *cobra.Command, args []string) error {
+	c := &cobra.Command{Use: "once", Short: "Run one event claim/run/finalize cycle (event mode by default)", RunE: func(cmd *cobra.Command, args []string) error {
 		if noWait {
 			return fmt.Errorf("once --no-wait is not supported until background child supervision is implemented")
 		}
-		cfg, store, gh, err := openGitHubStore(cmd.Context(), *configPath)
-		if err != nil {
-			return err
+		switch *mode {
+		case "", "events", "event":
+			cfg, store, err := openConfiguredStore(cmd.Context(), *configPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			leaseOwner := fmt.Sprintf("%s-%d", runnerID(*cfg), os.Getpid())
+			result, key, err := eventcore.RunOnce(cmd.Context(), *cfg, store, eventcore.RunOptions{LeaseOwner: leaseOwner, Lease: cfg.Queue.LeaseDuration.Duration, Workdir: cfg.Workdir.Path, Runner: model.RunnerInfo{ID: leaseOwner, Name: cfg.Runner.Name}})
+			if err != nil {
+				return err
+			}
+			if result.Claimed == 0 {
+				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "once OK: no event claimed")
+				return nil
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "once OK: event_key=%s claimed=%d finalized=%d\n", key, result.Claimed, result.Finalized)
+			return nil
+		case "legacy":
+			cfg, store, gh, err := openGitHubStore(cmd.Context(), *configPath)
+			if err != nil {
+				return err
+			}
+			defer store.Close()
+			result, err := daemon.Once(cmd.Context(), *cfg, store, gh)
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "once OK: fetched=%d routed=%d claimed=%d succeeded=%d failed=%d\n", result.Poll.IssuesFetched, result.Route.JobsCreated, result.Dispatch.Claimed, result.Dispatch.Succeeded, result.Dispatch.Failed)
+			return nil
+		default:
+			return fmt.Errorf("unsupported mode %q (use events or legacy)", *mode)
 		}
-		defer store.Close()
-		result, err := daemon.Once(cmd.Context(), *cfg, store, gh)
-		if err != nil {
-			return err
-		}
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "once OK: fetched=%d routed=%d claimed=%d succeeded=%d failed=%d\n", result.Poll.IssuesFetched, result.Route.JobsCreated, result.Dispatch.Claimed, result.Dispatch.Succeeded, result.Dispatch.Failed)
-		return nil
 	}}
 	c.Flags().BoolVar(&noWait, "no-wait", false, "unsupported: background reconciliation is not implemented")
 	return c
@@ -370,49 +410,34 @@ func eventsCommand(configPath *string) *cobra.Command {
 
 func eventRunCommand(configPath *string) *cobra.Command {
 	var leaseOwner string
-	c := &cobra.Command{Use: "event-run-once", Hidden: true, Short: "Claim and run one automation event", RunE: func(cmd *cobra.Command, args []string) error {
+	c := &cobra.Command{Use: "event-run-once", Short: "Claim and run one automation event", RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, store, err := openConfiguredStore(cmd.Context(), *configPath)
 		if err != nil {
 			return err
 		}
 		defer store.Close()
 		if leaseOwner == "" {
-			leaseOwner = fmt.Sprintf("issueq-%d", os.Getpid())
+			leaseOwner = fmt.Sprintf("%s-%d", runnerID(*cfg), os.Getpid())
 		}
 		runnerInfo := model.RunnerInfo{ID: leaseOwner, Name: cfg.Runner.Name}
-		ev, route, handoff, err := eventcore.ClaimOne(cmd.Context(), *cfg, store, leaseOwner, cfg.Queue.LeaseDuration.Duration, cfg.Workdir.Path, runnerInfo)
+		result, key, err := eventcore.RunOnce(cmd.Context(), *cfg, store, eventcore.RunOptions{LeaseOwner: leaseOwner, Lease: cfg.Queue.LeaseDuration.Duration, Workdir: cfg.Workdir.Path, Runner: runnerInfo})
 		if err != nil {
 			return err
 		}
-		if ev == nil {
+		if result.Claimed == 0 {
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "event-run-once: no event claimed")
 			return nil
 		}
-		paths, err := eventcore.WriteContext(cfg.Workdir.Path, *ev, *route, handoff, runnerInfo, leaseOwner)
-		if err != nil {
-			return err
-		}
-		command := append([]string(nil), route.Job.Command...)
-		command = append(command, paths["context"], paths["result"])
-		proc := exec.CommandContext(cmd.Context(), command[0], command[1:]...)
-		proc.Env = eventcore.EnvFor(*cfg, *route, *ev, paths)
-		out, _ := os.Create(paths["stdout"])
-		defer out.Close()
-		errOut, _ := os.Create(paths["stderr"])
-		defer errOut.Close()
-		proc.Stdout = out
-		proc.Stderr = errOut
-		if err := proc.Run(); err != nil {
-			fallback := fmt.Sprintf(`{"schema":"%s","event_key":%q,"route":%q,"status":"failed","decision":"command_failed","summary_markdown":%q}`, eventcore.ResultSchema, ev.EventKey, route.Name, err.Error())
-			_ = os.WriteFile(paths["result"], []byte(fallback), 0600)
-		}
-		ok, err := eventcore.FinalizeFromResult(cmd.Context(), *cfg, store, *ev, *route, leaseOwner, paths["result"])
-		if err != nil {
-			return err
-		}
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "event-run-once OK: key=%s finalized=%t\n", ev.EventKey, ok)
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "event-run-once OK: key=%s finalized=%t\n", key, result.Finalized == 1)
 		return nil
 	}}
 	c.Flags().StringVar(&leaseOwner, "lease-owner", "", "lease owner id")
 	return c
+}
+
+func runnerID(cfg config.Config) string {
+	if cfg.Runner.Name != "" {
+		return cfg.Runner.Name
+	}
+	return "issueq-local"
 }

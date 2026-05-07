@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -303,4 +305,122 @@ func mergePayload(base string, patch map[string]any) string {
 	}
 	b, _ := json.Marshal(m)
 	return string(b)
+}
+
+type RunResult struct {
+	Claimed   int
+	Finalized int
+}
+
+type RunOptions struct {
+	LeaseOwner string
+	Lease      time.Duration
+	Workdir    string
+	Runner     model.RunnerInfo
+}
+
+func RunOnce(ctx context.Context, cfg config.Config, st *sqlitestore.Store, opts RunOptions) (RunResult, string, error) {
+	if opts.LeaseOwner == "" {
+		opts.LeaseOwner = fmt.Sprintf("issueq-%d", os.Getpid())
+	}
+	if opts.Lease <= 0 {
+		opts.Lease = cfg.Queue.LeaseDuration.Duration
+	}
+	if opts.Lease <= 0 {
+		opts.Lease = 30 * time.Minute
+	}
+	if opts.Workdir == "" {
+		opts.Workdir = cfg.Workdir.Path
+	}
+	if opts.Runner.ID == "" {
+		opts.Runner.ID = opts.LeaseOwner
+	}
+	if opts.Runner.Name == "" {
+		opts.Runner.Name = cfg.Runner.Name
+	}
+	ev, route, handoff, err := ClaimOne(ctx, cfg, st, opts.LeaseOwner, opts.Lease, opts.Workdir, opts.Runner)
+	if err != nil {
+		return RunResult{}, "", err
+	}
+	if ev == nil {
+		return RunResult{}, "", nil
+	}
+	if len(route.Job.Command) == 0 {
+		_, _ = st.FinalizeAutomationEvent(ctx, ev.EventKey, store.EventFinalize{Status: model.AutomationEventStatusFailed, ResultJSON: `{"error":"route command is empty"}`, LeaseOwner: opts.LeaseOwner, Now: time.Now().UTC()})
+		return RunResult{Claimed: 1, Finalized: 1}, ev.EventKey, nil
+	}
+	paths, err := WriteContext(opts.Workdir, *ev, *route, handoff, opts.Runner, opts.LeaseOwner)
+	if err != nil {
+		return RunResult{Claimed: 1}, ev.EventKey, err
+	}
+	command := append([]string(nil), route.Job.Command...)
+	command = append(command, paths["context"], paths["result"])
+	proc := exec.CommandContext(ctx, command[0], command[1:]...)
+	proc.Env = EnvFor(cfg, *route, *ev, paths)
+	out, err := os.Create(paths["stdout"])
+	if err != nil {
+		return RunResult{Claimed: 1}, ev.EventKey, err
+	}
+	defer out.Close()
+	errOut, err := os.Create(paths["stderr"])
+	if err != nil {
+		return RunResult{Claimed: 1}, ev.EventKey, err
+	}
+	defer errOut.Close()
+	proc.Stdout = out
+	proc.Stderr = errOut
+	if err := proc.Run(); err != nil {
+		fallback := fmt.Sprintf(`{"schema":"%s","event_key":%q,"route":%q,"status":"failed","decision":"command_failed","summary_markdown":%q}`, ResultSchema, ev.EventKey, route.Name, err.Error())
+		_ = os.WriteFile(paths["result"], []byte(fallback), 0600)
+	}
+	ok, err := FinalizeFromResult(ctx, cfg, st, *ev, *route, opts.LeaseOwner, paths["result"])
+	if err != nil {
+		return RunResult{Claimed: 1}, ev.EventKey, err
+	}
+	result := RunResult{Claimed: 1}
+	if ok {
+		result.Finalized = 1
+	}
+	return result, ev.EventKey, nil
+}
+
+func RunLoop(ctx context.Context, cfg config.Config, st *sqlitestore.Store, logger *slog.Logger, opts RunOptions, idleInterval time.Duration) error {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if idleInterval <= 0 {
+		idleInterval = cfg.Polling.Interval.Duration
+	}
+	if idleInterval <= 0 {
+		idleInterval = 3 * time.Minute
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		result, key, err := RunOnce(ctx, cfg, st, opts)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			logger.Error("event runner failed", "error", err)
+		} else if result.Claimed > 0 {
+			logger.Info("event runner completed", "event_key", key, "finalized", result.Finalized)
+			continue
+		}
+		timer := time.NewTimer(idleInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }

@@ -1,0 +1,27 @@
+{
+  "schema": "issueq-event/v1",
+  "kind": "pr-review",
+  "repo": {
+    "host": "github.com",
+    "owner": "example-org",
+    "name": "example-repo"
+  },
+  "source": {
+    "kind": "fixture",
+    "key": "run-1",
+    "url": "https://github.com/example-org/example-repo/actions/runs/1"
+  },
+  "target": {
+    "kind": "pull_request",
+    "key": "pr-241",
+    "fingerprint": "head-0123456789abcdef0123456789abcdef01234567"
+  },
+  "payload": {
+    "pr_number": 241,
+    "pr_url": "https://github.com/example-org/example-repo/pull/241",
+    "base_branch": "main",
+    "head_branch": "feature",
+    "head_sha": "0123456789abcdef0123456789abcdef01234567",
+    "required_checks": ["CI: completed/success"]
+  }
+}
