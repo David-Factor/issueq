@@ -25,6 +25,10 @@ func sampleUpsert(kind string) EventUpsert {
 	return EventUpsert{Schema: EventSchema, Kind: kind, Repo: RepoInput{Host: "h", Owner: "o", Name: "r"}, Target: TargetInput{Kind: "pull_request", Key: "pr-1", Fingerprint: "head-abcdef"}, Payload: json.RawMessage(`{"x":1}`)}
 }
 
+func validResultJSON(eventKey, route, decision, nextKind, nextRoute string) string {
+	return `{"schema":"issueq-agent-result/v1","event_key":"` + eventKey + `","route":"` + route + `","status":"succeeded","decision":"` + decision + `","summary_markdown":"s","work_started":true,"handoff":{"schema":"issueq-handoff/v1","producer":{"event_key":"` + eventKey + `","route":"` + route + `","decision":"` + decision + `"},"target":{"kind":"pull_request","key":"pr-1","fingerprint":"head-abcdef","subscope":""},"next_event":{"kind":"` + nextKind + `","route":"` + nextRoute + `"},"payload":{}},"next_event":{"kind":"` + nextKind + `","payload_patch":{"y":2}}}`
+}
+
 func TestValidateUpsertCanonicalAndRouteSpoof(t *testing.T) {
 	cfg := testConfig(t.TempDir())
 	ev, err := ValidateUpsert(cfg, sampleUpsert("pr-review"))
@@ -168,7 +172,7 @@ func TestFollowUpPolicyRejectsUnconfiguredNextEvent(t *testing.T) {
 	if err != nil || claimed == nil {
 		t.Fatalf("claim %#v %v", claimed, err)
 	}
-	res := `{"schema":"issueq-agent-result/v1","event_key":"` + claimed.EventKey + `","route":"pr-review","status":"succeeded","decision":"fix_candidate","summary_markdown":"s","next_event":{"kind":"ci-fix","payload_patch":{"y":2}}}`
+	res := validResultJSON(claimed.EventKey, "pr-review", "fix_candidate", "ci-fix", "ci-fix")
 	p := filepath.Join(dir, "result.json")
 	if err := os.WriteFile(p, []byte(res), 0600); err != nil {
 		t.Fatal(err)
@@ -264,7 +268,7 @@ func TestHandoffGateAndFollowUp(t *testing.T) {
 	if claimed == nil {
 		t.Fatal("claim review")
 	}
-	res := `{"schema":"issueq-agent-result/v1","event_key":"` + claimed.EventKey + `","route":"pr-review","status":"succeeded","decision":"fix_candidate","summary_markdown":"s","next_event":{"kind":"pr-fix","payload_patch":{"y":2}}}`
+	res := validResultJSON(claimed.EventKey, "pr-review", "fix_candidate", "pr-fix", "pr-fix")
 	p := filepath.Join(dir, "result.json")
 	_ = os.WriteFile(p, []byte(res), 0600)
 	ok, err := FinalizeFromResult(ctx, cfg, st, *claimed, cfg.Routes[0], "r", p)

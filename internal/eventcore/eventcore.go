@@ -18,8 +18,12 @@ import (
 	sqlitestore "issueq/internal/store/sqlite"
 )
 
-const EventSchema = "issueq-event/v1"
-const ResultSchema = "issueq-agent-result/v1"
+const (
+	EventSchema      = "issueq-event/v1"
+	RunContextSchema = "issueq-run-context/v1"
+	ResultSchema     = "issueq-agent-result/v1"
+	HandoffSchema    = "issueq-handoff/v1"
+)
 
 type EventUpsert struct {
 	Schema    string          `json:"schema"`
@@ -209,7 +213,7 @@ func WriteContext(workdir string, ev model.AutomationEvent, route config.RouteCo
 		return nil, err
 	}
 	var payload json.RawMessage = []byte(ev.PayloadJSON)
-	ctx := EventContext{Schema: "issueq-run-context/v1", Event: map[string]any{"key": ev.EventKey, "kind": ev.Kind, "route": ev.RouteName, "status": ev.Status, "priority": ev.Priority, "attempt": ev.AttemptCount, "max_attempts": route.Job.MaxAttempts, "target_fingerprint": ev.TargetFingerprint, "subscope": ev.Subscope}, Repo: map[string]any{"host": ev.RepoHost, "owner": ev.Owner, "name": ev.Repo, "slug": ev.Owner + "/" + ev.Repo}, Source: map[string]any{"kind": ev.SourceKind, "key": ev.SourceKey, "url": ev.SourceURL}, Target: map[string]any{"kind": ev.TargetKind, "key": ev.TargetKey, "fingerprint": ev.TargetFingerprint}, Payload: payload, Handoff: handoff, Job: map[string]any{"id": ev.EventKey, "attempt": ev.AttemptCount, "max_attempts": route.Job.MaxAttempts, "lease_owner": leaseOwner}, Runner: runner, Paths: p}
+	ctx := EventContext{Schema: RunContextSchema, Event: map[string]any{"key": ev.EventKey, "kind": ev.Kind, "route": ev.RouteName, "status": ev.Status, "priority": ev.Priority, "attempt": ev.AttemptCount, "max_attempts": route.Job.MaxAttempts, "target_fingerprint": ev.TargetFingerprint, "subscope": ev.Subscope}, Repo: map[string]any{"host": ev.RepoHost, "owner": ev.Owner, "name": ev.Repo, "slug": ev.Owner + "/" + ev.Repo}, Source: map[string]any{"kind": ev.SourceKind, "key": ev.SourceKey, "url": ev.SourceURL}, Target: map[string]any{"kind": ev.TargetKind, "key": ev.TargetKey, "fingerprint": ev.TargetFingerprint}, Payload: payload, Handoff: handoff, Job: map[string]any{"id": ev.EventKey, "attempt": ev.AttemptCount, "max_attempts": route.Job.MaxAttempts, "lease_owner": leaseOwner}, Runner: runner, Paths: p}
 	b, err := json.MarshalIndent(ctx, "", "  ")
 	if err != nil {
 		return nil, err
@@ -234,6 +238,16 @@ func EnvFor(cfg config.Config, route config.RouteConfig, ev model.AutomationEven
 }
 
 func ValidateResult(ev model.AutomationEvent, route config.RouteConfig, b []byte) (AgentResult, error) {
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return AgentResult{}, fmt.Errorf("parse result: %w", err)
+	}
+	allowed := map[string]struct{}{"schema": {}, "event_key": {}, "route": {}, "status": {}, "decision": {}, "summary_markdown": {}, "work_started": {}, "handoff": {}, "next_event": {}, "projection": {}, "safety": {}}
+	for key := range raw {
+		if _, ok := allowed[key]; !ok {
+			return AgentResult{}, fmt.Errorf("unknown top-level result field %q", key)
+		}
+	}
 	var res AgentResult
 	if err := json.Unmarshal(b, &res); err != nil {
 		return res, fmt.Errorf("parse result: %w", err)
@@ -255,7 +269,48 @@ func ValidateResult(ev model.AutomationEvent, route config.RouteConfig, b []byte
 	if res.Decision == "" {
 		return res, errors.New("decision is required")
 	}
+	if res.SummaryMarkdown == "" {
+		return res, errors.New("summary_markdown is required")
+	}
+	if res.WorkStarted == nil {
+		return res, errors.New("work_started is required")
+	}
+	if res.Handoff != nil {
+		if res.Handoff.Schema != HandoffSchema {
+			return res, fmt.Errorf("handoff schema must be %s", HandoffSchema)
+		}
+		if res.Handoff.Producer.EventKey != ev.EventKey {
+			return res, errors.New("handoff producer event_key mismatch")
+		}
+		if res.Handoff.Producer.Route != route.Name {
+			return res, errors.New("handoff producer route mismatch")
+		}
+		if res.Handoff.Producer.Decision != res.Decision {
+			return res, errors.New("handoff producer decision mismatch")
+		}
+		if res.Handoff.Target.Kind != ev.TargetKind || res.Handoff.Target.Key != ev.TargetKey || res.Handoff.Target.Fingerprint != ev.TargetFingerprint || normalizeSubscope(res.Handoff.Target.Subscope) != normalizeSubscope(ev.Subscope) {
+			return res, errors.New("handoff target mismatch")
+		}
+	}
+	if res.NextEvent != nil {
+		if strings.TrimSpace(res.NextEvent.Kind) == "" {
+			return res, errors.New("next_event.kind is required")
+		}
+		if res.Handoff == nil {
+			return res, errors.New("next_event requires handoff")
+		}
+		if res.Handoff.NextEvent.Kind != res.NextEvent.Kind {
+			return res, errors.New("handoff next_event kind mismatch")
+		}
+		if res.Handoff.NextEvent.Route == "" {
+			return res, errors.New("handoff next_event route is required")
+		}
+	}
 	return res, nil
+}
+
+func normalizeSubscope(value string) string {
+	return strings.TrimSpace(value)
 }
 
 func FinalizeFromResult(ctx context.Context, cfg config.Config, st *sqlitestore.Store, ev model.AutomationEvent, route config.RouteConfig, leaseOwner string, resultPath string) (bool, error) {
@@ -280,7 +335,7 @@ func FinalizeFromResult(ctx context.Context, cfg config.Config, st *sqlitestore.
 				created = t
 			}
 		}
-		_, _ = st.UpsertEventHandoff(ctx, model.EventHandoff{ID: ev.EventKey + ":" + res.Decision, ProducerEventKey: ev.EventKey, ProducerRoute: route.Name, Decision: res.Decision, NextEventKind: res.Handoff.NextEvent.Kind, NextRoute: res.Handoff.NextEvent.Route, TargetKind: ev.TargetKind, TargetKey: ev.TargetKey, TargetFingerprint: ev.TargetFingerprint, Subscope: ev.Subscope, PayloadJSON: string(hp), CreatedAt: created})
+		_, _ = st.UpsertEventHandoff(ctx, model.EventHandoff{ID: ev.EventKey + ":" + res.Decision, ProducerEventKey: ev.EventKey, ProducerRoute: route.Name, Decision: res.Decision, NextEventKind: res.Handoff.NextEvent.Kind, NextRoute: res.Handoff.NextEvent.Route, TargetKind: res.Handoff.Target.Kind, TargetKey: res.Handoff.Target.Key, TargetFingerprint: res.Handoff.Target.Fingerprint, Subscope: normalizeSubscope(res.Handoff.Target.Subscope), PayloadJSON: string(hp), CreatedAt: created})
 	}
 	if res.NextEvent != nil {
 		for _, f := range route.Job.FollowUps {
